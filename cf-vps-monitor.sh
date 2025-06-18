@@ -28,7 +28,7 @@ SERVICE_FILE="$SCRIPT_DIR/monitor-service.sh"
 SYSTEMD_SERVICE_FILE="$HOME/.config/systemd/user/cf-vps-monitor.service"
 
 # 默认配置
-DEFAULT_INTERVAL=60
+DEFAULT_INTERVAL=10
 DEFAULT_WORKER_URL=""
 DEFAULT_SERVER_ID=""
 DEFAULT_API_KEY=""
@@ -61,134 +61,370 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# 检测系统信息
+# 统一的命令接口
+get_system_command() {
+    local cmd_type="$1"
+    local fallback="${2:-}"
+
+    case "$cmd_type" in
+        "memory_info")
+            if [[ "$OS" == "FreeBSD" ]] || [[ "$OS" == "OpenBSD" ]] || [[ "$OS" == "NetBSD" ]]; then
+                echo "sysctl"
+            elif [[ -f /proc/meminfo ]]; then
+                echo "proc"
+            elif command_exists free; then
+                echo "free"
+            else
+                echo "$fallback"
+            fi
+            ;;
+        "disk_usage")
+            if command_exists df; then
+                echo "df"
+            elif command_exists du; then
+                echo "du"
+            else
+                echo "$fallback"
+            fi
+            ;;
+        "network_stats")
+            if [[ -f /proc/net/dev ]]; then
+                echo "proc"
+            elif command_exists netstat; then
+                echo "netstat"
+            elif command_exists ss; then
+                echo "ss"
+            else
+                echo "$fallback"
+            fi
+            ;;
+        "process_info")
+            if command_exists ps; then
+                echo "ps"
+            elif [[ -d /proc ]]; then
+                echo "proc"
+            else
+                echo "$fallback"
+            fi
+            ;;
+        "cpu_info")
+            if [[ "$OS" == "FreeBSD" ]] || [[ "$OS" == "OpenBSD" ]] || [[ "$OS" == "NetBSD" ]]; then
+                echo "sysctl"
+            elif [[ -f /proc/stat ]]; then
+                echo "proc"
+            elif command_exists top; then
+                echo "top"
+            elif command_exists vmstat; then
+                echo "vmstat"
+            else
+                echo "$fallback"
+            fi
+            ;;
+        *)
+            echo "$fallback"
+            ;;
+    esac
+}
+
+# 跨平台的命令执行
+execute_system_command() {
+    local cmd_type="$1"
+    local command_method="$2"
+    shift 2
+    local args=("$@")
+
+    case "$cmd_type:$command_method" in
+        "memory_info:sysctl")
+            sysctl vm.stats.vm 2>/dev/null || sysctl hw.physmem hw.usermem 2>/dev/null
+            ;;
+        "memory_info:proc")
+            cat /proc/meminfo 2>/dev/null
+            ;;
+        "memory_info:free")
+            free -b 2>/dev/null || free 2>/dev/null
+            ;;
+        "disk_usage:df")
+            df -B1 "${args[@]}" 2>/dev/null || df "${args[@]}" 2>/dev/null
+            ;;
+        "network_stats:proc")
+            cat /proc/net/dev 2>/dev/null
+            ;;
+        "network_stats:netstat")
+            netstat -i 2>/dev/null
+            ;;
+        "cpu_info:sysctl")
+            sysctl kern.cp_time 2>/dev/null
+            ;;
+        "cpu_info:proc")
+            cat /proc/stat 2>/dev/null
+            ;;
+        "cpu_info:top")
+            timeout 3 top -bn1 2>/dev/null | head -10
+            ;;
+        "cpu_info:vmstat")
+            timeout 3 vmstat 1 2 2>/dev/null | tail -1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 检测系统信息（增强版）
 detect_system() {
     OS=$(uname -s)
+    ARCH=$(uname -m)
+    KERNEL_VERSION=$(uname -r)
 
-    if [[ "$OS" == "FreeBSD" ]]; then
-        VER=$(uname -r)
-        print_message "$CYAN" "检测到系统: FreeBSD $VER"
-        return
+    # 检测是否在容器中运行
+    IS_CONTAINER="false"
+    CONTAINER_TYPE="none"
+    if [[ -f /.dockerenv ]]; then
+        IS_CONTAINER="true"
+        CONTAINER_TYPE="docker"
+    elif [[ -f /run/.containerenv ]]; then
+        IS_CONTAINER="true"
+        CONTAINER_TYPE="podman"
+    elif [[ "${container:-}" != "" ]]; then
+        IS_CONTAINER="true"
+        CONTAINER_TYPE="$container"
+    elif grep -q "docker\|lxc\|container" /proc/1/cgroup 2>/dev/null; then
+        IS_CONTAINER="true"
+        CONTAINER_TYPE="unknown"
     fi
 
-    # 检测容器环境
-    if [[ -f /.dockerenv ]] || [[ -n "${container:-}" ]]; then
-        CONTAINER_ENV="true"
-        print_message "$YELLOW" "检测到容器环境"
-    else
-        CONTAINER_ENV="false"
+    # 检测虚拟化环境
+    VIRTUALIZATION="none"
+    if command_exists systemd-detect-virt; then
+        VIRTUALIZATION=$(systemd-detect-virt 2>/dev/null || echo "none")
+    elif [[ -f /sys/class/dmi/id/product_name ]]; then
+        local product_name=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
+        case "$product_name" in
+            *VMware*) VIRTUALIZATION="vmware" ;;
+            *VirtualBox*) VIRTUALIZATION="virtualbox" ;;
+            *KVM*) VIRTUALIZATION="kvm" ;;
+            *QEMU*) VIRTUALIZATION="qemu" ;;
+            *Xen*) VIRTUALIZATION="xen" ;;
+            *Microsoft*) VIRTUALIZATION="hyperv" ;;
+        esac
     fi
 
-    # 多种方式检测Linux发行版
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS=$NAME
-        VER=$VERSION_ID
-        DISTRO_ID=$ID
-    elif [[ -f /etc/lsb-release ]]; then
-        . /etc/lsb-release
-        OS=$DISTRIB_ID
-        VER=$DISTRIB_RELEASE
-        DISTRO_ID=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
-    elif command_exists lsb_release; then
-        OS=$(lsb_release -si)
-        VER=$(lsb_release -sr)
-        DISTRO_ID=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
-    elif [[ -f /etc/redhat-release ]]; then
-        OS=$(cat /etc/redhat-release | sed 's/ release.*//')
-        VER=$(cat /etc/redhat-release | sed 's/.*release //' | sed 's/ .*//')
-        DISTRO_ID="rhel"
-    elif [[ -f /etc/centos-release ]]; then
-        OS="CentOS"
-        VER=$(cat /etc/centos-release | sed 's/.*release //' | sed 's/ .*//')
-        DISTRO_ID="centos"
-    elif [[ -f /etc/debian_version ]]; then
-        OS="Debian"
-        VER=$(cat /etc/debian_version)
-        DISTRO_ID="debian"
-    elif [[ -f /etc/alpine-release ]]; then
-        OS="Alpine Linux"
-        VER=$(cat /etc/alpine-release)
-        DISTRO_ID="alpine"
-    elif [[ -f /etc/arch-release ]]; then
-        OS="Arch Linux"
-        VER="rolling"
-        DISTRO_ID="arch"
-    else
-        OS="Linux"
-        VER=$(uname -r)
-        DISTRO_ID="unknown"
+    case "$OS" in
+        FreeBSD|OpenBSD|NetBSD)
+            VER=$(uname -r | cut -d'-' -f1)
+            DISTRO_ID=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
+            DISTRO_NAME="$OS"
+            print_message "$CYAN" "检测到系统: $OS $VER"
+            ;;
+        Darwin)
+            DISTRO_ID="macos"
+            DISTRO_NAME="macOS"
+            if command_exists sw_vers; then
+                VER=$(sw_vers -productVersion)
+            else
+                VER=$(uname -r)
+            fi
+            print_message "$CYAN" "检测到系统: macOS $VER"
+            ;;
+        Linux)
+            # 优先使用 /etc/os-release
+            if [[ -f /etc/os-release ]]; then
+                . /etc/os-release
+                OS="$NAME"
+                VER="${VERSION_ID:-unknown}"
+                DISTRO_ID="${ID:-unknown}"
+                DISTRO_NAME="$NAME"
+            # 备用检测方法
+            elif [[ -f /etc/lsb-release ]]; then
+                . /etc/lsb-release
+                OS="$DISTRIB_ID"
+                VER="$DISTRIB_RELEASE"
+                DISTRO_ID=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
+                DISTRO_NAME="$OS"
+            elif command_exists lsb_release; then
+                OS=$(lsb_release -si)
+                VER=$(lsb_release -sr)
+                DISTRO_ID=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
+                DISTRO_NAME="$OS"
+            elif [[ -f /etc/redhat-release ]]; then
+                OS=$(cat /etc/redhat-release | sed 's/ release.*//')
+                VER=$(cat /etc/redhat-release | sed 's/.*release //' | sed 's/ .*//')
+                DISTRO_ID="rhel"
+                DISTRO_NAME="Red Hat Enterprise Linux"
+            elif [[ -f /etc/centos-release ]]; then
+                OS="CentOS"
+                VER=$(cat /etc/centos-release | sed 's/.*release //' | sed 's/ .*//')
+                DISTRO_ID="centos"
+                DISTRO_NAME="CentOS"
+            elif [[ -f /etc/debian_version ]]; then
+                OS="Debian"
+                VER=$(cat /etc/debian_version)
+                DISTRO_ID="debian"
+                DISTRO_NAME="Debian"
+            elif [[ -f /etc/alpine-release ]]; then
+                OS="Alpine Linux"
+                VER=$(cat /etc/alpine-release)
+                DISTRO_ID="alpine"
+                DISTRO_NAME="Alpine Linux"
+            elif [[ -f /etc/arch-release ]]; then
+                OS="Arch Linux"
+                VER="rolling"
+                DISTRO_ID="arch"
+                DISTRO_NAME="Arch Linux"
+            else
+                OS="Linux"
+                VER=$(uname -r)
+                DISTRO_ID="unknown"
+                DISTRO_NAME="Unknown Linux"
+            fi
+
+            print_message "$CYAN" "检测到系统: $OS $VER ($ARCH)"
+            ;;
+        *)
+            VER=$(uname -r)
+            DISTRO_ID="unknown"
+            DISTRO_NAME="Unknown OS"
+            print_message "$YELLOW" "未知系统: $OS $VER"
+            ;;
+    esac
+
+    # 显示环境信息
+    if [[ "$IS_CONTAINER" == "true" ]]; then
+        print_message "$YELLOW" "运行在容器环境中 ($CONTAINER_TYPE)"
     fi
 
-    print_message "$CYAN" "检测到系统: $OS $VER"
-    if [[ "$CONTAINER_ENV" == "true" ]]; then
-        print_message "$YELLOW" "运行在容器环境中"
+    if [[ "$VIRTUALIZATION" != "none" ]]; then
+        print_message "$CYAN" "虚拟化环境: $VIRTUALIZATION"
     fi
 
     # 确保变量在全局可用
-    export OS VER DISTRO_ID CONTAINER_ENV
+    export OS ARCH KERNEL_VERSION VER DISTRO_ID DISTRO_NAME
+    export IS_CONTAINER CONTAINER_TYPE VIRTUALIZATION
 }
 
-# 检测包管理器
+# 检测包管理器（增强版）
 detect_package_manager() {
     PKG_MANAGER=""
     PKG_INSTALL=""
     PKG_UPDATE=""
+    PKG_SEARCH=""
+    PKG_INFO=""
 
-    if [[ "$OS" == "FreeBSD" ]]; then
-        if command_exists pkg; then
-            PKG_MANAGER="pkg"
-            PKG_INSTALL="pkg install -y"
-            PKG_UPDATE="pkg update"
-        fi
-    else
-        # 按优先级检测包管理器
-        if command_exists apt-get; then
-            PKG_MANAGER="apt-get"
-            PKG_INSTALL="apt-get install -y"
-            PKG_UPDATE="apt-get update"
-        elif command_exists apt; then
-            PKG_MANAGER="apt"
-            PKG_INSTALL="apt install -y"
-            PKG_UPDATE="apt update"
-        elif command_exists dnf; then
-            PKG_MANAGER="dnf"
-            PKG_INSTALL="dnf install -y"
-            PKG_UPDATE="dnf update -y"
-        elif command_exists yum; then
-            PKG_MANAGER="yum"
-            PKG_INSTALL="yum install -y"
-            PKG_UPDATE="yum update -y"
-        elif command_exists zypper; then
-            PKG_MANAGER="zypper"
-            PKG_INSTALL="zypper install -y"
-            PKG_UPDATE="zypper refresh"
-        elif command_exists pacman; then
-            PKG_MANAGER="pacman"
-            PKG_INSTALL="pacman -S --noconfirm"
-            PKG_UPDATE="pacman -Sy"
-        elif command_exists apk; then
-            PKG_MANAGER="apk"
-            PKG_INSTALL="apk add"
-            PKG_UPDATE="apk update"
-        elif command_exists emerge; then
-            PKG_MANAGER="emerge"
-            PKG_INSTALL="emerge"
-            PKG_UPDATE="emerge --sync"
-        elif command_exists xbps-install; then
-            PKG_MANAGER="xbps"
-            PKG_INSTALL="xbps-install -y"
-            PKG_UPDATE="xbps-install -S"
-        elif command_exists swupd; then
-            PKG_MANAGER="swupd"
-            PKG_INSTALL="swupd bundle-add"
-            PKG_UPDATE="swupd update"
-        elif command_exists nix-env; then
-            PKG_MANAGER="nix"
-            PKG_INSTALL="nix-env -i"
-            PKG_UPDATE="nix-channel --update"
-        fi
-    fi
+    # 根据系统类型和发行版检测包管理器
+    case "$OS" in
+        FreeBSD|OpenBSD|NetBSD)
+            if command_exists pkg; then
+                PKG_MANAGER="pkg"
+                PKG_INSTALL="pkg install -y"
+                PKG_UPDATE="pkg update"
+                PKG_SEARCH="pkg search"
+                PKG_INFO="pkg info"
+            elif command_exists pkg_add && [[ "$OS" == "OpenBSD" ]]; then
+                PKG_MANAGER="pkg_add"
+                PKG_INSTALL="pkg_add"
+                PKG_UPDATE="pkg_add -u"
+                PKG_SEARCH="pkg_info -Q"
+                PKG_INFO="pkg_info"
+            fi
+            ;;
+        Darwin)
+            if command_exists brew; then
+                PKG_MANAGER="brew"
+                PKG_INSTALL="brew install"
+                PKG_UPDATE="brew update"
+                PKG_SEARCH="brew search"
+                PKG_INFO="brew info"
+            elif command_exists port; then
+                PKG_MANAGER="port"
+                PKG_INSTALL="port install"
+                PKG_UPDATE="port selfupdate"
+                PKG_SEARCH="port search"
+                PKG_INFO="port info"
+            fi
+            ;;
+        Linux|*)
+            # 按优先级和发行版特性检测包管理器
+            if command_exists apt-get; then
+                PKG_MANAGER="apt-get"
+                PKG_INSTALL="apt-get install -y"
+                PKG_UPDATE="apt-get update"
+                PKG_SEARCH="apt-cache search"
+                PKG_INFO="apt-cache show"
+            elif command_exists apt; then
+                PKG_MANAGER="apt"
+                PKG_INSTALL="apt install -y"
+                PKG_UPDATE="apt update"
+                PKG_SEARCH="apt search"
+                PKG_INFO="apt show"
+            elif command_exists dnf; then
+                PKG_MANAGER="dnf"
+                PKG_INSTALL="dnf install -y"
+                PKG_UPDATE="dnf update -y"
+                PKG_SEARCH="dnf search"
+                PKG_INFO="dnf info"
+            elif command_exists yum; then
+                PKG_MANAGER="yum"
+                PKG_INSTALL="yum install -y"
+                PKG_UPDATE="yum update -y"
+                PKG_SEARCH="yum search"
+                PKG_INFO="yum info"
+            elif command_exists zypper; then
+                PKG_MANAGER="zypper"
+                PKG_INSTALL="zypper install -y"
+                PKG_UPDATE="zypper refresh"
+                PKG_SEARCH="zypper search"
+                PKG_INFO="zypper info"
+            elif command_exists pacman; then
+                PKG_MANAGER="pacman"
+                PKG_INSTALL="pacman -S --noconfirm"
+                PKG_UPDATE="pacman -Sy"
+                PKG_SEARCH="pacman -Ss"
+                PKG_INFO="pacman -Si"
+            elif command_exists apk; then
+                PKG_MANAGER="apk"
+                PKG_INSTALL="apk add"
+                PKG_UPDATE="apk update"
+                PKG_SEARCH="apk search"
+                PKG_INFO="apk info"
+            elif command_exists emerge; then
+                PKG_MANAGER="emerge"
+                PKG_INSTALL="emerge"
+                PKG_UPDATE="emerge --sync"
+                PKG_SEARCH="emerge --search"
+                PKG_INFO="emerge --info"
+            elif command_exists xbps-install; then
+                PKG_MANAGER="xbps"
+                PKG_INSTALL="xbps-install -y"
+                PKG_UPDATE="xbps-install -S"
+                PKG_SEARCH="xbps-query -Rs"
+                PKG_INFO="xbps-query -R"
+            elif command_exists swupd; then
+                PKG_MANAGER="swupd"
+                PKG_INSTALL="swupd bundle-add"
+                PKG_UPDATE="swupd update"
+                PKG_SEARCH="swupd search"
+                PKG_INFO="swupd bundle-info"
+            elif command_exists nix-env; then
+                PKG_MANAGER="nix"
+                PKG_INSTALL="nix-env -i"
+                PKG_UPDATE="nix-channel --update"
+                PKG_SEARCH="nix-env -qa"
+                PKG_INFO="nix-env -qa --description"
+            elif command_exists snap; then
+                PKG_MANAGER="snap"
+                PKG_INSTALL="snap install"
+                PKG_UPDATE="snap refresh"
+                PKG_SEARCH="snap find"
+                PKG_INFO="snap info"
+            elif command_exists flatpak; then
+                PKG_MANAGER="flatpak"
+                PKG_INSTALL="flatpak install -y"
+                PKG_UPDATE="flatpak update -y"
+                PKG_SEARCH="flatpak search"
+                PKG_INFO="flatpak info"
+            fi
+            ;;
+    esac
 
     if [[ -n "$PKG_MANAGER" ]]; then
         print_message "$GREEN" "检测到包管理器: $PKG_MANAGER"
@@ -197,7 +433,7 @@ detect_package_manager() {
     fi
 
     # 导出变量供其他函数使用
-    export PKG_MANAGER PKG_INSTALL PKG_UPDATE
+    export PKG_MANAGER PKG_INSTALL PKG_UPDATE PKG_SEARCH PKG_INFO
 }
 
 # 检查并安装依赖（无需root权限的方法）
@@ -703,37 +939,54 @@ get_memory_usage() {
             free=0
         fi
     else
-        # Linux系统 - 多种方法提高兼容性
+        # Linux系统 - 修复内存计算逻辑，确保 used + free = total
+        total=0
+        used=0
+        free=0
+
+        # 方法1: 使用free命令（最常用且最准确）
         if command_exists free; then
-            # 方法1: 使用free命令（最常用）
             local mem_info=$(free -k 2>/dev/null | grep "^Mem:")
             if [[ -n "$mem_info" ]]; then
                 total=$(echo "$mem_info" | awk '{print $2}')
-                used=$(echo "$mem_info" | awk '{print $3}')
-                free=$(echo "$mem_info" | awk '{print $4}')
 
-                # 在某些系统上，free命令的输出格式可能不同
-                # 如果第3列不是used，尝试计算
-                if [[ ! "$used" =~ ^[0-9]+$ ]]; then
-                    local available=$(echo "$mem_info" | awk '{print $7}' 2>/dev/null || echo "0")
-                    if [[ "$available" =~ ^[0-9]+$ ]]; then
-                        used=$((total - available))
-                    else
+                # 尝试获取available列（第7列，现代Linux系统）
+                local available=$(echo "$mem_info" | awk '{print $7}' 2>/dev/null || echo "")
+                if [[ "$available" =~ ^[0-9]+$ ]]; then
+                    # 如果有available列，使用它作为真正的可用内存
+                    free=$available
+                    used=$((total - free))
+                else
+                    # 如果没有available列，使用传统方法计算
+                    local mem_free=$(echo "$mem_info" | awk '{print $4}' 2>/dev/null || echo "0")
+                    local buff_cache=$(echo "$mem_info" | awk '{print $6}' 2>/dev/null || echo "0")
+
+                    # 验证数据有效性
+                    if [[ "$mem_free" =~ ^[0-9]+$ ]] && [[ "$buff_cache" =~ ^[0-9]+$ ]]; then
+                        free=$((mem_free + buff_cache))
                         used=$((total - free))
+                    else
+                        # 如果解析失败，使用第3列作为used，但需要重新计算free
+                        local raw_used=$(echo "$mem_info" | awk '{print $3}' 2>/dev/null || echo "0")
+                        if [[ "$raw_used" =~ ^[0-9]+$ ]]; then
+                            used=$raw_used
+                            free=$((total - used))
+                        fi
                     fi
                 fi
             fi
         fi
 
         # 方法2: 直接读取/proc/meminfo（备用方法）
-        if [[ -z "$total" || "$total" == "0" ]] && [[ -f /proc/meminfo ]]; then
+        if [[ "$total" == "0" ]] && [[ -f /proc/meminfo ]]; then
             total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
             local mem_free=$(grep "^MemFree:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
             local buffers=$(grep "^Buffers:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
             local cached=$(grep "^Cached:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
+            local sreclaimable=$(grep "^SReclaimable:" /proc/meminfo | awk '{print $2}' 2>/dev/null || echo "0")
 
-            # 计算实际可用内存
-            free=$((mem_free + buffers + cached))
+            # 计算实际可用内存（包括可回收的内存）
+            free=$((mem_free + buffers + cached + sreclaimable))
             used=$((total - free))
         fi
 
@@ -755,14 +1008,57 @@ get_memory_usage() {
         used=$(sanitize_integer "$used" "0")
         free=$(sanitize_integer "$free" "0")
 
-        # 如果仍然没有获取到数据，设置默认值
-        if [[ "$total" == "0" ]]; then
+        # 数据一致性验证和修正 - 优化版本
+        if [[ $total -gt 0 ]]; then
+            # 确保所有值都是有效数字
+            total=$(sanitize_integer "$total" "0")
+            used=$(sanitize_integer "$used" "0")
+            free=$(sanitize_integer "$free" "0")
+
+            # 确保 used + free = total 的一致性
+            local sum=$((used + free))
+            local diff=$((sum - total))
+
+            # 如果差异超过1%，说明数据有问题，需要修正
+            local tolerance=$((total / 100))
+            if [[ $tolerance -lt 1024 ]]; then
+                tolerance=1024  # 最小容差1MB
+            fi
+
+            if [[ ${diff#-} -gt $tolerance ]]; then
+                # 数据不一致，优先保证total的准确性
+                if [[ $free -gt $total ]]; then
+                    # free过大，重置为total
+                    free=$total
+                    used=0
+                elif [[ $used -gt $total ]]; then
+                    # used过大，重置
+                    used=$total
+                    free=0
+                else
+                    # 重新计算used，保证一致性
+                    used=$((total - free))
+                fi
+
+                # 最终安全检查
+                if [[ $used -lt 0 ]]; then
+                    used=0
+                    free=$total
+                fi
+                if [[ $free -lt 0 ]]; then
+                    free=0
+                    used=$total
+                fi
+            fi
+        else
+            # 如果没有获取到数据，设置默认值
             total=0
             used=0
             free=0
         fi
     fi
 
+    # 计算使用百分比
     if [[ $total -gt 0 ]]; then
         usage_percent=$(echo "scale=1; $used * 100 / $total" | bc 2>/dev/null || echo "0")
         # 确保usage_percent是有效的数字
@@ -929,23 +1225,44 @@ get_network_usage() {
             interface=$(awk '/^[^I]/ && $2 == "00000000" {print $1; exit}' /proc/net/route 2>/dev/null)
         fi
 
-        # 方法4: 查找活跃的网络接口
+        # 方法4: 查找活跃的网络接口（改进版）
         if [[ -z "$interface" && -f "/proc/net/dev" ]]; then
             # 查找有流量的接口（排除lo和虚拟接口）
             interface=$(awk '/^ *[^:]*:/ {
                 gsub(/:/, "", $1)
-                if ($1 != "lo" && $1 !~ /^(docker|br-|veth|tun|tap)/ && ($2 > 0 || $10 > 0)) {
-                    print $1
-                    exit
+                # 排除回环和虚拟接口
+                if ($1 != "lo" && $1 !~ /^(docker|br-|veth|tun|tap|virbr|vmnet)/) {
+                    # 检查是否有流量（接收或发送字节数 > 1MB）
+                    if ($2 > 1048576 || $10 > 1048576) {
+                        print $1
+                        exit
+                    }
                 }
             }' /proc/net/dev)
         fi
 
-        # 方法5: 如果还是没找到，使用第一个非lo接口
+        # 方法5: 如果还是没找到，使用第一个物理网络接口
+        if [[ -z "$interface" && -f "/proc/net/dev" ]]; then
+            # 优先选择常见的物理接口名称
+            for prefix in eth ens enp eno wlan wlp; do
+                interface=$(awk -v prefix="$prefix" '/^ *[^:]*:/ {
+                    gsub(/:/, "", $1)
+                    if ($1 ~ "^" prefix) {
+                        print $1
+                        exit
+                    }
+                }' /proc/net/dev)
+                if [[ -n "$interface" ]]; then
+                    break
+                fi
+            done
+        fi
+
+        # 方法6: 最后的备选方案
         if [[ -z "$interface" && -f "/proc/net/dev" ]]; then
             interface=$(awk '/^ *[^:]*:/ {
                 gsub(/:/, "", $1)
-                if ($1 != "lo" && $1 !~ /^(docker|br-|veth|tun|tap)/) {
+                if ($1 != "lo" && $1 !~ /^(docker|br-|veth|tun|tap|virbr|vmnet)/) {
                     print $1
                     exit
                 }
@@ -1108,6 +1425,274 @@ clean_json_string() {
     echo "$input" | tr -d '\000-\037' | tr -d '\177-\377'
 }
 
+# 验证JSON数据格式
+validate_json_data() {
+    local json_data="$1"
+    local data_type="$2"
+
+    # 基本格式检查
+    if [[ ! "$json_data" =~ ^\{.*\}$ ]]; then
+        return 1
+    fi
+
+    # 根据数据类型进行特定验证
+    case "$data_type" in
+        "cpu")
+            # CPU数据应包含usage_percent和load_avg
+            if [[ "$json_data" =~ \"usage_percent\":[0-9]+\.?[0-9]* ]] && [[ "$json_data" =~ \"load_avg\":\[ ]]; then
+                return 0
+            fi
+            ;;
+        "memory"|"disk")
+            # 内存和磁盘数据应包含total, used, free, usage_percent
+            if [[ "$json_data" =~ \"total\":[0-9]+\.?[0-9]* ]] && \
+               [[ "$json_data" =~ \"used\":[0-9]+\.?[0-9]* ]] && \
+               [[ "$json_data" =~ \"free\":[0-9]+\.?[0-9]* ]] && \
+               [[ "$json_data" =~ \"usage_percent\":[0-9]+\.?[0-9]* ]]; then
+                return 0
+            fi
+            ;;
+        "network")
+            # 网络数据应包含upload_speed, download_speed, total_upload, total_download
+            if [[ "$json_data" =~ \"upload_speed\":[0-9]+ ]] && \
+               [[ "$json_data" =~ \"download_speed\":[0-9]+ ]] && \
+               [[ "$json_data" =~ \"total_upload\":[0-9]+ ]] && \
+               [[ "$json_data" =~ \"total_download\":[0-9]+ ]]; then
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+# 生成默认JSON数据
+generate_default_json() {
+    local data_type="$1"
+
+    case "$data_type" in
+        "cpu")
+            echo '{"usage_percent":0,"load_avg":[0,0,0]}'
+            ;;
+        "memory")
+            echo '{"total":0,"used":0,"free":0,"usage_percent":0}'
+            ;;
+        "disk")
+            echo '{"total":0,"used":0,"free":0,"usage_percent":0}'
+            ;;
+        "network")
+            echo '{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
+            ;;
+        *)
+            echo '{}'
+            ;;
+    esac
+}
+
+# 指数退避重试机制
+retry_with_backoff() {
+    local max_attempts="${1:-3}"
+    local initial_delay="${2:-1}"
+    local max_delay="${3:-30}"
+    local backoff_factor="${4:-2}"
+    local command_func="$5"
+    shift 5
+    local command_args=("$@")
+
+    local attempt=1
+    local delay=$initial_delay
+
+    while [[ $attempt -le $max_attempts ]]; do
+        log "尝试执行 (第 $attempt/$max_attempts 次)..."
+
+        if $command_func "${command_args[@]}"; then
+            log "执行成功 (第 $attempt 次尝试)"
+            return 0
+        fi
+
+        if [[ $attempt -lt $max_attempts ]]; then
+            log "执行失败，${delay}秒后重试..."
+            sleep "$delay"
+
+            # 计算下次延迟时间（指数退避）
+            delay=$((delay * backoff_factor))
+            if [[ $delay -gt $max_delay ]]; then
+                delay=$max_delay
+            fi
+        fi
+
+        attempt=$((attempt + 1))
+    done
+
+    log "所有重试尝试均失败"
+    return 1
+}
+
+# 获取服务器配置（内部实现）
+_get_config_internal() {
+    log "正在获取服务器配置..."
+
+    local response=$(curl -s -w "%{http_code}" -X GET "$WORKER_URL/api/config/$SERVER_ID" \
+        -H "X-API-Key: $API_KEY" 2>/dev/null || echo "000")
+
+    local http_code="${response: -3}"
+    local response_body="${response%???}"
+
+    if [[ "$http_code" == "200" ]]; then
+        log "配置获取成功"
+
+        # 尝试解析配置
+        local new_interval=""
+        if command_exists jq; then
+            # 如果有jq命令，使用jq解析
+            new_interval=$(echo "$response_body" | jq -r '.config.report_interval // empty' 2>/dev/null)
+        else
+            # 如果没有jq，使用改进的文本解析
+            # 方法1: 使用grep + cut
+            new_interval=$(echo "$response_body" | grep -o '"report_interval":[0-9]*' | cut -d':' -f2 2>/dev/null)
+
+            # 方法2: 如果方法1失败，使用sed备用方案
+            if [[ -z "$new_interval" ]]; then
+                new_interval=$(echo "$response_body" | sed -n 's/.*"report_interval":\s*\([0-9]\+\).*/\1/p' 2>/dev/null)
+            fi
+
+            # 方法3: 最后的备用方案
+            if [[ -z "$new_interval" ]]; then
+                new_interval=$(echo "$response_body" | awk -F'"report_interval":' '{if(NF>1) print $2}' | awk -F',' '{print $1}' | tr -d ' ' 2>/dev/null)
+            fi
+        fi
+
+        # 验证并更新间隔设置
+        if [[ -n "$new_interval" && "$new_interval" =~ ^[0-9]+$ && "$new_interval" -gt 0 ]]; then
+            if [[ "$new_interval" != "$INTERVAL" ]]; then
+                log "检测到新的上报间隔: ${new_interval}秒 (当前: ${INTERVAL}秒)"
+                INTERVAL="$new_interval"
+                # 更新配置文件
+                save_config
+                log "上报间隔已更新为: ${INTERVAL}秒"
+                return 0
+            else
+                log "配置无变化，当前间隔: ${INTERVAL}秒"
+                return 0
+            fi
+        else
+            log "警告: 无法解析配置中的上报间隔，保持当前设置"
+            return 1
+        fi
+    else
+        # 根据HTTP状态码决定是否可重试
+        case "$http_code" in
+            "401"|"404")
+                log "配置获取失败 (HTTP $http_code): 认证或服务器不存在"
+                return 1  # 不可重试的错误
+                ;;
+            "429"|"500"|"503"|"502"|"504"|"000")
+                log "配置获取失败 (HTTP $http_code): 可重试的错误"
+                return 2  # 可重试的错误
+                ;;
+            *)
+                log "配置获取失败 (HTTP $http_code): $response_body"
+                return 1  # 默认不可重试
+                ;;
+        esac
+    fi
+}
+
+# 获取服务器配置（带重试）
+get_config() {
+    # 使用重试机制调用内部函数
+    if retry_with_backoff 3 2 10 2 _get_config_internal; then
+        return 0
+    else
+        log "配置获取最终失败，使用缓存配置"
+        return 1
+    fi
+}
+
+# 本地缓存管理
+CACHE_DIR="$SCRIPT_DIR/cache"
+CONFIG_CACHE_FILE="$CACHE_DIR/config.json"
+METRICS_CACHE_FILE="$CACHE_DIR/last_metrics.json"
+
+# 初始化缓存目录
+init_cache() {
+    if [[ ! -d "$CACHE_DIR" ]]; then
+        mkdir -p "$CACHE_DIR"
+        log "创建缓存目录: $CACHE_DIR"
+    fi
+}
+
+# 保存配置到缓存
+save_config_cache() {
+    local config_data="$1"
+    init_cache
+
+    echo "$config_data" > "$CONFIG_CACHE_FILE"
+    log "配置已缓存到本地"
+}
+
+# 从缓存加载配置
+load_config_cache() {
+    if [[ -f "$CONFIG_CACHE_FILE" ]]; then
+        local cached_config=$(cat "$CONFIG_CACHE_FILE")
+        if [[ -n "$cached_config" ]]; then
+            log "从缓存加载配置"
+            echo "$cached_config"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 清理过期缓存
+cleanup_cache() {
+    local max_age_hours="${1:-24}"  # 默认24小时
+
+    if [[ -d "$CACHE_DIR" ]]; then
+        # 清理超过指定时间的缓存文件
+        find "$CACHE_DIR" -type f -mtime +0 -exec rm -f {} \; 2>/dev/null || true
+        log "清理了过期的缓存文件"
+    fi
+}
+
+# 保存最后成功的监控数据
+save_metrics_cache() {
+    local metrics_data="$1"
+    init_cache
+
+    local cache_entry="{\"timestamp\":$(date +%s),\"data\":$metrics_data}"
+    echo "$cache_entry" > "$METRICS_CACHE_FILE"
+}
+
+# 获取缓存的监控数据
+get_cached_metrics() {
+    if [[ -f "$METRICS_CACHE_FILE" ]]; then
+        local cached_data=$(cat "$METRICS_CACHE_FILE")
+        if [[ -n "$cached_data" ]]; then
+            # 检查缓存时间（不超过1小时）
+            local cache_timestamp
+            if command_exists jq; then
+                cache_timestamp=$(echo "$cached_data" | jq -r '.timestamp // 0' 2>/dev/null)
+            else
+                cache_timestamp=$(echo "$cached_data" | sed -n 's/.*"timestamp":\([0-9]\+\).*/\1/p')
+            fi
+
+            local current_time=$(date +%s)
+            local age=$((current_time - cache_timestamp))
+
+            if [[ $age -lt 3600 ]]; then  # 1小时内的缓存有效
+                if command_exists jq; then
+                    echo "$cached_data" | jq -r '.data' 2>/dev/null
+                else
+                    echo "$cached_data" | sed -n 's/.*"data":\(.*\)}/\1/p'
+                fi
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
 # 上报监控数据
 report_metrics() {
     local timestamp=$(date +%s)
@@ -1126,22 +1711,22 @@ report_metrics() {
     disk_raw=$(clean_json_string "$disk_raw")
     network_raw=$(clean_json_string "$network_raw")
 
-    # 验证各个JSON组件（使用更宽松的验证）
-    if [[ -z "$cpu_raw" || "$cpu_raw" == "{}" || ! "$cpu_raw" =~ ^\{.*\}$ ]]; then
-        log "使用默认CPU数据"
-        cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
+    # 验证各个JSON组件（使用增强的验证）
+    if ! validate_json_data "$cpu_raw" "cpu"; then
+        log "CPU数据验证失败，使用默认数据"
+        cpu_raw=$(generate_default_json "cpu")
     fi
-    if [[ -z "$memory_raw" || "$memory_raw" == "{}" || ! "$memory_raw" =~ ^\{.*\}$ ]]; then
-        log "使用默认内存数据"
-        memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    if ! validate_json_data "$memory_raw" "memory"; then
+        log "内存数据验证失败，使用默认数据"
+        memory_raw=$(generate_default_json "memory")
     fi
-    if [[ -z "$disk_raw" || "$disk_raw" == "{}" || ! "$disk_raw" =~ ^\{.*\}$ ]]; then
-        log "使用默认磁盘数据"
-        disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    if ! validate_json_data "$disk_raw" "disk"; then
+        log "磁盘数据验证失败，使用默认数据"
+        disk_raw=$(generate_default_json "disk")
     fi
-    if [[ -z "$network_raw" || "$network_raw" == "{}" || ! "$network_raw" =~ ^\{.*\}$ ]]; then
-        log "使用默认网络数据"
-        network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
+    if ! validate_json_data "$network_raw" "network"; then
+        log "网络数据验证失败，使用默认数据"
+        network_raw=$(generate_default_json "network")
     fi
 
     # 构建JSON数据
@@ -1193,20 +1778,29 @@ report_metrics() {
 
         return 0
     else
-        log "数据上报失败 (HTTP $http_code): $response_body"
-
-        # 简化的错误处理
+        # 错误分类处理
         case "$http_code" in
-            "400") log "数据格式错误" ;;
-            "401") log "认证失败 - 请检查API密钥" ;;
-            "404") log "服务器不存在 - 请检查服务器ID" ;;
-            "429") log "请求过于频繁 - 将自动重试" ;;
-            "500"|"503") log "服务器错误 - 将在下个周期重试" ;;
-            "000") log "网络连接失败" ;;
-            *) log "未知错误 (HTTP $http_code)" ;;
+            "400"|"413")
+                log "数据上报失败 (HTTP $http_code): 数据格式或大小问题"
+                return 1  # 不可重试的错误
+                ;;
+            "401"|"403")
+                log "数据上报失败 (HTTP $http_code): 认证失败"
+                return 1  # 不可重试的错误
+                ;;
+            "404")
+                log "数据上报失败 (HTTP $http_code): 服务器不存在"
+                return 1  # 不可重试的错误
+                ;;
+            "429"|"500"|"502"|"503"|"504"|"000")
+                log "数据上报失败 (HTTP $http_code): 可重试的错误"
+                return 2  # 可重试的错误
+                ;;
+            *)
+                log "数据上报失败 (HTTP $http_code): 未知错误"
+                return 1  # 默认不可重试
+                ;;
         esac
-
-        return 1
     fi
 }
 
@@ -1373,6 +1967,70 @@ EOL
     fi
 }
 
+# 获取服务器配置
+get_config() {
+    log "正在获取服务器配置..."
+
+    local response=\$(curl -s -w "%{http_code}" -X GET "\$WORKER_URL/api/config/\$SERVER_ID" \\
+        -H "X-API-Key: \$API_KEY" 2>/dev/null || echo "000")
+
+    local http_code="\${response: -3}"
+    local response_body="\${response%???}"
+
+    if [[ "\$http_code" == "200" ]]; then
+        log "配置获取成功"
+
+        # 尝试解析配置
+        local new_interval=""
+        # 使用改进的文本解析（避免依赖jq）
+        # 方法1: 使用grep + cut
+        new_interval=\$(echo "\$response_body" | grep -o '"report_interval":[0-9]*' | cut -d':' -f2 2>/dev/null)
+
+        # 方法2: 如果方法1失败，使用awk备用方案
+        if [[ -z "\$new_interval" ]]; then
+            new_interval=\$(echo "\$response_body" | awk -F'"report_interval":' '{if(NF>1) print \$2}' | awk -F',' '{print \$1}' | tr -d ' ' 2>/dev/null)
+        fi
+
+        # 验证并更新间隔设置
+        if [[ -n "\$new_interval" && "\$new_interval" =~ ^[0-9]+\$ && "\$new_interval" -gt 0 ]]; then
+            if [[ "\$new_interval" != "\$INTERVAL" ]]; then
+                log "检测到新的上报间隔: \${new_interval}秒 (当前: \${INTERVAL}秒)"
+                INTERVAL="\$new_interval"
+                # 更新配置文件
+                cat > "\$CONFIG_FILE" << EOL
+# VPS监控配置文件
+WORKER_URL="\$WORKER_URL"
+SERVER_ID="\$SERVER_ID"
+API_KEY="\$API_KEY"
+INTERVAL="\$INTERVAL"
+EOL
+                log "上报间隔已更新为: \${INTERVAL}秒"
+                return 0
+            else
+                log "配置无变化，当前间隔: \${INTERVAL}秒"
+                return 0
+            fi
+        else
+            log "警告: 无法解析配置中的上报间隔，保持当前设置"
+            return 1
+        fi
+    else
+        log "配置获取失败 (HTTP \$http_code): \$response_body"
+
+        # 简化的错误处理
+        case "\$http_code" in
+            "401") log "认证失败 - 请检查API密钥" ;;
+            "404") log "服务器不存在 - 请检查服务器ID" ;;
+            "429") log "请求过于频繁 - 将稍后重试" ;;
+            "500"|"503") log "服务器错误 - 将稍后重试" ;;
+            "000") log "网络连接失败" ;;
+            *) log "未知错误 (HTTP \$http_code)" ;;
+        esac
+
+        return 1
+    fi
+}
+
 # 主循环
 main() {
     log "VPS监控服务启动 (PID: \$\$)"
@@ -1381,7 +2039,23 @@ main() {
     # 信号处理
     trap 'log "收到终止信号，正在停止..."; rm -f "\$PID_FILE"; exit 0' TERM INT
 
+    # 启动时获取一次配置
+    log "启动时获取服务器配置..."
+    get_config || log "启动时配置获取失败，使用当前配置"
+
+    local config_check_counter=0
+    local config_check_interval=10  # 每10个周期检查一次配置（约10分钟）
+
     while true; do
+        # 定期检查配置更新
+        if [[ \$config_check_counter -ge \$config_check_interval ]]; then
+            log "定期检查配置更新..."
+            get_config || log "配置检查失败，继续使用当前配置"
+            config_check_counter=0
+        else
+            config_check_counter=\$((config_check_counter + 1))
+        fi
+
         if ! report_metrics; then
             log "上报失败，将在下个周期重试"
         fi
@@ -1626,13 +2300,22 @@ test_connection() {
         return 1
     fi
 
-    print_message "$BLUE" "正在测试上报数据..."
-    if report_metrics; then
-        print_message "$GREEN" "✓ 连接测试成功"
+    print_message "$BLUE" "正在测试配置获取..."
+    if get_config; then
+        print_message "$GREEN" "✓ 配置获取测试成功"
     else
-        print_message "$RED" "✗ 连接测试失败，请检查配置和网络"
+        print_message "$YELLOW" "⚠ 配置获取测试失败，但不影响基本功能"
+    fi
+
+    print_message "$BLUE" "正在测试数据上报..."
+    if report_metrics; then
+        print_message "$GREEN" "✓ 数据上报测试成功"
+    else
+        print_message "$RED" "✗ 数据上报测试失败，请检查配置和网络"
         return 1
     fi
+
+    print_message "$GREEN" "✓ 连接测试完成"
 }
 
 
@@ -1769,26 +2452,89 @@ uninstall_monitor() {
         return 0
     fi
 
-    print_message "$BLUE" "开始卸载VPS监控服务..."
+    print_message "$BLUE" "开始彻底卸载VPS监控服务..."
 
-    # 停止服务
+    # 1. 停止所有相关进程
+    print_message "$BLUE" "停止所有相关进程..."
     stop_service
 
-    # 删除systemd服务
-    if [[ -f "$SYSTEMD_SERVICE_FILE" ]] && command_exists systemctl; then
-        print_message "$BLUE" "删除systemd服务..."
-        systemctl --user disable vps-monitor.service 2>/dev/null || true
-        rm -f "$SYSTEMD_SERVICE_FILE"
-        systemctl --user daemon-reload 2>/dev/null || true
+    # 查找并停止所有相关进程
+    local pids=$(pgrep -f "cf-vps-monitor\|monitor-service\.sh\|vps-monitor" 2>/dev/null || echo "")
+    if [[ -n "$pids" ]]; then
+        for pid in $pids; do
+            if [[ "$pid" != "$$" ]]; then  # 不杀死当前脚本进程
+                print_message "$BLUE" "停止进程 PID: $pid"
+                kill "$pid" 2>/dev/null || true
+                sleep 1
+                if kill -0 "$pid" 2>/dev/null; then
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+            fi
+        done
     fi
 
-    # 删除所有文件
+    # 2. 删除systemd服务（修复服务名称）
+    if [[ -f "$SYSTEMD_SERVICE_FILE" ]] && command_exists systemctl; then
+        print_message "$BLUE" "删除systemd服务..."
+        systemctl --user stop cf-vps-monitor.service 2>/dev/null || true
+        systemctl --user disable cf-vps-monitor.service 2>/dev/null || true
+        rm -f "$SYSTEMD_SERVICE_FILE"
+        systemctl --user daemon-reload 2>/dev/null || true
+        systemctl --user reset-failed 2>/dev/null || true
+    fi
+
+    # 3. 清理临时文件
+    print_message "$BLUE" "清理临时文件..."
+    # 清理网络监控临时文件
+    rm -f /tmp/vps_monitor_net_* 2>/dev/null || true
+    rm -f /tmp/vps_monitor_functions_*.sh 2>/dev/null || true
+
+    # 清理wrapper脚本
+    rm -f "$SCRIPT_DIR/curl_wrapper.sh" 2>/dev/null || true
+    rm -f "$SCRIPT_DIR/bc_wrapper.sh" 2>/dev/null || true
+
+    # 清理可能的缓存目录中的临时文件
+    local temp_dirs=("${TMPDIR:-/tmp}" "${HOME}/.cache")
+    for temp_dir in "${temp_dirs[@]}"; do
+        if [[ -d "$temp_dir" ]]; then
+            find "$temp_dir" -name "*vps_monitor*" -type f -delete 2>/dev/null || true
+        fi
+    done
+
+    # 4. 删除备用安装目录
+    print_message "$BLUE" "检查备用安装目录..."
+    local alt_dirs=(
+        "$HOME/.local/share/vps-monitor"
+        "/opt/vps-monitor"
+        "$HOME/.vps-monitor"
+    )
+    for dir in "${alt_dirs[@]}"; do
+        if [[ -d "$dir" && "$dir" != "$SCRIPT_DIR" ]]; then
+            print_message "$BLUE" "删除备用目录: $dir"
+            rm -rf "$dir" 2>/dev/null || true
+        fi
+    done
+
+    # 5. 删除主安装目录
     if [[ -d "$SCRIPT_DIR" ]]; then
-        print_message "$BLUE" "删除安装目录..."
+        print_message "$BLUE" "删除主安装目录..."
         rm -rf "$SCRIPT_DIR"
     fi
 
-    print_message "$GREEN" "✓ VPS监控服务已完全卸载"
+    # 6. 检查残留进程
+    print_message "$BLUE" "检查残留进程..."
+    local remaining_pids=$(pgrep -f "cf-vps-monitor\|monitor-service\.sh\|vps-monitor" 2>/dev/null || echo "")
+    if [[ -n "$remaining_pids" ]]; then
+        print_message "$YELLOW" "警告: 发现残留进程，建议手动检查:"
+        for pid in $remaining_pids; do
+            if [[ "$pid" != "$$" ]]; then
+                local cmd=$(ps -p "$pid" -o cmd= 2>/dev/null || echo "未知进程")
+                print_message "$YELLOW" "  PID $pid: $cmd"
+            fi
+        done
+    fi
+
+    print_message "$GREEN" "✓ VPS监控服务已彻底卸载"
     print_message "$CYAN" "感谢使用VPS监控服务"
 }
 
