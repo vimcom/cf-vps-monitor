@@ -3357,28 +3357,17 @@ function getIndexHtml() {
     </style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+    <nav class="navbar navbar-dark bg-primary">
         <div class="container">
             <a class="navbar-brand" href="/">VPS监控面板</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarNav">
-                <ul class="navbar-nav ms-auto align-items-center">
-                    <li class="nav-item">
-                        <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2" title="GitHub Repository">
-                            <i class="bi bi-github"></i>
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
-                            <i class="bi bi-moon-stars-fill"></i>
-                        </button>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" id="adminAuthLink" href="/login.html">管理员登录</a>
-                    </li>
-                </ul>
+            <div class="d-flex align-items-center">
+                <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2" title="GitHub Repository">
+                    <i class="bi bi-github"></i>
+                </a>
+                <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
+                    <i class="bi bi-moon-stars-fill"></i>
+                </button>
+                <a class="nav-link text-light" id="adminAuthLink" href="/login.html" style="white-space: nowrap;">管理员登录</a>
             </div>
         </div>
     </nav>
@@ -3388,6 +3377,7 @@ function getIndexHtml() {
             暂无服务器数据，请先登录管理后台添加服务器。
         </div>
 
+        <!-- 桌面端表格视图 -->
         <div class="table-responsive">
             <table class="table table-striped table-hover align-middle">
                 <thead>
@@ -3412,6 +3402,16 @@ function getIndexHtml() {
                 </tbody>
             </table>
         </div>
+
+        <!-- 移动端卡片视图 -->
+        <div class="mobile-card-container" id="mobileServerContainer">
+            <div class="text-center p-3">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">加载中...</span>
+                </div>
+                <div class="mt-2">加载服务器数据中...</div>
+            </div>
+        </div>
     </div>
 
     <!-- Website Status Section -->
@@ -3420,6 +3420,7 @@ function getIndexHtml() {
         <div id="noSites" class="alert alert-info d-none">
             暂无监控网站数据。
         </div>
+        <!-- 桌面端表格视图 -->
         <div class="table-responsive">
             <table class="table table-striped table-hover align-middle">
                 <thead>
@@ -3438,6 +3439,16 @@ function getIndexHtml() {
                     </tr>
                 </tbody>
             </table>
+        </div>
+
+        <!-- 移动端卡片视图 -->
+        <div class="mobile-card-container" id="mobileSiteContainer">
+            <div class="text-center p-3">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">加载中...</span>
+                </div>
+                <div class="mt-2">加载网站数据中...</div>
+            </div>
         </div>
     </div>
     <!-- End Website Status Section -->
@@ -3641,23 +3652,14 @@ function getLoginHtml() {
     </style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+    <nav class="navbar navbar-dark bg-primary">
         <div class="container">
             <a class="navbar-brand" href="/">VPS监控面板</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarNav">
-                <ul class="navbar-nav ms-auto align-items-center">
-                    <li class="nav-item">
-                        <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
-                            <i class="bi bi-moon-stars-fill"></i>
-                        </button>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="/">返回首页</a>
-                    </li>
-                </ul>
+            <div class="d-flex align-items-center">
+                <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
+                    <i class="bi bi-moon-stars-fill"></i>
+                </button>
+                <a class="nav-link text-light" href="/" style="white-space: nowrap;">返回首页</a>
             </div>
         </div>
     </nav>
@@ -3720,36 +3722,19 @@ function getAdminHtml() {
     <link href="/css/style.css" rel="stylesheet">
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+    <nav class="navbar navbar-dark bg-primary">
         <div class="container">
             <a class="navbar-brand" href="/">VPS监控面板</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarNav">
-                <ul class="navbar-nav me-auto">
-                    <li class="nav-item">
-                        <a class="nav-link" href="/">返回首页</a>
-                    </li>
-                </ul>
-                <ul class="navbar-nav align-items-center">
-                    <li class="nav-item">
-                        <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2" title="GitHub Repository">
-                            <i class="bi bi-github"></i>
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
-                            <i class="bi bi-moon-stars-fill"></i>
-                        </button>
-                    </li>
-                    <li class="nav-item">
-                        <button id="changePasswordBtn" class="btn btn-outline-light btn-sm me-2">修改密码</button>
-                    </li>
-                    <li class="nav-item">
-                        <button id="logoutBtn" class="btn btn-outline-light btn-sm">退出登录</button>
-                    </li>
-                </ul>
+            <div class="d-flex align-items-center flex-wrap">
+                <a class="nav-link text-light me-2" href="/" style="white-space: nowrap;">返回首页</a>
+                <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-1" title="GitHub Repository">
+                    <i class="bi bi-github"></i>
+                </a>
+                <button id="themeToggler" class="btn btn-outline-light btn-sm me-1" title="切换主题">
+                    <i class="bi bi-moon-stars-fill"></i>
+                </button>
+                <button id="changePasswordBtn" class="btn btn-outline-light btn-sm me-1" style="font-size: 0.75rem; padding: 0.25rem 0.5rem;">密码</button>
+                <button id="logoutBtn" class="btn btn-outline-light btn-sm" style="font-size: 0.75rem; padding: 0.25rem 0.5rem;">退出</button>
             </div>
         </div>
     </nav>
@@ -3792,6 +3777,7 @@ function getAdminHtml() {
         <div id="serverAlert" class="alert d-none"></div>
         <div class="card">
             <div class="card-body">
+                <!-- 桌面端表格视图 -->
                 <div class="table-responsive">
                     <table class="table table-striped table-hover">
                         <thead>
@@ -3814,6 +3800,16 @@ function getAdminHtml() {
                             </tr>
                         </tbody>
                     </table>
+                </div>
+
+                <!-- 移动端卡片视图 -->
+                <div class="mobile-card-container" id="mobileAdminServerContainer">
+                    <div class="text-center p-3">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">加载中...</span>
+                        </div>
+                        <div class="mt-2">加载服务器数据中...</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -3847,6 +3843,7 @@ function getAdminHtml() {
 
         <div class="card">
             <div class="card-body">
+                <!-- 桌面端表格视图 -->
                 <div class="table-responsive">
                     <table class="table table-striped table-hover">
                         <thead>
@@ -3868,6 +3865,16 @@ function getAdminHtml() {
                             </tr>
                         </tbody>
                     </table>
+                </div>
+
+                <!-- 移动端卡片视图 -->
+                <div class="mobile-card-container" id="mobileAdminSiteContainer">
+                    <div class="text-center p-3">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">加载中...</span>
+                        </div>
+                        <div class="mt-2">加载网站数据中...</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -4145,6 +4152,310 @@ body {
     .chart-container {
         height: 150px;
     }
+
+    /* 移动端隐藏表格，显示卡片 */
+    .table-responsive {
+        display: none !important;
+    }
+
+    .mobile-card-container {
+        display: block !important;
+    }
+
+    /* 移动端导航栏优化 */
+    .navbar-brand {
+        font-size: 1rem;
+        margin-right: 0.5rem;
+    }
+
+    .container {
+        padding-left: 10px;
+        padding-right: 10px;
+    }
+
+    /* 移动端导航栏按钮组优化 */
+    .navbar .d-flex {
+        gap: 0.25rem;
+        flex-wrap: wrap;
+    }
+
+    .navbar .btn-sm {
+        padding: 0.25rem 0.5rem;
+        font-size: 0.75rem;
+        min-width: auto;
+        border-width: 1px;
+    }
+
+    .navbar .nav-link {
+        font-size: 0.8rem;
+        padding: 0.25rem 0.5rem;
+        margin: 0;
+    }
+
+    /* 超小屏幕优化 (小于400px) */
+    @media (max-width: 400px) {
+        .navbar-brand {
+            font-size: 0.9rem;
+        }
+
+        .navbar .btn-sm {
+            padding: 0.2rem 0.4rem;
+            font-size: 0.7rem;
+        }
+
+        .navbar .nav-link {
+            font-size: 0.75rem;
+            padding: 0.2rem 0.4rem;
+        }
+
+        .container {
+            padding-left: 8px;
+            padding-right: 8px;
+        }
+    }
+
+    /* 移动端按钮优化 */
+    .btn-sm {
+        padding: 0.375rem 0.75rem;
+        font-size: 0.875rem;
+    }
+}
+
+/* 桌面端隐藏卡片容器 */
+@media (min-width: 769px) {
+    .mobile-card-container {
+        display: none !important;
+    }
+}
+
+/* 移动端卡片样式 */
+.mobile-card-container {
+    display: none; /* 默认隐藏，通过媒体查询控制 */
+}
+
+.mobile-server-card, .mobile-site-card {
+    background: var(--bs-card-bg, #fff);
+    border: 1px solid var(--bs-border-color, rgba(0,0,0,.125));
+    border-radius: 0.5rem;
+    margin-bottom: 0.75rem;
+    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+    overflow: hidden;
+    transition: box-shadow 0.15s ease-in-out, transform 0.15s ease-in-out;
+}
+
+@media (max-width: 768px) {
+    .mobile-server-card:hover, .mobile-site-card:hover {
+        box-shadow: 0 0.25rem 0.5rem rgba(0, 0, 0, 0.1);
+        transform: translateY(-1px);
+    }
+}
+
+.mobile-card-header {
+    padding: 0.75rem;
+    background-color: var(--bs-card-cap-bg, rgba(0,0,0,.03));
+    border-bottom: 1px solid var(--bs-border-color, rgba(0,0,0,.125));
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+@media (max-width: 768px) {
+    .mobile-card-header:hover {
+        background-color: var(--bs-card-cap-bg, rgba(0,0,0,.05));
+    }
+}
+
+.mobile-card-title {
+    font-weight: 600;
+    margin: 0;
+    font-size: 1rem;
+    line-height: 1.3;
+}
+
+.mobile-card-status {
+    flex-shrink: 0;
+}
+
+.mobile-card-body {
+    padding: 0.75rem;
+}
+
+.mobile-card-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--bs-border-color-translucent, rgba(0,0,0,.08));
+}
+
+.mobile-card-row:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+}
+
+/* 两列布局样式 */
+.mobile-card-two-columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--bs-border-color-translucent, rgba(0,0,0,.08));
+}
+
+.mobile-card-two-columns:last-child {
+    border-bottom: none;
+    padding-bottom: 0.25rem;
+}
+
+.mobile-card-column-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    min-height: 2rem;
+    justify-content: center;
+}
+
+.mobile-card-column-item .mobile-card-label {
+    font-size: 0.7rem;
+    margin-bottom: 0;
+    color: var(--bs-secondary-color, #6c757d);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
+.mobile-card-column-item .mobile-card-value {
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-align: left;
+    max-width: 100%;
+    word-break: break-word;
+    line-height: 1.2;
+}
+
+/* 移动端单行样式优化 */
+@media (max-width: 768px) {
+    .mobile-card-row {
+        padding: 0.5rem 0;
+        min-height: 2rem;
+        align-items: center;
+    }
+
+    .mobile-card-label {
+        font-weight: 500;
+        font-size: 0.875rem;
+    }
+
+    .mobile-card-value {
+        font-weight: 600;
+        font-size: 0.875rem;
+        word-break: break-word;
+    }
+}
+
+.mobile-card-label {
+    font-weight: 500;
+    color: var(--bs-secondary-color, #6c757d);
+    font-size: 0.875rem;
+}
+
+.mobile-card-value {
+    text-align: right;
+    flex-shrink: 0;
+    max-width: 60%;
+}
+
+
+
+/* 移动端进度条优化 */
+@media (max-width: 768px) {
+    .progress {
+        height: 1rem;
+        margin-top: 0.25rem;
+        border-radius: 0.5rem;
+    }
+
+    .progress span {
+        font-size: 0.75rem;
+        line-height: 1rem;
+    }
+}
+
+/* 移动端状态徽章优化 */
+@media (max-width: 768px) {
+    .badge {
+        font-size: 0.75rem;
+        padding: 0.35em 0.65em;
+        border-radius: 0.375rem;
+    }
+}
+
+/* 移动端历史记录条优化 */
+@media (max-width: 768px) {
+    .history-bar-container {
+        height: 1.5rem;
+        border-radius: 0.25rem;
+        overflow: hidden;
+    }
+
+    .history-bar {
+        min-width: 2px;
+        border-radius: 0;
+    }
+}
+
+/* 移动端历史记录条优化 */
+.mobile-history-container {
+    margin-top: 0.5rem;
+}
+
+.mobile-history-label {
+    font-size: 0.75rem;
+    color: var(--bs-secondary-color, #6c757d);
+    margin-bottom: 0.25rem;
+}
+
+
+
+/* 移动端按钮优化 */
+@media (max-width: 768px) {
+    .mobile-card-body .btn-sm {
+        padding: 0.5rem 0.75rem;
+        font-size: 0.8rem;
+        border-radius: 0.375rem;
+        transition: all 0.15s ease-in-out;
+    }
+
+    .mobile-card-body .d-flex.gap-2 {
+        gap: 0.5rem !important;
+    }
+
+    .mobile-card-body .btn i {
+        font-size: 0.875rem;
+    }
+
+    /* 移动端触摸反馈 */
+    .mobile-card-header:active {
+        background-color: var(--bs-card-cap-bg, rgba(0,0,0,.08)) !important;
+        transform: scale(0.98);
+    }
+
+    .mobile-card-body .btn:active {
+        transform: scale(0.95);
+    }
+
+    /* 移动端容器标题优化 */
+    .container h2 {
+        font-size: 1.5rem;
+        margin-bottom: 1rem;
+    }
+
+    /* 移动端卡片标题层次优化 */
+    .mobile-card-title {
+        font-size: 1rem;
+        line-height: 1.3;
+        font-weight: 600;
+    }
 }
 
 /* 自定义浅绿色进度条 */
@@ -4270,6 +4581,162 @@ body {
 
         .navbar {
             background-color: #1e1e1e !important; /* 确保覆盖 Bootstrap 默认 */
+        }
+
+        /* 暗色主题移动端卡片样式 */
+        .mobile-server-card, .mobile-site-card {
+            background: var(--bs-dark, #212529);
+            border-color: var(--bs-border-color, #495057);
+        }
+
+        .mobile-card-header {
+            background-color: rgba(255, 255, 255, 0.05);
+            border-bottom-color: var(--bs-border-color, #495057);
+        }
+
+        .mobile-card-title {
+            color: #ffffff !important;
+        }
+
+        .mobile-card-label {
+            color: #ced4da !important;
+        }
+
+        .mobile-card-value {
+            color: #ffffff !important;
+        }
+
+
+
+        .mobile-card-row {
+            border-bottom-color: rgba(255, 255, 255, 0.08);
+        }
+
+        .mobile-card-two-columns {
+            border-bottom-color: rgba(255, 255, 255, 0.08);
+        }
+
+        .mobile-card-column-item .mobile-card-label {
+            color: #ced4da !important;
+        }
+
+        .mobile-card-column-item .mobile-card-value {
+            color: #ffffff !important;
+        }
+
+        .mobile-history-label {
+            color: #ced4da !important;
+        }
+
+        /* 暗色主题下的空状态和错误状态文字 */
+        .mobile-card-container .text-muted {
+            color: #ced4da !important;
+        }
+
+        .mobile-card-container .text-danger {
+            color: #ff6b6b !important;
+        }
+
+        .mobile-card-container h6 {
+            color: #ffffff !important;
+        }
+
+        .mobile-card-container small {
+            color: #adb5bd !important;
+        }
+
+        /* 暗色主题下的移动端按钮优化 */
+        .mobile-card-body .btn-outline-primary {
+            color: #6ea8fe !important;
+            border-color: #6ea8fe !important;
+        }
+
+        .mobile-card-body .btn-outline-primary:hover {
+            color: #000 !important;
+            background-color: #6ea8fe !important;
+            border-color: #6ea8fe !important;
+        }
+
+        .mobile-card-body .btn-outline-info {
+            color: #6edff6 !important;
+            border-color: #6edff6 !important;
+        }
+
+        .mobile-card-body .btn-outline-info:hover {
+            color: #000 !important;
+            background-color: #6edff6 !important;
+            border-color: #6edff6 !important;
+        }
+
+        .mobile-card-body .btn-outline-danger {
+            color: #ea868f !important;
+            border-color: #ea868f !important;
+        }
+
+        .mobile-card-body .btn-outline-danger:hover {
+            color: #000 !important;
+            background-color: #ea868f !important;
+            border-color: #ea868f !important;
+        }
+
+        /* 暗色主题下的Badge徽章优化 */
+        .mobile-card-header .badge.bg-success {
+            background-color: #198754 !important;
+            color: #ffffff !important;
+        }
+
+        .mobile-card-header .badge.bg-danger {
+            background-color: #dc3545 !important;
+            color: #ffffff !important;
+        }
+
+        .mobile-card-header .badge.bg-warning {
+            background-color: #ffc107 !important;
+            color: #000000 !important;
+        }
+
+        .mobile-card-header .badge.bg-secondary {
+            background-color: #6c757d !important;
+            color: #ffffff !important;
+        }
+
+        .mobile-card-header .badge.bg-primary {
+            background-color: #0d6efd !important;
+            color: #ffffff !important;
+        }
+
+        /* 暗色主题下的移动端容器标题优化 */
+        .container h2 {
+            color: #ffffff !important;
+        }
+
+        /* 暗色主题下的移动端加载状态优化 */
+        .mobile-card-container .spinner-border {
+            color: #6ea8fe !important;
+        }
+
+        .mobile-card-container .mt-2 {
+            color: #ced4da !important;
+        }
+
+        /* 暗色主题下的导航栏按钮优化 */
+        .navbar .btn-outline-light {
+            color: #f8f9fa !important;
+            border-color: #f8f9fa !important;
+        }
+
+        .navbar .btn-outline-light:hover {
+            color: #000 !important;
+            background-color: #f8f9fa !important;
+            border-color: #f8f9fa !important;
+        }
+
+        .navbar .nav-link {
+            color: #f8f9fa !important;
+        }
+
+        .navbar .nav-link:hover {
+            color: #e9ecef !important;
         }
         .navbar-light .navbar-nav .nav-link {
              color: #ccc;
@@ -4645,6 +5112,8 @@ async function loadAllServerStatuses() {
             serverTableBody.innerHTML = '<tr><td colspan="11" class="text-center">No server data available. Please log in to the admin panel to add servers.</td></tr>';
             // Remove any existing detail rows if the server list becomes empty
             removeAllDetailRows();
+            // 同时更新移动端卡片容器
+            renderMobileServerCards([]);
             return;
         } else {
             noServersAlert.classList.add('d-none');
@@ -4672,7 +5141,12 @@ async function loadAllServerStatuses() {
         console.error('Error loading server statuses:', error);
         const serverTableBody = document.getElementById('serverTableBody');
         serverTableBody.innerHTML = '<tr><td colspan="11" class="text-center text-danger">Failed to load server data. Please refresh the page.</td></tr>';
-         removeAllDetailRows();
+        removeAllDetailRows();
+        // 同时更新移动端卡片容器显示错误状态
+        const mobileContainer = document.getElementById('mobileServerContainer');
+        if (mobileContainer) {
+            mobileContainer.innerHTML = '<div class="text-center p-3 text-danger">加载服务器数据失败，请刷新页面重试。</div>';
+        }
     }
 }
 
@@ -4705,6 +5179,489 @@ function getProgressBarHtml(percentage) {
     \`;
 }
 
+
+// 移动端辅助函数
+function getServerStatusBadge(status) {
+    if (status === 'online') {
+        return { class: 'bg-success', text: '在线' };
+    } else if (status === 'offline') {
+        return { class: 'bg-danger', text: '离线' };
+    } else if (status === 'error') {
+        return { class: 'bg-warning text-dark', text: '错误' };
+    } else {
+        return { class: 'bg-secondary', text: '未知' };
+    }
+}
+
+function formatBytes(bytes) {
+    if (typeof bytes !== 'number' || isNaN(bytes)) return '-';
+    if (bytes < 1024) return \`\${bytes.toFixed(1)} B\`;
+    if (bytes < 1024 * 1024) return \`\${(bytes / 1024).toFixed(1)} KB\`;
+    if (bytes < 1024 * 1024 * 1024) return \`\${(bytes / (1024 * 1024)).toFixed(1)} MB\`;
+    return \`\${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB\`;
+}
+
+function renderHistoryBar(container, history) {
+    if (!history || history.length === 0) {
+        container.innerHTML = '<small class="text-muted">暂无历史记录</small>';
+        return;
+    }
+
+    let historyHtml = '';
+    const now = new Date();
+
+    for (let i = 0; i < 24; i++) {
+        const slotTime = new Date(now);
+        slotTime.setHours(now.getHours() - i);
+
+        const slotStart = new Date(slotTime);
+        slotStart.setMinutes(0, 0, 0);
+
+        const slotEnd = new Date(slotTime);
+        slotEnd.setMinutes(59, 59, 999);
+
+        const slotStartTimestamp = Math.floor(slotStart.getTime() / 1000);
+        const slotEndTimestamp = Math.floor(slotEnd.getTime() / 1000);
+
+        const recordForHour = history.find(
+            r => r.timestamp >= slotStartTimestamp && r.timestamp <= slotEndTimestamp
+        );
+
+        let barClass = 'history-bar-pending';
+        let titleText = \`\${String(slotStart.getHours()).padStart(2, '0')}:00 - \${String((slotStart.getHours() + 1) % 24).padStart(2, '0')}:00: 无记录\`;
+
+        if (recordForHour) {
+            if (recordForHour.status === 'UP') {
+                barClass = 'history-bar-up';
+            } else if (['DOWN', 'TIMEOUT', 'ERROR'].includes(recordForHour.status)) {
+                barClass = 'history-bar-down';
+            }
+            const recordDate = new Date(recordForHour.timestamp * 1000);
+            titleText = \`\${recordDate.toLocaleString()}: \${recordForHour.status} (\${recordForHour.status_code || 'N/A'}), \${recordForHour.response_time_ms || '-'}ms\`;
+        }
+
+        historyHtml += \`<div class="history-bar \${barClass}" title="\${titleText}"></div>\`;
+    }
+
+    container.innerHTML = historyHtml;
+}
+
+// 移动端服务器卡片渲染函数
+function renderMobileServerCards(allStatuses) {
+    const mobileContainer = document.getElementById('mobileServerContainer');
+    if (!mobileContainer) return;
+
+    mobileContainer.innerHTML = '';
+
+    if (!allStatuses || allStatuses.length === 0) {
+        mobileContainer.innerHTML = \`
+            <div class="text-center p-4">
+                <i class="bi bi-server text-muted" style="font-size: 3rem;"></i>
+                <div class="mt-3 text-muted">
+                    <h6>暂无服务器数据</h6>
+                    <small>请登录管理后台添加服务器</small>
+                </div>
+            </div>
+        \`;
+        return;
+    }
+
+    allStatuses.forEach(data => {
+        const serverId = data.server.id;
+        const serverName = data.server.name;
+        const metrics = data.metrics;
+        const hasError = data.error;
+
+        const card = document.createElement('div');
+        card.className = 'mobile-server-card';
+        card.setAttribute('data-server-id', serverId);
+
+        // 确定服务器状态
+        let status = 'unknown';
+        let lastUpdate = '从未';
+
+        if (hasError) {
+            status = 'error';
+        } else if (metrics) {
+            const now = new Date();
+            const lastReportTime = new Date(metrics.timestamp * 1000);
+            const diffMinutes = (now - lastReportTime) / (1000 * 60);
+
+            if (diffMinutes <= 5) {
+                status = 'online';
+            } else {
+                status = 'offline';
+            }
+            lastUpdate = lastReportTime.toLocaleString();
+        }
+
+        const statusInfo = getServerStatusBadge(status);
+
+        // 卡片头部
+        const cardHeader = document.createElement('div');
+        cardHeader.className = 'mobile-card-header';
+        cardHeader.innerHTML = \`
+            <h6 class="mobile-card-title">\${serverName || '未命名服务器'}</h6>
+            <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+        \`;
+
+        // 卡片主体 - 显示所有信息
+        const cardBody = document.createElement('div');
+        cardBody.className = 'mobile-card-body';
+
+        // 获取所有数据
+        const cpuValue = metrics && metrics.cpu ? \`\${metrics.cpu.usage_percent.toFixed(1)}%\` : '-';
+        const memoryValue = metrics && metrics.memory ? \`\${metrics.memory.usage_percent.toFixed(1)}%\` : '-';
+        const diskValue = metrics && metrics.disk ? \`\${metrics.disk.usage_percent.toFixed(1)}%\` : '-';
+        const uptimeValue = metrics && metrics.uptime ? formatUptime(metrics.uptime) : '-';
+        const uploadSpeed = metrics && metrics.network ? formatNetworkSpeed(metrics.network.upload_speed) : '-';
+        const downloadSpeed = metrics && metrics.network ? formatNetworkSpeed(metrics.network.download_speed) : '-';
+        const totalUpload = metrics && metrics.network ? formatDataSize(metrics.network.total_upload) : '-';
+        const totalDownload = metrics && metrics.network ? formatDataSize(metrics.network.total_download) : '-';
+
+        // 上传速度 | 下载速度
+        const speedRow = document.createElement('div');
+        speedRow.className = 'mobile-card-two-columns';
+        speedRow.innerHTML = \`
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">上传速度</span>
+                <span class="mobile-card-value">\${uploadSpeed}</span>
+            </div>
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">下载速度</span>
+                <span class="mobile-card-value">\${downloadSpeed}</span>
+            </div>
+        \`;
+        cardBody.appendChild(speedRow);
+
+        // CPU | 内存
+        const cpuMemoryRow = document.createElement('div');
+        cpuMemoryRow.className = 'mobile-card-two-columns';
+        cpuMemoryRow.innerHTML = \`
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">CPU</span>
+                <span class="mobile-card-value">\${cpuValue}</span>
+            </div>
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">内存</span>
+                <span class="mobile-card-value">\${memoryValue}</span>
+            </div>
+        \`;
+        cardBody.appendChild(cpuMemoryRow);
+
+        // 硬盘 | 运行时长
+        const diskUptimeRow = document.createElement('div');
+        diskUptimeRow.className = 'mobile-card-two-columns';
+        diskUptimeRow.innerHTML = \`
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">硬盘</span>
+                <span class="mobile-card-value">\${diskValue}</span>
+            </div>
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">运行时长</span>
+                <span class="mobile-card-value">\${uptimeValue}</span>
+            </div>
+        \`;
+        cardBody.appendChild(diskUptimeRow);
+
+        // 总上传 | 总下载
+        const totalRow = document.createElement('div');
+        totalRow.className = 'mobile-card-two-columns';
+        totalRow.innerHTML = \`
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">总上传</span>
+                <span class="mobile-card-value">\${totalUpload}</span>
+            </div>
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">总下载</span>
+                <span class="mobile-card-value">\${totalDownload}</span>
+            </div>
+        \`;
+        cardBody.appendChild(totalRow);
+
+        // 最后更新 - 单行
+        const lastUpdateRow = document.createElement('div');
+        lastUpdateRow.className = 'mobile-card-row';
+        lastUpdateRow.innerHTML = \`
+            <span class="mobile-card-label">最后更新</span>
+            <span class="mobile-card-value">\${lastUpdate}</span>
+        \`;
+        cardBody.appendChild(lastUpdateRow);
+
+        // 组装卡片
+        card.appendChild(cardHeader);
+        card.appendChild(cardBody);
+
+        mobileContainer.appendChild(card);
+    });
+}
+
+// 移动端网站卡片渲染函数
+function renderMobileSiteCards(sites) {
+    const mobileContainer = document.getElementById('mobileSiteContainer');
+    if (!mobileContainer) return;
+
+    mobileContainer.innerHTML = '';
+
+    if (!sites || sites.length === 0) {
+        mobileContainer.innerHTML = \`
+            <div class="text-center p-4">
+                <i class="bi bi-globe text-muted" style="font-size: 3rem;"></i>
+                <div class="mt-3 text-muted">
+                    <h6>暂无监控网站数据</h6>
+                    <small>请登录管理后台添加监控网站</small>
+                </div>
+            </div>
+        \`;
+        return;
+    }
+
+    sites.forEach(site => {
+        const card = document.createElement('div');
+        card.className = 'mobile-site-card';
+
+        const statusInfo = getSiteStatusBadge(site.last_status);
+        const lastCheckTime = site.last_checked ? new Date(site.last_checked * 1000).toLocaleString() : '从未';
+        const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
+
+        // 卡片头部
+        const cardHeader = document.createElement('div');
+        cardHeader.className = 'mobile-card-header';
+        cardHeader.innerHTML = \`
+            <h6 class="mobile-card-title">\${site.name || '未命名网站'}</h6>
+            <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+        \`;
+
+        // 卡片主体
+        const cardBody = document.createElement('div');
+        cardBody.className = 'mobile-card-body';
+
+        // 网站信息 - 两列布局
+        const statusCode = site.last_status_code || '-';
+
+        // 状态码 | 响应时间
+        const statusResponseRow = document.createElement('div');
+        statusResponseRow.className = 'mobile-card-two-columns';
+        statusResponseRow.innerHTML = \`
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">状态码</span>
+                <span class="mobile-card-value">\${statusCode}</span>
+            </div>
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">响应时间</span>
+                <span class="mobile-card-value">\${responseTime}</span>
+            </div>
+        \`;
+        cardBody.appendChild(statusResponseRow);
+
+        // 最后检查 - 单行
+        const lastCheckRow = document.createElement('div');
+        lastCheckRow.className = 'mobile-card-row';
+        lastCheckRow.innerHTML = \`
+            <span class="mobile-card-label">最后检查</span>
+            <span class="mobile-card-value">\${lastCheckTime}</span>
+        \`;
+        cardBody.appendChild(lastCheckRow);
+
+        // 24小时历史记录
+        if (site.history && site.history.length > 0) {
+            const historyContainer = document.createElement('div');
+            historyContainer.className = 'mobile-history-container';
+            historyContainer.innerHTML = \`
+                <div class="mobile-history-label">24小时记录</div>
+                <div class="history-bar-container"></div>
+            \`;
+            cardBody.appendChild(historyContainer);
+
+            // 渲染历史记录条
+            const historyBarContainer = historyContainer.querySelector('.history-bar-container');
+            renderHistoryBar(historyBarContainer, site.history);
+        }
+
+        // 组装卡片
+        card.appendChild(cardHeader);
+        card.appendChild(cardBody);
+
+        mobileContainer.appendChild(card);
+    });
+}
+
+// 管理页面移动端服务器卡片渲染函数
+function renderMobileAdminServerCards(servers) {
+    const mobileContainer = document.getElementById('mobileAdminServerContainer');
+    if (!mobileContainer) return;
+
+    mobileContainer.innerHTML = '';
+
+    if (!servers || servers.length === 0) {
+        mobileContainer.innerHTML = '<div class="text-center p-3 text-muted">暂无服务器数据</div>';
+        return;
+    }
+
+    servers.forEach(server => {
+        const card = document.createElement('div');
+        card.className = 'mobile-server-card';
+        card.setAttribute('data-server-id', server.id);
+
+        // 卡片头部
+        const cardHeader = document.createElement('div');
+        cardHeader.className = 'mobile-card-header';
+        cardHeader.innerHTML = \`
+            <h6 class="mobile-card-title">\${server.name || '未命名服务器'}</h6>
+            <span class="badge bg-primary">ID: \${server.id}</span>
+        \`;
+
+        // 卡片主体
+        const cardBody = document.createElement('div');
+        cardBody.className = 'mobile-card-body';
+
+        // 基本信息 - 两列布局
+        const lastUpdate = server.last_update ? new Date(server.last_update * 1000).toLocaleString() : '从未';
+
+        // 描述 - 单行
+        if (server.description) {
+            const descRow = document.createElement('div');
+            descRow.className = 'mobile-card-row';
+            descRow.innerHTML = \`
+                <span class="mobile-card-label">描述</span>
+                <span class="mobile-card-value">\${server.description}</span>
+            \`;
+            cardBody.appendChild(descRow);
+        }
+
+        // 最后更新 - 单行
+        const lastUpdateRow = document.createElement('div');
+        lastUpdateRow.className = 'mobile-card-row';
+        lastUpdateRow.innerHTML = \`
+            <span class="mobile-card-label">最后更新</span>
+            <span class="mobile-card-value">\${lastUpdate}</span>
+        \`;
+        cardBody.appendChild(lastUpdateRow);
+
+        // API密钥 - 单行（部分显示）
+        const apiKeyDisplay = server.api_key ? \`\${server.api_key.substring(0, 8)}...\` : '-';
+        const apiKeyRow = document.createElement('div');
+        apiKeyRow.className = 'mobile-card-row';
+        apiKeyRow.innerHTML = \`
+            <span class="mobile-card-label">API密钥</span>
+            <span class="mobile-card-value">\${apiKeyDisplay}</span>
+        \`;
+        cardBody.appendChild(apiKeyRow);
+
+        // 操作按钮
+        const actionsRow = document.createElement('div');
+        actionsRow.className = 'mobile-card-row';
+        actionsRow.innerHTML = \`
+            <div class="d-flex gap-2 w-100">
+                <button class="btn btn-outline-primary btn-sm flex-fill" onclick="editServer('\${server.id}')">
+                    <i class="bi bi-pencil"></i> 编辑
+                </button>
+                <button class="btn btn-outline-info btn-sm flex-fill" onclick="copyInstallScript('\${server.id}', this)">
+                    <i class="bi bi-clipboard"></i> 脚本
+                </button>
+                <button class="btn btn-outline-danger btn-sm" onclick="deleteServer('\${server.id}')">
+                    <i class="bi bi-trash"></i>
+                </button>
+            </div>
+        \`;
+        cardBody.appendChild(actionsRow);
+
+        // 组装卡片
+        card.appendChild(cardHeader);
+        card.appendChild(cardBody);
+
+        mobileContainer.appendChild(card);
+    });
+}
+
+// 管理页面移动端网站卡片渲染函数
+function renderMobileAdminSiteCards(sites) {
+    const mobileContainer = document.getElementById('mobileAdminSiteContainer');
+    if (!mobileContainer) return;
+
+    mobileContainer.innerHTML = '';
+
+    if (!sites || sites.length === 0) {
+        mobileContainer.innerHTML = '<div class="text-center p-3 text-muted">暂无监控网站数据</div>';
+        return;
+    }
+
+    sites.forEach(site => {
+        const card = document.createElement('div');
+        card.className = 'mobile-site-card';
+
+        const statusInfo = getSiteStatusBadge(site.last_status);
+        const lastCheckTime = site.last_checked ? new Date(site.last_checked * 1000).toLocaleString() : '从未';
+        const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
+
+        // 卡片头部
+        const cardHeader = document.createElement('div');
+        cardHeader.className = 'mobile-card-header';
+        cardHeader.innerHTML = \`
+            <h6 class="mobile-card-title">\${site.name || '未命名网站'}</h6>
+            <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+        \`;
+
+        // 卡片主体
+        const cardBody = document.createElement('div');
+        cardBody.className = 'mobile-card-body';
+
+        // URL - 单行
+        const urlRow = document.createElement('div');
+        urlRow.className = 'mobile-card-row';
+        urlRow.innerHTML = \`
+            <span class="mobile-card-label">URL</span>
+            <span class="mobile-card-value" style="word-break: break-all;">\${site.url}</span>
+        \`;
+        cardBody.appendChild(urlRow);
+
+        // 状态码 | 响应时间
+        const statusCode = site.last_status_code || '-';
+        const statusResponseRow = document.createElement('div');
+        statusResponseRow.className = 'mobile-card-two-columns';
+        statusResponseRow.innerHTML = \`
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">状态码</span>
+                <span class="mobile-card-value">\${statusCode}</span>
+            </div>
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">响应时间</span>
+                <span class="mobile-card-value">\${responseTime}</span>
+            </div>
+        \`;
+        cardBody.appendChild(statusResponseRow);
+
+        // 最后检查 - 单行
+        const lastCheckRow = document.createElement('div');
+        lastCheckRow.className = 'mobile-card-row';
+        lastCheckRow.innerHTML = \`
+            <span class="mobile-card-label">最后检查</span>
+            <span class="mobile-card-value">\${lastCheckTime}</span>
+        \`;
+        cardBody.appendChild(lastCheckRow);
+
+        // 操作按钮
+        const actionsRow = document.createElement('div');
+        actionsRow.className = 'mobile-card-row';
+        actionsRow.innerHTML = \`
+            <div class="d-flex gap-2 w-100">
+                <button class="btn btn-outline-primary btn-sm flex-fill" onclick="editSite('\${site.id}')">
+                    <i class="bi bi-pencil"></i> 编辑
+                </button>
+                <button class="btn btn-outline-danger btn-sm" onclick="deleteSite('\${site.id}')">
+                    <i class="bi bi-trash"></i> 删除
+                </button>
+            </div>
+        \`;
+        cardBody.appendChild(actionsRow);
+
+        // 组装卡片
+        card.appendChild(cardHeader);
+        card.appendChild(cardBody);
+
+        mobileContainer.appendChild(card);
+    });
+}
 
 // Render the server table using DOM manipulation
 function renderServerTable(allStatuses) {
@@ -4800,6 +5757,9 @@ function renderServerTable(allStatuses) {
             populateDetailsRow(serverId, detailsRowElement); // Populate content
         }
     });
+
+    // 3. 同时渲染移动端卡片
+    renderMobileServerCards(allStatuses);
 }
 
 
@@ -4878,6 +5838,8 @@ async function loadAllSiteStatuses() {
         if (sites.length === 0) {
             noSitesAlert.classList.remove('d-none');
             siteStatusTableBody.innerHTML = '<tr><td colspan="6" class="text-center">No websites are being monitored.</td></tr>'; // Colspan updated
+            // 同时更新移动端卡片容器
+            renderMobileSiteCards([]);
             return;
         } else {
             noSitesAlert.classList.add('d-none');
@@ -4889,6 +5851,11 @@ async function loadAllSiteStatuses() {
         console.error('Error loading website statuses:', error);
         const siteStatusTableBody = document.getElementById('siteStatusTableBody');
         siteStatusTableBody.innerHTML = '<tr><td colspan="6" class="text-center text-danger">Failed to load website status data. Please refresh the page.</td></tr>'; // Colspan updated
+        // 同时更新移动端卡片容器显示错误状态
+        const mobileContainer = document.getElementById('mobileSiteContainer');
+        if (mobileContainer) {
+            mobileContainer.innerHTML = '<div class="text-center p-3 text-danger">加载网站数据失败，请刷新页面重试。</div>';
+        }
     }
 }
 
@@ -4919,6 +5886,9 @@ async function renderSiteStatusTable(sites) {
         // Asynchronously fetch and render history for this site
         fetchAndRenderSiteHistory(site.id, historyCell.querySelector('.history-bar-container'));
     }
+
+    // 同时渲染移动端卡片
+    renderMobileSiteCards(sites);
 }
 
 // Fetch and render 24h history for a site
