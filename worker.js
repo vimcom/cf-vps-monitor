@@ -1188,6 +1188,113 @@ async function handleApiRequest(request, env, ctx) {
     }
   }
   
+  // ==================== 配置获取API ====================
+
+  // VPS配置获取（使用API密钥认证）
+  if (path.startsWith('/api/config/') && method === 'GET') {
+    try {
+      const serverId = extractAndValidateServerId(path);
+      if (!serverId) {
+        return new Response(JSON.stringify({
+          error: 'Invalid server ID',
+          message: '无效的服务器ID格式'
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      const apiKey = request.headers.get('X-API-Key');
+      if (!apiKey) {
+        return new Response(JSON.stringify({
+          error: 'API key required',
+          message: '需要API密钥'
+        }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 验证服务器和API密钥
+      const serverData = await env.DB.prepare(
+        'SELECT id, name, description, api_key FROM servers WHERE id = ?'
+      ).bind(serverId).first();
+
+      if (!serverData) {
+        return new Response(JSON.stringify({
+          error: 'Server not found',
+          message: '服务器不存在'
+        }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      if (serverData.api_key !== apiKey) {
+        return new Response(JSON.stringify({
+          error: 'Invalid API key',
+          message: 'API密钥无效'
+        }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 获取VPS上报间隔设置
+      let reportInterval = 60; // 默认值
+      try {
+        const intervalResult = await env.DB.prepare(
+          'SELECT value FROM app_config WHERE key = ?'
+        ).bind('vps_report_interval_seconds').first();
+
+        if (intervalResult?.value) {
+          const parsedInterval = parseInt(intervalResult.value, 10);
+          if (!isNaN(parsedInterval) && parsedInterval > 0) {
+            reportInterval = parsedInterval;
+          }
+        }
+      } catch (intervalError) {
+        console.warn("获取VPS上报间隔失败，使用默认值:", intervalError);
+      }
+
+      // 返回配置信息
+      const configData = {
+        success: true,
+        config: {
+          report_interval: reportInterval,
+          enabled_metrics: ['cpu', 'memory', 'disk', 'network', 'uptime'],
+          server_info: {
+            id: serverData.id,
+            name: serverData.name,
+            description: serverData.description || ''
+          }
+        },
+        timestamp: Math.floor(Date.now() / 1000)
+      };
+
+      return new Response(JSON.stringify(configData), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+
+    } catch (error) {
+      console.error("配置获取API错误:", error, {
+        serverId,
+        errorType: error.constructor.name,
+        errorMessage: error.message,
+        stack: error.stack
+      });
+
+      return new Response(JSON.stringify({
+        error: 'Internal server error',
+        message: `服务器内部错误: ${error.message}`,
+        details: '请稍后重试，如果问题持续存在请联系管理员'
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
+
   // ==================== 数据上报API ====================
 
   // VPS数据上报
@@ -1293,7 +1400,7 @@ async function handleApiRequest(request, env, ctx) {
         });
       }
 
-      // 验证JSON对象结构
+      // 增强的JSON对象结构验证
       const validateJsonObject = (obj, fieldName) => {
         if (!obj || typeof obj !== 'object') {
           console.warn(`${fieldName}字段不是有效的对象:`, obj);
@@ -1302,18 +1409,49 @@ async function handleApiRequest(request, env, ctx) {
         return true;
       };
 
-      // 验证各个JSON字段的结构
-      if (!validateJsonObject(reportData.cpu, 'CPU')) {
-        console.error('CPU数据结构无效:', reportData.cpu);
+      // 详细的数据结构验证
+      const validateDataStructure = (data, type) => {
+        if (!validateJsonObject(data, type)) {
+          return false;
+        }
+
+        switch (type) {
+          case 'CPU':
+            return typeof data.usage_percent === 'number' &&
+                   Array.isArray(data.load_avg) &&
+                   data.load_avg.length === 3;
+          case '内存':
+          case '磁盘':
+            return typeof data.total === 'number' &&
+                   typeof data.used === 'number' &&
+                   typeof data.free === 'number' &&
+                   typeof data.usage_percent === 'number';
+          case '网络':
+            return typeof data.upload_speed === 'number' &&
+                   typeof data.download_speed === 'number' &&
+                   typeof data.total_upload === 'number' &&
+                   typeof data.total_download === 'number';
+          default:
+            return true;
+        }
+      };
+
+      // 验证各个JSON字段的结构，如果无效则使用默认值
+      if (!validateDataStructure(reportData.cpu, 'CPU')) {
+        console.warn('CPU数据结构无效，使用默认值:', reportData.cpu);
+        reportData.cpu = { usage_percent: 0, load_avg: [0, 0, 0] };
       }
-      if (!validateJsonObject(reportData.memory, '内存')) {
-        console.error('内存数据结构无效:', reportData.memory);
+      if (!validateDataStructure(reportData.memory, '内存')) {
+        console.warn('内存数据结构无效，使用默认值:', reportData.memory);
+        reportData.memory = { total: 0, used: 0, free: 0, usage_percent: 0 };
       }
-      if (!validateJsonObject(reportData.disk, '磁盘')) {
-        console.error('磁盘数据结构无效:', reportData.disk);
+      if (!validateDataStructure(reportData.disk, '磁盘')) {
+        console.warn('磁盘数据结构无效，使用默认值:', reportData.disk);
+        reportData.disk = { total: 0, used: 0, free: 0, usage_percent: 0 };
       }
-      if (!validateJsonObject(reportData.network, '网络')) {
-        console.error('网络数据结构无效:', reportData.network);
+      if (!validateDataStructure(reportData.network, '网络')) {
+        console.warn('网络数据结构无效，使用默认值:', reportData.network);
+        reportData.network = { upload_speed: 0, download_speed: 0, total_upload: 0, total_download: 0 };
       }
 
       // 验证时间戳
