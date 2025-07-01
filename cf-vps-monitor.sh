@@ -24,7 +24,7 @@ SCRIPT_DIR="$HOME/.cf-vps-monitor"
 CONFIG_FILE="$SCRIPT_DIR/config"
 LOG_FILE="$SCRIPT_DIR/monitor.log"
 PID_FILE="$SCRIPT_DIR/monitor.pid"
-SERVICE_FILE="$SCRIPT_DIR/monitor-service.sh"
+SERVICE_FILE="$SCRIPT_DIR/vps-monitor-service.sh"
 SYSTEMD_SERVICE_FILE="$HOME/.config/systemd/user/cf-vps-monitor.service"
 
 # 默认配置
@@ -1381,19 +1381,11 @@ sanitize_number() {
     local value="$1"
     local default_value="${2:-0}"
 
-    # 移除所有非数字和小数点的字符
     value=$(echo "$value" | sed 's/[^0-9.]//g')
 
-    # 检查是否为有效数字
-    if [[ "$value" =~ ^[0-9]+\.?[0-9]*$ ]] || [[ "$value" =~ ^[0-9]*\.[0-9]+$ ]]; then
-        # 确保小数点前有数字（修复.2变成0.2）
-        if [[ "$value" =~ ^\. ]]; then
-            value="0$value"
-        fi
-        # 确保小数点后有数字（修复2.变成2.0）
-        if [[ "$value" =~ \.$ ]]; then
-            value="${value}0"
-        fi
+    if [[ "$value" =~ ^[0-9]*\.?[0-9]+$ ]] || [[ "$value" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        [[ "$value" =~ ^\. ]] && value="0$value"
+        [[ "$value" =~ \.$ ]] && value="${value}0"
         echo "$value"
     else
         echo "$default_value"
@@ -1405,15 +1397,8 @@ sanitize_integer() {
     local value="$1"
     local default_value="${2:-0}"
 
-    # 移除所有非数字字符
     value=$(echo "$value" | sed 's/[^0-9]//g')
-
-    # 检查是否为有效整数
-    if [[ "$value" =~ ^[0-9]+$ ]]; then
-        echo "$value"
-    else
-        echo "$default_value"
-    fi
+    [[ "$value" =~ ^[0-9]+$ ]] && echo "$value" || echo "$default_value"
 }
 
 
@@ -1425,188 +1410,59 @@ clean_json_string() {
     echo "$input" | tr -d '\000-\037' | tr -d '\177-\377'
 }
 
-# 验证JSON数据格式
-validate_json_data() {
-    local json_data="$1"
-    local data_type="$2"
 
-    # 基本格式检查
-    if [[ ! "$json_data" =~ ^\{.*\}$ ]]; then
-        return 1
-    fi
 
-    # 根据数据类型进行特定验证
-    case "$data_type" in
-        "cpu")
-            # CPU数据应包含usage_percent和load_avg
-            if [[ "$json_data" =~ \"usage_percent\":[0-9]+\.?[0-9]* ]] && [[ "$json_data" =~ \"load_avg\":\[ ]]; then
-                return 0
-            fi
-            ;;
-        "memory"|"disk")
-            # 内存和磁盘数据应包含total, used, free, usage_percent
-            if [[ "$json_data" =~ \"total\":[0-9]+\.?[0-9]* ]] && \
-               [[ "$json_data" =~ \"used\":[0-9]+\.?[0-9]* ]] && \
-               [[ "$json_data" =~ \"free\":[0-9]+\.?[0-9]* ]] && \
-               [[ "$json_data" =~ \"usage_percent\":[0-9]+\.?[0-9]* ]]; then
-                return 0
-            fi
-            ;;
-        "network")
-            # 网络数据应包含upload_speed, download_speed, total_upload, total_download
-            if [[ "$json_data" =~ \"upload_speed\":[0-9]+ ]] && \
-               [[ "$json_data" =~ \"download_speed\":[0-9]+ ]] && \
-               [[ "$json_data" =~ \"total_upload\":[0-9]+ ]] && \
-               [[ "$json_data" =~ \"total_download\":[0-9]+ ]]; then
-                return 0
-            fi
-            ;;
-    esac
-
-    return 1
-}
-
-# 生成默认JSON数据
-generate_default_json() {
-    local data_type="$1"
-
-    case "$data_type" in
-        "cpu")
-            echo '{"usage_percent":0,"load_avg":[0,0,0]}'
-            ;;
-        "memory")
-            echo '{"total":0,"used":0,"free":0,"usage_percent":0}'
-            ;;
-        "disk")
-            echo '{"total":0,"used":0,"free":0,"usage_percent":0}'
-            ;;
-        "network")
-            echo '{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
-            ;;
-        *)
-            echo '{}'
-            ;;
-    esac
-}
-
-# 指数退避重试机制
-retry_with_backoff() {
-    local max_attempts="${1:-3}"
-    local initial_delay="${2:-1}"
-    local max_delay="${3:-30}"
-    local backoff_factor="${4:-2}"
-    local command_func="$5"
-    shift 5
-    local command_args=("$@")
-
+# 获取服务器配置（带简单重试）
+get_config() {
+    local max_attempts=3
     local attempt=1
-    local delay=$initial_delay
 
     while [[ $attempt -le $max_attempts ]]; do
-        log "尝试执行 (第 $attempt/$max_attempts 次)..."
+        log "正在获取服务器配置... (第 $attempt/$max_attempts 次)"
 
-        if $command_func "${command_args[@]}"; then
-            log "执行成功 (第 $attempt 次尝试)"
+        local response=$(curl -s -w "%{http_code}" -X GET "$WORKER_URL/api/config/$SERVER_ID" \
+            -H "X-API-Key: $API_KEY" 2>/dev/null || echo "000")
+
+        local http_code="${response: -3}"
+        local response_body="${response%???}"
+
+        if [[ "$http_code" == "200" ]]; then
+            log "配置获取成功"
+
+            # 简化的间隔解析
+            local new_interval=$(echo "$response_body" | sed -n 's/.*"interval":\([0-9]\+\).*/\1/p')
+
+            if [[ -n "$new_interval" && "$new_interval" =~ ^[0-9]+$ && "$new_interval" -gt 0 ]]; then
+                if [[ "$new_interval" != "$INTERVAL" ]]; then
+                    log "服务器返回新的上报间隔: ${new_interval}秒 (当前: ${INTERVAL}秒)"
+                    INTERVAL="$new_interval"
+                    save_config
+                    log "上报间隔已更新为: ${INTERVAL}秒"
+                fi
+            fi
+
+            save_config_cache "$response_body"
             return 0
-        fi
+        else
+            log "配置获取失败 (HTTP $http_code)"
 
-        if [[ $attempt -lt $max_attempts ]]; then
-            log "执行失败，${delay}秒后重试..."
-            sleep "$delay"
+            case "$http_code" in
+                "401") log "认证失败 - 请检查API密钥" ;;
+                "404") log "服务器不存在 - 请检查服务器ID" ;;
+                "000") log "网络连接失败" ;;
+            esac
 
-            # 计算下次延迟时间（指数退避）
-            delay=$((delay * backoff_factor))
-            if [[ $delay -gt $max_delay ]]; then
-                delay=$max_delay
+            if [[ $attempt -lt $max_attempts ]]; then
+                log "等待2秒后重试..."
+                sleep 2
             fi
         fi
 
         attempt=$((attempt + 1))
     done
 
-    log "所有重试尝试均失败"
+    log "配置获取最终失败"
     return 1
-}
-
-# 获取服务器配置（内部实现）
-_get_config_internal() {
-    log "正在获取服务器配置..."
-
-    local response=$(curl -s -w "%{http_code}" -X GET "$WORKER_URL/api/config/$SERVER_ID" \
-        -H "X-API-Key: $API_KEY" 2>/dev/null || echo "000")
-
-    local http_code="${response: -3}"
-    local response_body="${response%???}"
-
-    if [[ "$http_code" == "200" ]]; then
-        log "配置获取成功"
-
-        # 尝试解析配置
-        local new_interval=""
-        if command_exists jq; then
-            # 如果有jq命令，使用jq解析
-            new_interval=$(echo "$response_body" | jq -r '.config.report_interval // empty' 2>/dev/null)
-        else
-            # 如果没有jq，使用改进的文本解析
-            # 方法1: 使用grep + cut
-            new_interval=$(echo "$response_body" | grep -o '"report_interval":[0-9]*' | cut -d':' -f2 2>/dev/null)
-
-            # 方法2: 如果方法1失败，使用sed备用方案
-            if [[ -z "$new_interval" ]]; then
-                new_interval=$(echo "$response_body" | sed -n 's/.*"report_interval":\s*\([0-9]\+\).*/\1/p' 2>/dev/null)
-            fi
-
-            # 方法3: 最后的备用方案
-            if [[ -z "$new_interval" ]]; then
-                new_interval=$(echo "$response_body" | awk -F'"report_interval":' '{if(NF>1) print $2}' | awk -F',' '{print $1}' | tr -d ' ' 2>/dev/null)
-            fi
-        fi
-
-        # 验证并更新间隔设置
-        if [[ -n "$new_interval" && "$new_interval" =~ ^[0-9]+$ && "$new_interval" -gt 0 ]]; then
-            if [[ "$new_interval" != "$INTERVAL" ]]; then
-                log "检测到新的上报间隔: ${new_interval}秒 (当前: ${INTERVAL}秒)"
-                INTERVAL="$new_interval"
-                # 更新配置文件
-                save_config
-                log "上报间隔已更新为: ${INTERVAL}秒"
-                return 0
-            else
-                log "配置无变化，当前间隔: ${INTERVAL}秒"
-                return 0
-            fi
-        else
-            log "警告: 无法解析配置中的上报间隔，保持当前设置"
-            return 1
-        fi
-    else
-        # 根据HTTP状态码决定是否可重试
-        case "$http_code" in
-            "401"|"404")
-                log "配置获取失败 (HTTP $http_code): 认证或服务器不存在"
-                return 1  # 不可重试的错误
-                ;;
-            "429"|"500"|"503"|"502"|"504"|"000")
-                log "配置获取失败 (HTTP $http_code): 可重试的错误"
-                return 2  # 可重试的错误
-                ;;
-            *)
-                log "配置获取失败 (HTTP $http_code): $response_body"
-                return 1  # 默认不可重试
-                ;;
-        esac
-    fi
-}
-
-# 获取服务器配置（带重试）
-get_config() {
-    # 使用重试机制调用内部函数
-    if retry_with_backoff 3 2 10 2 _get_config_internal; then
-        return 0
-    else
-        log "配置获取最终失败，使用缓存配置"
-        return 1
-    fi
 }
 
 # 本地缓存管理
@@ -1644,54 +1500,7 @@ load_config_cache() {
     return 1
 }
 
-# 清理过期缓存
-cleanup_cache() {
-    local max_age_hours="${1:-24}"  # 默认24小时
 
-    if [[ -d "$CACHE_DIR" ]]; then
-        # 清理超过指定时间的缓存文件
-        find "$CACHE_DIR" -type f -mtime +0 -exec rm -f {} \; 2>/dev/null || true
-        log "清理了过期的缓存文件"
-    fi
-}
-
-# 保存最后成功的监控数据
-save_metrics_cache() {
-    local metrics_data="$1"
-    init_cache
-
-    local cache_entry="{\"timestamp\":$(date +%s),\"data\":$metrics_data}"
-    echo "$cache_entry" > "$METRICS_CACHE_FILE"
-}
-
-# 获取缓存的监控数据
-get_cached_metrics() {
-    if [[ -f "$METRICS_CACHE_FILE" ]]; then
-        local cached_data=$(cat "$METRICS_CACHE_FILE")
-        if [[ -n "$cached_data" ]]; then
-            # 检查缓存时间（不超过1小时）
-            local cache_timestamp
-            if command_exists jq; then
-                cache_timestamp=$(echo "$cached_data" | jq -r '.timestamp // 0' 2>/dev/null)
-            else
-                cache_timestamp=$(echo "$cached_data" | sed -n 's/.*"timestamp":\([0-9]\+\).*/\1/p')
-            fi
-
-            local current_time=$(date +%s)
-            local age=$((current_time - cache_timestamp))
-
-            if [[ $age -lt 3600 ]]; then  # 1小时内的缓存有效
-                if command_exists jq; then
-                    echo "$cached_data" | jq -r '.data' 2>/dev/null
-                else
-                    echo "$cached_data" | sed -n 's/.*"data":\(.*\)}/\1/p'
-                fi
-                return 0
-            fi
-        fi
-    fi
-    return 1
-}
 
 # 上报监控数据
 report_metrics() {
@@ -1711,23 +1520,11 @@ report_metrics() {
     disk_raw=$(clean_json_string "$disk_raw")
     network_raw=$(clean_json_string "$network_raw")
 
-    # 验证各个JSON组件（使用增强的验证）
-    if ! validate_json_data "$cpu_raw" "cpu"; then
-        log "CPU数据验证失败，使用默认数据"
-        cpu_raw=$(generate_default_json "cpu")
-    fi
-    if ! validate_json_data "$memory_raw" "memory"; then
-        log "内存数据验证失败，使用默认数据"
-        memory_raw=$(generate_default_json "memory")
-    fi
-    if ! validate_json_data "$disk_raw" "disk"; then
-        log "磁盘数据验证失败，使用默认数据"
-        disk_raw=$(generate_default_json "disk")
-    fi
-    if ! validate_json_data "$network_raw" "network"; then
-        log "网络数据验证失败，使用默认数据"
-        network_raw=$(generate_default_json "network")
-    fi
+    # 简单验证JSON格式
+    [[ ! "$cpu_raw" =~ ^\{.*\}$ ]] && cpu_raw='{"usage_percent":0,"load_avg":[0,0,0]}'
+    [[ ! "$memory_raw" =~ ^\{.*\}$ ]] && memory_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    [[ ! "$disk_raw" =~ ^\{.*\}$ ]] && disk_raw='{"total":0,"used":0,"free":0,"usage_percent":0}'
+    [[ ! "$network_raw" =~ ^\{.*\}$ ]] && network_raw='{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'
 
     # 构建JSON数据
     local data="{\"timestamp\":$timestamp,\"cpu\":$cpu_raw,\"memory\":$memory_raw,\"disk\":$disk_raw,\"network\":$network_raw,\"uptime\":$uptime}"
@@ -2083,59 +1880,425 @@ EOF
     print_message "$GREEN" "监控服务脚本创建完成: $SERVICE_FILE"
 }
 
-# 创建systemd用户服务
+# ==================== 用户类型检测和systemd命令选择机制 ====================
+
+# 检测当前用户类型
+detect_user_type() {
+    if [[ $EUID -eq 0 ]]; then
+        echo "root"
+    else
+        echo "user"
+    fi
+}
+
+# 检查是否为root用户
+is_root_user() {
+    [[ $EUID -eq 0 ]]
+}
+
+# 获取适当的systemctl命令
+get_systemd_command() {
+    if is_root_user; then
+        echo "systemctl"
+    else
+        echo "systemctl --user"
+    fi
+}
+
+# 获取systemd服务文件路径
+get_systemd_service_path() {
+    if is_root_user; then
+        echo "/etc/systemd/system/cf-vps-monitor.service"
+    else
+        echo "$HOME/.config/systemd/user/cf-vps-monitor.service"
+    fi
+}
+
+# 获取systemd服务目录路径
+get_systemd_service_dir() {
+    if is_root_user; then
+        echo "/etc/systemd/system"
+    else
+        echo "$HOME/.config/systemd/user"
+    fi
+}
+
+# 获取用户类型描述
+get_user_type_description() {
+    if is_root_user; then
+        echo "系统管理员(root)"
+    else
+        echo "普通用户($USER)"
+    fi
+}
+
+# 检查systemd服务可用性（根据用户类型）
+check_systemd_availability() {
+    if ! command_exists systemctl; then
+        return 1
+    fi
+
+    if is_root_user; then
+        # root用户检查系统级systemd
+        systemctl status >/dev/null 2>&1
+    else
+        # 普通用户检查用户级systemd
+        systemctl --user status >/dev/null 2>&1
+    fi
+}
+
+# 创建systemd服务（支持root和普通用户）
 create_systemd_service() {
+    local user_type=$(detect_user_type)
+    local user_desc=$(get_user_type_description)
+    local systemd_cmd=$(get_systemd_command)
+    local service_path=$(get_systemd_service_path)
+    local service_dir=$(get_systemd_service_dir)
+
+    print_message "$BLUE" "配置systemd服务 (用户类型: $user_desc)..."
+
+    # 检查systemd可用性
     if ! command_exists systemctl; then
         print_message "$YELLOW" "systemd不可用，将使用传统方式运行服务"
         return 1
     fi
 
-    # 检查是否可以使用systemd用户服务
-    if ! systemctl --user status >/dev/null 2>&1; then
-        print_message "$YELLOW" "systemd用户服务不可用，将使用传统方式运行服务"
+    # 根据用户类型检查systemd服务可用性
+    if ! check_systemd_availability; then
+        if is_root_user; then
+            print_message "$YELLOW" "系统级systemd不可用，将使用传统方式运行服务"
+        else
+            print_message "$YELLOW" "用户级systemd不可用，将使用传统方式运行服务"
+            print_message "$CYAN" "提示: 可能需要启动用户会话或设置XDG_RUNTIME_DIR"
+        fi
         return 1
     fi
 
-    # 确保systemd服务文件目录存在
-    local systemd_dir=$(dirname "$SYSTEMD_SERVICE_FILE")
-    if [[ ! -d "$systemd_dir" ]]; then
-        if ! mkdir -p "$systemd_dir" 2>/dev/null; then
-            print_message "$YELLOW" "无法创建systemd目录，将使用传统方式运行服务"
+    # 创建服务文件目录
+    if [[ ! -d "$service_dir" ]]; then
+        print_message "$CYAN" "  创建systemd服务目录: $service_dir"
+        if ! mkdir -p "$service_dir" 2>/dev/null; then
+            if is_root_user; then
+                print_message "$YELLOW" "无法创建系统级systemd目录，将使用传统方式运行服务"
+            else
+                print_message "$YELLOW" "无法创建用户级systemd目录，将使用传统方式运行服务"
+            fi
             return 1
         fi
     fi
 
-    cat > "$SYSTEMD_SERVICE_FILE" << EOF
+    # 验证服务脚本文件存在且可执行
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_message "$RED" "服务脚本文件不存在: $SERVICE_FILE"
+        print_message "$CYAN" "提示: 请先运行安装命令创建服务脚本"
+        return 1
+    fi
+
+    if [[ ! -x "$SERVICE_FILE" ]]; then
+        print_message "$CYAN" "  设置服务脚本执行权限..."
+        if chmod +x "$SERVICE_FILE" 2>/dev/null; then
+            print_message "$GREEN" "  ✓ 执行权限设置成功"
+        else
+            print_message "$RED" "✗ 无法设置服务脚本执行权限"
+            return 1
+        fi
+    fi
+
+    # 生成服务文件内容
+    print_message "$CYAN" "  生成systemd服务文件: $service_path"
+    if ! generate_systemd_service_file "$service_path" "$user_type"; then
+        print_message "$RED" "✗ systemd服务文件生成失败"
+        return 1
+    fi
+
+    # 验证生成的服务文件
+    if [[ ! -f "$service_path" ]]; then
+        print_message "$RED" "✗ systemd服务文件创建失败"
+        return 1
+    fi
+
+    # 重新加载systemd配置
+    print_message "$CYAN" "  重新加载systemd配置..."
+    if ! $systemd_cmd daemon-reload 2>/dev/null; then
+        print_message "$YELLOW" "⚠ 无法重新加载systemd配置，将使用传统方式运行服务"
+        return 1
+    fi
+
+    # 验证服务文件语法
+    print_message "$CYAN" "  验证服务文件语法..."
+    if ! $systemd_cmd show cf-vps-monitor.service >/dev/null 2>&1; then
+        print_message "$YELLOW" "⚠ systemd服务文件语法验证失败"
+        return 1
+    fi
+
+    # 启用systemd服务
+    print_message "$CYAN" "  启用systemd服务..."
+    if ! $systemd_cmd enable cf-vps-monitor.service 2>/dev/null; then
+        print_message "$YELLOW" "⚠ 服务启用失败，但服务文件已创建"
+        return 1
+    fi
+
+    # 启动systemd服务（测试）
+    if $systemd_cmd start cf-vps-monitor.service 2>/dev/null; then
+        print_message "$GREEN" "  ✓ 服务启动成功"
+    else
+        print_message "$YELLOW" "  ⚠ 服务启动失败（可能已在运行）"
+    fi
+
+    if is_root_user; then
+        print_message "$GREEN" "✓ 系统级systemd服务创建完成: $service_path"
+        print_message "$CYAN" "  服务将在系统启动时自动运行"
+    else
+        print_message "$GREEN" "✓ 用户级systemd服务创建完成: $service_path"
+        print_message "$CYAN" "  服务配置已优化，包含网络依赖和安全设置"
+    fi
+    return 0
+}
+
+# 生成systemd服务文件内容
+generate_systemd_service_file() {
+    local service_path="$1"
+    local user_type="$2"
+
+    # 确保目标目录存在
+    local service_dir=$(dirname "$service_path")
+    if [[ ! -d "$service_dir" ]]; then
+        print_message "$CYAN" "  创建systemd目录: $service_dir"
+        if ! mkdir -p "$service_dir" 2>/dev/null; then
+            print_message "$RED" "✗ 无法创建systemd目录: $service_dir"
+            return 1
+        fi
+    fi
+
+    # 检查目录写入权限
+    if [[ ! -w "$service_dir" ]]; then
+        print_message "$RED" "✗ 无写入权限: $service_dir"
+        return 1
+    fi
+
+    if is_root_user; then
+        # root用户的系统级服务配置
+        local temp_file=$(mktemp)
+        cat > "$temp_file" << EOF
 [Unit]
-Description=cf-vps-monitor Service
-After=network.target
+Description=cf-vps-monitor Service - VPS Monitoring Agent
+Documentation=https://github.com/kadidalax/cf-vps-monitor
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=$SERVICE_FILE
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=10
-User=$USER
+StartLimitInterval=300
+StartLimitBurst=5
+User=root
+Group=root
+WorkingDirectory=$SCRIPT_DIR
+Environment=HOME=$HOME
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        # 复制到目标位置
+        if cp "$temp_file" "$service_path" 2>/dev/null; then
+            rm -f "$temp_file"
+        else
+            rm -f "$temp_file"
+            return 1
+        fi
+    else
+        # 普通用户的用户级服务配置
+        local temp_file=$(mktemp)
+        local current_user="$USER"
+        local current_group=$(id -gn)
+        local runtime_dir="/run/user/$(id -u)"
+
+        cat > "$temp_file" << EOF
+[Unit]
+Description=cf-vps-monitor Service - VPS Monitoring Agent
+Documentation=https://github.com/kadidalax/cf-vps-monitor
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$SERVICE_FILE
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+User=$current_user
+Group=$current_group
 WorkingDirectory=$SCRIPT_DIR
 Environment=HOME=$HOME
 Environment=PATH=$PATH
+Environment=XDG_RUNTIME_DIR=$runtime_dir
 
 [Install]
 WantedBy=default.target
 EOF
 
-    # 重新加载systemd配置
-    if ! systemctl --user daemon-reload 2>/dev/null; then
-        print_message "$YELLOW" "无法重新加载systemd配置，将使用传统方式运行服务"
+        # 复制到目标位置
+        if cp "$temp_file" "$service_path" 2>/dev/null; then
+            rm -f "$temp_file"
+        else
+            rm -f "$temp_file"
+            return 1
+        fi
+    fi
+
+    # 验证文件是否成功创建
+    if [[ ! -f "$service_path" ]]; then
         return 1
     fi
 
-    print_message "$GREEN" "systemd用户服务创建完成: $SYSTEMD_SERVICE_FILE"
     return 0
 }
 
+# ==================== systemd lingering支持 ====================
+
+# 检测lingering支持状态
+check_lingering_support() {
+    # root用户特殊处理
+    if is_root_user; then
+        return 3  # root用户不需要lingering
+    fi
+
+    # 检查loginctl命令是否可用
+    if ! command_exists loginctl; then
+        return 2  # 不支持
+    fi
+
+    # 检查systemd是否运行
+    if ! systemctl --version >/dev/null 2>&1; then
+        return 2  # 不支持
+    fi
+
+    # 检查当前用户的lingering状态
+    local linger_status
+    linger_status=$(loginctl show-user "$USER" 2>/dev/null | grep "^Linger=" | cut -d= -f2)
+
+    if [[ "$linger_status" == "yes" ]]; then
+        return 0  # 已启用
+    elif [[ "$linger_status" == "no" ]]; then
+        return 1  # 未启用但支持
+    else
+        # 尝试另一种检测方法
+        if loginctl list-users 2>/dev/null | grep -q "^[[:space:]]*$(id -u)[[:space:]]"; then
+            # 用户存在于loginctl中，检查linger目录
+            if [[ -f "/var/lib/systemd/linger/$USER" ]]; then
+                return 0  # 已启用
+            else
+                return 1  # 未启用但支持
+            fi
+        else
+            return 2  # 不支持或无法检测
+        fi
+    fi
+}
+
+# 启用lingering
+enable_lingering() {
+    # root用户特殊处理
+    if is_root_user; then
+        print_message "$GREEN" "✓ root用户使用系统级服务，无需lingering支持"
+        return 0
+    fi
+
+    print_message "$BLUE" "尝试启用用户lingering..."
+
+    # 检查是否已经启用
+    check_lingering_support
+    case $? in
+        0)
+            print_message "$GREEN" "✓ 用户lingering已启用"
+            return 0
+            ;;
+        2)
+            print_message "$YELLOW" "⚠ 系统不支持lingering或无法检测"
+            return 1
+            ;;
+        3)
+            # 这种情况不应该发生，因为已经在开头检查了
+            print_message "$GREEN" "✓ root用户无需lingering支持"
+            return 0
+            ;;
+    esac
+
+    # 尝试启用lingering
+    if loginctl enable-linger "$USER" 2>/dev/null; then
+        # 验证是否成功启用
+        sleep 1
+        check_lingering_support
+        case $? in
+            0)
+                print_message "$GREEN" "✓ 用户lingering已成功启用"
+                return 0
+                ;;
+            *)
+                print_message "$YELLOW" "⚠ lingering启用状态不确定"
+                return 1
+                ;;
+        esac
+    else
+        print_message "$YELLOW" "⚠ 无法启用lingering (可能需要管理员权限或系统不支持)"
+        print_message "$CYAN" "提示: 可以请求管理员执行: sudo loginctl enable-linger $USER"
+        return 1
+    fi
+}
+
+# 禁用lingering
+disable_lingering() {
+    # root用户特殊处理
+    if is_root_user; then
+        print_message "$GREEN" "✓ root用户使用系统级服务，无需禁用lingering"
+        return 0
+    fi
+
+    print_message "$BLUE" "禁用用户lingering..."
+
+    # 检查当前状态
+    check_lingering_support
+    case $? in
+        0)
+            # 已启用，尝试禁用
+            if loginctl disable-linger "$USER" 2>/dev/null; then
+                print_message "$GREEN" "✓ 用户lingering已禁用"
+                return 0
+            else
+                print_message "$YELLOW" "⚠ 无法禁用lingering"
+                return 1
+            fi
+            ;;
+        1)
+            print_message "$YELLOW" "用户lingering未启用"
+            return 0
+            ;;
+        2)
+            print_message "$YELLOW" "系统不支持lingering"
+            return 1
+            ;;
+        3)
+            print_message "$GREEN" "✓ root用户无需lingering支持"
+            return 0
+            ;;
+    esac
+}
+
+
+
 # 启动监控服务
 start_service() {
+    local systemd_cmd=$(get_systemd_command)
+    local service_path=$(get_systemd_service_path)
+    local user_desc=$(get_user_type_description)
+
     if [[ -f "$PID_FILE" ]]; then
         local pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
@@ -2147,10 +2310,10 @@ start_service() {
     fi
 
     # 尝试使用systemd
-    if [[ -f "$SYSTEMD_SERVICE_FILE" ]] && command_exists systemctl; then
-        print_message "$BLUE" "使用systemd启动服务..."
-        if systemctl --user start cf-vps-monitor.service; then
-            systemctl --user enable cf-vps-monitor.service
+    if [[ -f "$service_path" ]] && command_exists systemctl; then
+        print_message "$BLUE" "使用systemd启动服务 ($user_desc)..."
+        if $systemd_cmd start cf-vps-monitor.service; then
+            $systemd_cmd enable cf-vps-monitor.service
             print_message "$GREEN" "监控服务已启动 (systemd)"
             return 0
         else
@@ -2192,15 +2355,19 @@ start_service() {
 
 # 停止监控服务
 stop_service() {
-    print_message "$BLUE" "停止监控服务..."
+    local systemd_cmd=$(get_systemd_command)
+    local service_path=$(get_systemd_service_path)
+    local user_desc=$(get_user_type_description)
+
+    print_message "$BLUE" "停止监控服务 ($user_desc)..."
 
     local stopped=false
 
     # 尝试使用systemd停止
-    if [[ -f "$SYSTEMD_SERVICE_FILE" ]] && command_exists systemctl; then
-        if systemctl --user is-active cf-vps-monitor.service >/dev/null 2>&1; then
-            systemctl --user stop cf-vps-monitor.service
-            systemctl --user disable cf-vps-monitor.service
+    if [[ -f "$service_path" ]] && command_exists systemctl; then
+        if $systemd_cmd is-active cf-vps-monitor.service >/dev/null 2>&1; then
+            $systemd_cmd stop cf-vps-monitor.service
+            $systemd_cmd disable cf-vps-monitor.service
             stopped=true
             print_message "$GREEN" "监控服务已停止 (systemd)"
         fi
@@ -2228,15 +2395,19 @@ stop_service() {
 
 # 检查服务状态
 check_service_status() {
-    print_message "$BLUE" "检查监控服务状态..."
+    local systemd_cmd=$(get_systemd_command)
+    local service_path=$(get_systemd_service_path)
+    local user_desc=$(get_user_type_description)
+
+    print_message "$BLUE" "检查监控服务状态 ($user_desc)..."
 
     local running=false
 
     # 检查systemd状态
-    if [[ -f "$SYSTEMD_SERVICE_FILE" ]] && command_exists systemctl; then
-        if systemctl --user is-active vps-monitor.service >/dev/null 2>&1; then
+    if [[ -f "$service_path" ]] && command_exists systemctl; then
+        if $systemd_cmd is-active cf-vps-monitor.service >/dev/null 2>&1; then
             print_message "$GREEN" "✓ systemd服务运行中"
-            systemctl --user status vps-monitor.service --no-pager -l
+            $systemd_cmd status cf-vps-monitor.service --no-pager -l
             running=true
         else
             print_message "$YELLOW" "✗ systemd服务未运行"
@@ -2273,6 +2444,784 @@ check_service_status() {
     else
         print_message "$YELLOW" "  配置文件不存在"
     fi
+
+    # 显示自启动状态
+    echo
+    print_message "$CYAN" "自启动配置状态:"
+
+    local active_count=0
+
+    # 检查systemd服务状态
+    local systemd_cmd=$(get_systemd_command)
+    local service_path=$(get_systemd_service_path)
+    local user_desc=$(get_user_type_description)
+
+    print_message "$CYAN" "  systemd服务 ($user_desc):"
+    if [[ -f "$service_path" ]] && command_exists systemctl; then
+        if $systemd_cmd is-enabled cf-vps-monitor.service >/dev/null 2>&1; then
+            print_message "$GREEN" "    ✓ 服务已启用"
+            active_count=$((active_count + 1))
+
+            # 检查lingering状态（根据用户类型）
+            if is_root_user; then
+                print_message "$GREEN" "    ✓ 系统级服务 (重启后自动运行)"
+            else
+                check_lingering_support
+                case $? in
+                    0)
+                        print_message "$GREEN" "    ✓ lingering已启用 (重启后自动运行)"
+                        ;;
+                    1)
+                        print_message "$YELLOW" "    ⚠ lingering未启用 (需要用户登录)"
+                        ;;
+                    2)
+                        print_message "$YELLOW" "    ⚠ 系统不支持lingering"
+                        ;;
+                    3)
+                        print_message "$GREEN" "    ✓ root用户无需lingering (重启后自动运行)"
+                        ;;
+                esac
+            fi
+        else
+            print_message "$YELLOW" "    ✗ 服务未启用"
+        fi
+    else
+        print_message "$YELLOW" "    ✗ 服务文件不存在"
+    fi
+
+    # 检查crontab状态
+    print_message "$CYAN" "  crontab自启动:"
+    if check_crontab_autostart; then
+        print_message "$GREEN" "    ✓ 已配置 (重启后自动运行)"
+        active_count=$((active_count + 1))
+    else
+        print_message "$YELLOW" "    ✗ 未配置"
+    fi
+
+    # 检查profile状态
+    print_message "$CYAN" "  shell profile自启动:"
+    if check_profile_autostart; then
+        print_message "$GREEN" "    ✓ 已配置 (登录时自动运行)"
+        active_count=$((active_count + 1))
+    else
+        print_message "$YELLOW" "    ✗ 未配置"
+    fi
+
+    # 自启动状态总结
+    echo
+    print_message "$BLUE" "自启动保障总结:"
+    echo "  活跃方案数: $active_count / 3"
+
+    if [[ $active_count -eq 0 ]]; then
+        print_message "$RED" "  状态: 无自启动保障"
+        print_message "$YELLOW" "  建议: 运行 '$0 upgrade-autostart' 配置自启动"
+    elif [[ $active_count -eq 1 ]]; then
+        print_message "$YELLOW" "  状态: 基本保障"
+        print_message "$CYAN" "  建议: 运行 '$0 upgrade-autostart' 配置额外保障"
+    elif [[ $active_count -eq 2 ]]; then
+        print_message "$GREEN" "  状态: 良好保障"
+    else
+        print_message "$GREEN" "  状态: 完全保障 (推荐)"
+    fi
+}
+
+# ==================== crontab自启动方案 ====================
+
+# 设置crontab自启动
+setup_crontab_autostart() {
+    print_message "$BLUE" "配置crontab自启动..."
+
+    # 详细的可用性检测
+    if ! command_exists crontab; then
+        print_message "$YELLOW" "crontab命令不可用，跳过crontab自启动配置"
+        print_message "$CYAN" "提示: 请安装cron服务 (apt install cron 或 yum install cronie)"
+        return 1
+    fi
+
+    # 检测cron服务状态
+    local cron_running=false
+    if pgrep -x "cron" >/dev/null 2>&1 || pgrep -x "crond" >/dev/null 2>&1; then
+        cron_running=true
+        print_message "$CYAN" "  cron服务状态: 运行中"
+    else
+        print_message "$YELLOW" "  ⚠ cron服务未运行，crontab可能无法正常工作"
+        print_message "$CYAN" "  提示: 请启动cron服务 (systemctl start cron 或 service cron start)"
+    fi
+
+    # 验证服务脚本文件存在
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_message "$RED" "服务脚本文件不存在: $SERVICE_FILE"
+        print_message "$CYAN" "提示: 请先运行安装命令创建服务脚本"
+        return 1
+    fi
+
+    # 验证服务脚本内容
+    if [[ ! -s "$SERVICE_FILE" ]]; then
+        print_message "$RED" "服务脚本文件为空: $SERVICE_FILE"
+        return 1
+    fi
+
+    # 确保服务脚本可执行
+    if [[ ! -x "$SERVICE_FILE" ]]; then
+        print_message "$CYAN" "  设置服务脚本执行权限..."
+        if chmod +x "$SERVICE_FILE" 2>/dev/null; then
+            print_message "$GREEN" "  ✓ 执行权限设置成功"
+        else
+            print_message "$RED" "✗ 无法设置服务脚本执行权限"
+            print_message "$CYAN" "提示: 请检查文件权限和目录访问权限"
+            return 1
+        fi
+    fi
+
+    local crontab_entry="@reboot $SERVICE_FILE"
+    local crontab_comment="# cf-vps-monitor auto-start"
+
+    # 检查当前crontab访问权限
+    local crontab_accessible=true
+    if ! crontab -l >/dev/null 2>&1; then
+        local crontab_error=$(crontab -l 2>&1)
+        if echo "$crontab_error" | grep -q "no crontab"; then
+            print_message "$CYAN" "  当前用户无crontab配置，将创建新配置"
+        else
+            print_message "$YELLOW" "  ⚠ crontab访问异常: $crontab_error"
+            crontab_accessible=false
+        fi
+    fi
+
+    # 检查是否已存在相关条目
+    local current_crontab=""
+    if [[ "$crontab_accessible" == "true" ]]; then
+        current_crontab=$(crontab -l 2>/dev/null || echo "")
+        if echo "$current_crontab" | grep -q "$SERVICE_FILE"; then
+            print_message "$GREEN" "✓ crontab自启动已配置"
+            # 显示现有条目
+            local existing_entry=$(echo "$current_crontab" | grep "$SERVICE_FILE")
+            print_message "$CYAN" "  现有条目: $existing_entry"
+            return 0
+        fi
+    fi
+
+    # 创建临时文件
+    local temp_crontab
+    temp_crontab=$(mktemp) || {
+        print_message "$RED" "✗ 无法创建临时文件"
+        print_message "$CYAN" "提示: 请检查/tmp目录权限或磁盘空间"
+        return 1
+    }
+
+    # 写入新配置
+    {
+        if [[ -n "$current_crontab" ]]; then
+            echo "$current_crontab"
+        fi
+        echo "$crontab_comment"
+        echo "$crontab_entry"
+    } > "$temp_crontab"
+
+    # 验证临时文件内容
+    if [[ ! -s "$temp_crontab" ]]; then
+        print_message "$RED" "✗ 临时crontab文件创建失败"
+        rm -f "$temp_crontab"
+        return 1
+    fi
+
+    print_message "$CYAN" "  准备安装crontab条目: $crontab_entry"
+
+    # 安装新的crontab
+    local crontab_output
+    if crontab_output=$(crontab "$temp_crontab" 2>&1); then
+        rm -f "$temp_crontab"
+        print_message "$GREEN" "✓ crontab自启动已配置"
+
+        # 验证安装结果
+        if crontab -l 2>/dev/null | grep -q "$SERVICE_FILE"; then
+            print_message "$GREEN" "  ✓ 配置验证成功"
+        else
+            print_message "$YELLOW" "  ⚠ 配置验证失败，但安装命令成功"
+        fi
+        return 0
+    else
+        local error_code=$?
+        rm -f "$temp_crontab"
+        print_message "$RED" "✗ crontab配置失败 (错误码: $error_code)"
+        if [[ -n "$crontab_output" ]]; then
+            print_message "$RED" "  错误信息: $crontab_output"
+        fi
+
+        # 提供常见问题的解决建议
+        if echo "$crontab_output" | grep -q "permission"; then
+            print_message "$CYAN" "提示: 权限问题，请检查用户是否有crontab使用权限"
+        elif echo "$crontab_output" | grep -q "syntax"; then
+            print_message "$CYAN" "提示: 语法错误，请检查crontab条目格式"
+        else
+            print_message "$CYAN" "提示: 请检查cron服务状态和用户权限"
+        fi
+        return 1
+    fi
+}
+
+# 移除crontab自启动
+remove_crontab_autostart() {
+    print_message "$BLUE" "移除crontab自启动..."
+
+    if ! command_exists crontab; then
+        print_message "$YELLOW" "crontab命令不可用"
+        return 1
+    fi
+
+    # 检查是否存在相关条目
+    if ! crontab -l 2>/dev/null | grep -q "$SERVICE_FILE"; then
+        print_message "$YELLOW" "crontab中未找到自启动条目"
+        return 0
+    fi
+
+    # 创建临时文件
+    local temp_crontab=$(mktemp)
+    if [[ $? -ne 0 ]]; then
+        print_message "$RED" "无法创建临时文件"
+        return 1
+    fi
+
+    # 过滤掉相关条目
+    crontab -l 2>/dev/null | grep -v "$SERVICE_FILE" | grep -v "cf-vps-monitor auto-start" > "$temp_crontab"
+
+    # 安装过滤后的crontab
+    if crontab "$temp_crontab" 2>/dev/null; then
+        rm -f "$temp_crontab"
+        print_message "$GREEN" "✓ crontab自启动已移除"
+        return 0
+    else
+        rm -f "$temp_crontab"
+        print_message "$RED" "✗ crontab移除失败"
+        return 1
+    fi
+}
+
+# 检查crontab自启动状态
+check_crontab_autostart() {
+    if ! command_exists crontab; then
+        return 1
+    fi
+
+    if crontab -l 2>/dev/null | grep -q "$SERVICE_FILE"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ==================== shell profile自启动方案 ====================
+
+# 设置shell profile自启动
+setup_profile_autostart() {
+    print_message "$BLUE" "配置shell profile自启动..."
+
+    # 验证服务脚本文件存在
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_message "$YELLOW" "服务脚本文件不存在: $SERVICE_FILE"
+        return 1
+    fi
+
+    # 确保服务脚本可执行
+    if [[ ! -x "$SERVICE_FILE" ]]; then
+        chmod +x "$SERVICE_FILE" 2>/dev/null || {
+            print_message "$YELLOW" "无法设置服务脚本执行权限"
+            return 1
+        }
+    fi
+
+    # 检测用户当前使用的shell
+    local current_shell=$(basename "$SHELL" 2>/dev/null || echo "bash")
+
+    # 定义profile文件优先级（根据shell类型和通用性）
+    local profile_files=()
+    case "$current_shell" in
+        "zsh")
+            profile_files=(".zshrc" ".zprofile" ".profile" ".bashrc")
+            ;;
+        "fish")
+            profile_files=(".config/fish/config.fish" ".profile")
+            ;;
+        "bash"|*)
+            profile_files=(".bashrc" ".bash_profile" ".profile")
+            ;;
+    esac
+
+    # 自启动代码模板
+    local startup_marker="# === cf-vps-monitor auto-start BEGIN ==="
+    local startup_end_marker="# === cf-vps-monitor auto-start END ==="
+
+    # 创建启动检测代码
+    local startup_code="$startup_marker
+# VPS监控服务自启动检测
+if [ -n \"\$PS1\" ] && [ \"\$TERM\" != \"dumb\" ]; then
+    # 只在交互式shell中执行
+    if [ -f \"$PID_FILE\" ]; then
+        # 检查PID文件中的进程是否还在运行
+        if ! kill -0 \$(cat \"$PID_FILE\" 2>/dev/null) 2>/dev/null; then
+            # 进程不存在，清理PID文件并启动服务
+            rm -f \"$PID_FILE\"
+            nohup \"$SERVICE_FILE\" >/dev/null 2>&1 &
+        fi
+    else
+        # PID文件不存在，启动服务
+        nohup \"$SERVICE_FILE\" >/dev/null 2>&1 &
+    fi
+fi
+$startup_end_marker"
+
+    # 尝试添加到合适的profile文件
+    for profile in "${profile_files[@]}"; do
+        local profile_path="$HOME/$profile"
+
+        # 特殊处理fish配置文件
+        if [[ "$profile" == ".config/fish/config.fish" ]]; then
+            local fish_dir="$HOME/.config/fish"
+            if [[ ! -d "$fish_dir" ]]; then
+                mkdir -p "$fish_dir" 2>/dev/null || continue
+            fi
+        fi
+
+        # 检查文件是否存在或可创建
+        if [[ -f "$profile_path" ]] || touch "$profile_path" 2>/dev/null; then
+            # 检查是否已存在自启动代码
+            if grep -q "cf-vps-monitor auto-start" "$profile_path" 2>/dev/null; then
+                print_message "$YELLOW" "shell profile自启动已配置在: $profile"
+                return 0
+            fi
+
+            # 添加自启动代码
+            echo "" >> "$profile_path"
+            echo "$startup_code" >> "$profile_path"
+
+            if [[ $? -eq 0 ]]; then
+                print_message "$GREEN" "✓ shell profile自启动已配置在: $profile"
+                return 0
+            else
+                print_message "$YELLOW" "无法写入profile文件: $profile"
+            fi
+        fi
+    done
+
+    print_message "$RED" "✗ 无法配置shell profile自启动"
+    return 1
+}
+
+# 移除shell profile自启动
+remove_profile_autostart() {
+    print_message "$BLUE" "移除shell profile自启动..."
+
+    local profile_files=(".bashrc" ".bash_profile" ".profile" ".zshrc" ".zprofile" ".config/fish/config.fish")
+    local removed_count=0
+
+    for profile in "${profile_files[@]}"; do
+        local profile_path="$HOME/$profile"
+
+        if [[ -f "$profile_path" ]] && grep -q "cf-vps-monitor auto-start" "$profile_path" 2>/dev/null; then
+            # 创建临时文件
+            local temp_file=$(mktemp)
+            if [[ $? -ne 0 ]]; then
+                print_message "$YELLOW" "无法创建临时文件处理: $profile"
+                continue
+            fi
+
+            # 移除自启动代码块
+            awk '
+                /# === cf-vps-monitor auto-start BEGIN ===/ { skip=1; next }
+                /# === cf-vps-monitor auto-start END ===/ { skip=0; next }
+                !skip { print }
+            ' "$profile_path" > "$temp_file"
+
+            # 替换原文件
+            if mv "$temp_file" "$profile_path" 2>/dev/null; then
+                print_message "$GREEN" "✓ 已从 $profile 移除自启动代码"
+                removed_count=$((removed_count + 1))
+            else
+                rm -f "$temp_file"
+                print_message "$YELLOW" "无法更新profile文件: $profile"
+            fi
+        fi
+    done
+
+    if [[ $removed_count -gt 0 ]]; then
+        print_message "$GREEN" "✓ shell profile自启动已移除 (处理了 $removed_count 个文件)"
+        return 0
+    else
+        print_message "$YELLOW" "未找到需要移除的shell profile自启动配置"
+        return 0
+    fi
+}
+
+# 检查shell profile自启动状态
+check_profile_autostart() {
+    local profile_files=(".bashrc" ".bash_profile" ".profile" ".zshrc" ".zprofile" ".config/fish/config.fish")
+
+    for profile in "${profile_files[@]}"; do
+        local profile_path="$HOME/$profile"
+        if [[ -f "$profile_path" ]] && grep -q "cf-vps-monitor auto-start" "$profile_path" 2>/dev/null; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ==================== 多重自启动方案协调器 ====================
+
+# 配置多重自启动保障
+setup_auto_start() {
+    local user_type=$(detect_user_type)
+    local user_desc=$(get_user_type_description)
+
+    print_message "$BLUE" "配置多重自启动保障机制 (用户类型: $user_desc)..."
+    echo
+
+    # 环境检查：确保必要的文件和目录存在
+    print_message "$CYAN" "检查环境依赖..."
+
+    # 检查脚本目录
+    if [[ ! -d "$SCRIPT_DIR" ]]; then
+        print_message "$YELLOW" "⚠ 监控目录不存在，正在创建: $SCRIPT_DIR"
+        if ! mkdir -p "$SCRIPT_DIR" 2>/dev/null; then
+            print_message "$RED" "✗ 无法创建监控目录，请先运行安装命令"
+            return 1
+        fi
+    fi
+
+    # 检查服务脚本文件
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_message "$YELLOW" "⚠ 服务脚本不存在，正在检查可能的位置..."
+
+        # 尝试查找可能的服务脚本文件
+        local possible_files=(
+            "$SCRIPT_DIR/monitor-service.sh"
+            "$SCRIPT_DIR/vps-monitor-service.sh"
+            "$SCRIPT_DIR/service.sh"
+        )
+
+        local found_file=""
+        for file in "${possible_files[@]}"; do
+            if [[ -f "$file" ]]; then
+                found_file="$file"
+                break
+            fi
+        done
+
+        if [[ -n "$found_file" ]]; then
+            print_message "$GREEN" "  ✓ 找到服务脚本: $found_file"
+            SERVICE_FILE="$found_file"
+        else
+            print_message "$RED" "✗ 未找到服务脚本文件"
+            print_message "$CYAN" "请先运行以下命令之一："
+            echo "  1. $0 install     # 完整安装"
+            echo "  2. $0 menu        # 交互式菜单选择安装"
+            return 1
+        fi
+    fi
+
+    print_message "$GREEN" "✓ 环境检查完成"
+    echo
+
+    local success_count=0
+    local total_attempts=0
+    local systemd_success=false
+    local lingering_success=false
+    local crontab_success=false
+    local profile_success=false
+
+    # 方案1: systemd服务配置
+    if is_root_user; then
+        print_message "$CYAN" "方案1: 系统级systemd服务配置"
+    else
+        print_message "$CYAN" "方案1: 用户级systemd服务配置"
+    fi
+    total_attempts=$((total_attempts + 1))
+
+    if create_systemd_service; then
+        systemd_success=true
+        success_count=$((success_count + 1))
+        if is_root_user; then
+            print_message "$GREEN" "  ✓ 系统级systemd服务已创建"
+        else
+            print_message "$GREEN" "  ✓ 用户级systemd服务已创建"
+        fi
+
+        # 检查lingering支持（仅普通用户需要）
+        if is_root_user; then
+            lingering_success=true
+            print_message "$GREEN" "  ✓ 系统级服务将在系统启动时自动运行"
+        else
+            print_message "$CYAN" "  检查lingering支持..."
+            check_lingering_support
+            case $? in
+                0)
+                    lingering_success=true
+                    print_message "$GREEN" "  ✓ lingering已启用"
+                    ;;
+                1)
+                    if enable_lingering; then
+                        lingering_success=true
+                        print_message "$GREEN" "  ✓ lingering已成功启用"
+                    else
+                        print_message "$YELLOW" "  ⚠ lingering启用失败，但systemd服务仍可用"
+                    fi
+                    ;;
+                2)
+                    print_message "$YELLOW" "  ⚠ 系统不支持lingering"
+                    ;;
+                3)
+                    # 这种情况不应该发生
+                    lingering_success=true
+                    print_message "$GREEN" "  ✓ root用户无需lingering"
+                    ;;
+            esac
+        fi
+    else
+        if is_root_user; then
+            print_message "$YELLOW" "  ✗ 系统级systemd服务配置失败"
+        else
+            print_message "$YELLOW" "  ✗ 用户级systemd服务配置失败"
+        fi
+    fi
+
+    echo
+
+    # 方案2: crontab @reboot备用方案
+    print_message "$CYAN" "方案2: crontab自启动备用"
+    total_attempts=$((total_attempts + 1))
+
+    if setup_crontab_autostart; then
+        crontab_success=true
+        success_count=$((success_count + 1))
+        print_message "$GREEN" "  ✓ crontab自启动已配置"
+    else
+        print_message "$YELLOW" "  ✗ crontab自启动配置失败"
+    fi
+
+    echo
+
+    # 方案3: shell profile最后保障
+    print_message "$CYAN" "方案3: shell profile最后保障"
+    total_attempts=$((total_attempts + 1))
+
+    if setup_profile_autostart; then
+        profile_success=true
+        success_count=$((success_count + 1))
+        print_message "$GREEN" "  ✓ shell profile自启动已配置"
+    else
+        print_message "$YELLOW" "  ✗ shell profile自启动配置失败"
+    fi
+
+    echo
+
+    # 配置结果总结
+    print_message "$BLUE" "自启动配置总结:"
+    echo "  总方案数: $total_attempts"
+    echo "  成功配置: $success_count"
+    echo "  成功率: $((success_count * 100 / total_attempts))%"
+    echo
+
+    # 详细状态报告
+    print_message "$CYAN" "各方案状态:"
+    if [[ "$systemd_success" == "true" ]]; then
+        if is_root_user; then
+            echo "  系统级systemd: ✓ 已配置 (开机自启动)"
+        else
+            if [[ "$lingering_success" == "true" ]]; then
+                echo "  用户级systemd + lingering: ✓ 完全配置 (推荐)"
+            else
+                echo "  用户级systemd: ✓ 已配置 (需要用户登录)"
+            fi
+        fi
+    else
+        if is_root_user; then
+            echo "  系统级systemd: ✗ 未配置"
+        else
+            echo "  用户级systemd: ✗ 未配置"
+        fi
+    fi
+
+    if [[ "$crontab_success" == "true" ]]; then
+        echo "  crontab: ✓ 已配置 (开机自启动)"
+    else
+        echo "  crontab: ✗ 未配置"
+    fi
+
+    if [[ "$profile_success" == "true" ]]; then
+        echo "  shell profile: ✓ 已配置 (登录时启动)"
+    else
+        echo "  shell profile: ✗ 未配置"
+    fi
+
+    echo
+
+    # 根据配置结果给出建议
+    if [[ $success_count -eq 0 ]]; then
+        print_message "$RED" "✗ 所有自启动方案配置失败"
+        print_message "$YELLOW" "建议: 请检查系统权限和依赖，或手动配置自启动"
+        return 1
+    elif [[ $success_count -eq 1 ]]; then
+        print_message "$YELLOW" "⚠ 仅配置了1种自启动方案"
+        print_message "$CYAN" "建议: 虽然可以工作，但建议检查其他方案的配置问题"
+    elif [[ $success_count -eq 2 ]]; then
+        print_message "$GREEN" "✓ 已配置2种自启动方案，具有良好的可靠性"
+    else
+        print_message "$GREEN" "✓ 已配置全部3种自启动方案，具有最高可靠性"
+    fi
+
+    # 根据用户类型提供不同的建议
+    echo
+    if is_root_user; then
+        if [[ "$systemd_success" == "true" ]]; then
+            print_message "$CYAN" "root用户建议: 系统级systemd服务具有最高优先级和可靠性"
+            print_message "$CYAN" "服务将在系统启动时自动运行，无需额外配置"
+        else
+            print_message "$CYAN" "root用户建议: 建议优先解决systemd服务配置问题"
+            print_message "$CYAN" "系统级服务是root用户的最佳选择"
+        fi
+    else
+        if [[ "$systemd_success" == "true" && "$lingering_success" != "true" ]]; then
+            print_message "$CYAN" "普通用户建议: 要让systemd服务在重启后自动运行，请考虑:"
+            echo "  1. 请求管理员执行: sudo loginctl enable-linger $USER"
+            echo "  2. 或依赖已配置的其他自启动方案"
+        else
+            print_message "$CYAN" "普通用户建议: 建议启用lingering以获得最佳的自启动体验"
+        fi
+    fi
+
+    return 0
+}
+
+# 移除所有自启动配置
+remove_auto_start() {
+    print_message "$BLUE" "移除所有自启动配置..."
+    echo
+
+    local removed_count=0
+
+    # 移除systemd服务
+    local systemd_cmd=$(get_systemd_command)
+    local service_path=$(get_systemd_service_path)
+    local user_desc=$(get_user_type_description)
+
+    if [[ -f "$service_path" ]] && command_exists systemctl; then
+        print_message "$CYAN" "移除systemd服务 ($user_desc)..."
+        $systemd_cmd stop cf-vps-monitor.service 2>/dev/null || true
+        $systemd_cmd disable cf-vps-monitor.service 2>/dev/null || true
+        rm -f "$service_path"
+        $systemd_cmd daemon-reload 2>/dev/null || true
+        print_message "$GREEN" "  ✓ systemd服务已移除"
+        removed_count=$((removed_count + 1))
+    fi
+
+    # 移除crontab配置
+    if remove_crontab_autostart; then
+        print_message "$GREEN" "  ✓ crontab配置已移除"
+        removed_count=$((removed_count + 1))
+    fi
+
+    # 移除profile配置
+    if remove_profile_autostart; then
+        print_message "$GREEN" "  ✓ profile配置已移除"
+        removed_count=$((removed_count + 1))
+    fi
+
+    echo
+    if [[ $removed_count -gt 0 ]]; then
+        print_message "$GREEN" "✓ 已移除 $removed_count 种自启动配置"
+    else
+        print_message "$YELLOW" "未找到需要移除的自启动配置"
+    fi
+
+    return 0
+}
+
+# 检查所有自启动方案状态
+check_auto_start_status() {
+    print_message "$BLUE" "检查自启动配置状态..."
+    echo
+
+    local active_count=0
+
+    # 检查systemd服务状态
+    local systemd_cmd=$(get_systemd_command)
+    local service_path=$(get_systemd_service_path)
+    local user_desc=$(get_user_type_description)
+
+    print_message "$CYAN" "systemd服务 ($user_desc):"
+    if [[ -f "$service_path" ]] && command_exists systemctl; then
+        if $systemd_cmd is-enabled cf-vps-monitor.service >/dev/null 2>&1; then
+            print_message "$GREEN" "  ✓ 服务已启用"
+            active_count=$((active_count + 1))
+
+            # 检查lingering状态（根据用户类型）
+            if is_root_user; then
+                print_message "$GREEN" "  ✓ 系统级服务 (重启后自动运行)"
+            else
+                check_lingering_support
+                case $? in
+                    0)
+                        print_message "$GREEN" "  ✓ lingering已启用 (重启后自动运行)"
+                        ;;
+                    1)
+                        print_message "$YELLOW" "  ⚠ lingering未启用 (需要用户登录)"
+                        ;;
+                    2)
+                        print_message "$YELLOW" "  ⚠ 系统不支持lingering"
+                        ;;
+                    3)
+                        print_message "$GREEN" "  ✓ root用户无需lingering (重启后自动运行)"
+                        ;;
+                esac
+            fi
+        else
+            print_message "$YELLOW" "  ✗ 服务未启用"
+        fi
+    else
+        print_message "$YELLOW" "  ✗ 服务文件不存在"
+    fi
+
+    echo
+
+    # 检查crontab状态
+    print_message "$CYAN" "crontab自启动:"
+    if check_crontab_autostart; then
+        print_message "$GREEN" "  ✓ 已配置 (重启后自动运行)"
+        active_count=$((active_count + 1))
+    else
+        print_message "$YELLOW" "  ✗ 未配置"
+    fi
+
+    echo
+
+    # 检查profile状态
+    print_message "$CYAN" "shell profile自启动:"
+    if check_profile_autostart; then
+        print_message "$GREEN" "  ✓ 已配置 (登录时自动运行)"
+        active_count=$((active_count + 1))
+    else
+        print_message "$YELLOW" "  ✗ 未配置"
+    fi
+
+    echo
+
+    # 状态总结
+    print_message "$BLUE" "自启动状态总结:"
+    echo "  活跃方案数: $active_count / 3"
+
+    if [[ $active_count -eq 0 ]]; then
+        print_message "$RED" "  状态: 无自启动保障"
+        print_message "$YELLOW" "  建议: 运行自启动配置命令"
+    elif [[ $active_count -eq 1 ]]; then
+        print_message "$YELLOW" "  状态: 基本保障"
+        print_message "$CYAN" "  建议: 考虑配置额外的自启动方案"
+    elif [[ $active_count -eq 2 ]]; then
+        print_message "$GREEN" "  状态: 良好保障"
+    else
+        print_message "$GREEN" "  状态: 完全保障"
+    fi
+
+    return 0
 }
 
 # 查看日志
@@ -2288,6 +3237,7 @@ view_logs() {
     echo "----------------------------------------"
     print_message "$CYAN" "日志文件位置: $LOG_FILE"
 }
+
 
 # 测试连接
 test_connection() {
@@ -2418,7 +3368,17 @@ install_monitor() {
         systemd_available=true
     fi
 
+    # 配置多重自启动保障
+    echo
+    print_message "$BLUE" "配置自启动机制..."
+    if setup_auto_start; then
+        print_message "$GREEN" "✓ 自启动机制配置完成"
+    else
+        print_message "$YELLOW" "⚠ 自启动配置部分失败，但不影响基本功能"
+    fi
+
     # 启动服务
+    echo
     if start_service; then
         print_message "$GREEN" "✓ VPS监控服务安装并启动成功"
         echo
@@ -2434,8 +3394,11 @@ install_monitor() {
             print_message "$GREEN" "  启动方式: 传统后台进程"
         fi
         echo
-        print_message "$YELLOW" "提示: 使用 '$0 status' 检查服务状态"
+        print_message "$GREEN" "✓ 已配置多重自启动保障，VPS重启后将自动运行"
+        echo
+        print_message "$YELLOW" "提示: 使用 '$0 status' 检查服务状态和自启动状态"
         print_message "$YELLOW" "提示: 使用 '$0 logs' 查看运行日志"
+        print_message "$YELLOW" "提示: 使用 '$0 upgrade-autostart' 升级自启动机制"
     else
         error_exit "服务启动失败"
     fi
@@ -2473,18 +3436,12 @@ uninstall_monitor() {
         done
     fi
 
-    # 2. 删除systemd服务（修复服务名称）
-    if [[ -f "$SYSTEMD_SERVICE_FILE" ]] && command_exists systemctl; then
-        print_message "$BLUE" "删除systemd服务..."
-        systemctl --user stop cf-vps-monitor.service 2>/dev/null || true
-        systemctl --user disable cf-vps-monitor.service 2>/dev/null || true
-        rm -f "$SYSTEMD_SERVICE_FILE"
-        systemctl --user daemon-reload 2>/dev/null || true
-        systemctl --user reset-failed 2>/dev/null || true
-    fi
+    # 2. 移除所有自启动配置
+    print_message "$BLUE" "移除所有自启动配置..."
+    remove_auto_start
 
-    # 3. 清理临时文件
-    print_message "$BLUE" "清理临时文件..."
+    # 3. 清理临时文件和缓存
+    print_message "$BLUE" "清理临时文件和缓存..."
     # 清理网络监控临时文件
     rm -f /tmp/vps_monitor_net_* 2>/dev/null || true
     rm -f /tmp/vps_monitor_functions_*.sh 2>/dev/null || true
@@ -2492,6 +3449,14 @@ uninstall_monitor() {
     # 清理wrapper脚本
     rm -f "$SCRIPT_DIR/curl_wrapper.sh" 2>/dev/null || true
     rm -f "$SCRIPT_DIR/bc_wrapper.sh" 2>/dev/null || true
+
+    # 清理缓存目录
+    if [[ -d "$SCRIPT_DIR/cache" ]]; then
+        rm -rf "$SCRIPT_DIR/cache" 2>/dev/null || true
+    fi
+
+    # 清理重启标记文件
+    rm -f "$SCRIPT_DIR/restart_needed" 2>/dev/null || true
 
     # 清理可能的缓存目录中的临时文件
     local temp_dirs=("${TMPDIR:-/tmp}" "${HOME}/.cache")
@@ -2507,6 +3472,7 @@ uninstall_monitor() {
         "$HOME/.local/share/vps-monitor"
         "/opt/vps-monitor"
         "$HOME/.vps-monitor"
+        "$HOME/.cf-vps-monitor"
     )
     for dir in "${alt_dirs[@]}"; do
         if [[ -d "$dir" && "$dir" != "$SCRIPT_DIR" ]]; then
@@ -2521,7 +3487,22 @@ uninstall_monitor() {
         rm -rf "$SCRIPT_DIR"
     fi
 
-    # 6. 检查残留进程
+    # 6. 清理可能的systemd用户目录残留
+    print_message "$BLUE" "清理systemd配置残留..."
+    local systemd_user_dir="$HOME/.config/systemd/user"
+    if [[ -d "$systemd_user_dir" ]]; then
+        rm -f "$systemd_user_dir/cf-vps-monitor.service" 2>/dev/null || true
+        rm -f "$systemd_user_dir/vps-monitor.service" 2>/dev/null || true
+    fi
+
+    # 清理系统级systemd服务（如果是root用户）
+    if is_root_user; then
+        rm -f "/etc/systemd/system/cf-vps-monitor.service" 2>/dev/null || true
+        rm -f "/etc/systemd/system/vps-monitor.service" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    # 7. 检查残留进程
     print_message "$BLUE" "检查残留进程..."
     local remaining_pids=$(pgrep -f "cf-vps-monitor\|monitor-service\.sh\|vps-monitor" 2>/dev/null || echo "")
     if [[ -n "$remaining_pids" ]]; then
@@ -2534,7 +3515,39 @@ uninstall_monitor() {
         done
     fi
 
+    # 8. 最终清理检查
+    print_message "$BLUE" "执行最终清理检查..."
+
+    # 清理可能的日志文件残留
+    local possible_logs=(
+        "/var/log/vps-monitor.log"
+        "/var/log/cf-vps-monitor.log"
+        "$HOME/vps-monitor.log"
+        "$HOME/cf-vps-monitor.log"
+    )
+    for log_file in "${possible_logs[@]}"; do
+        if [[ -f "$log_file" ]]; then
+            rm -f "$log_file" 2>/dev/null || true
+            print_message "$CYAN" "  清理日志文件: $log_file"
+        fi
+    done
+
+    # 清理可能的配置文件残留
+    local possible_configs=(
+        "$HOME/.vps-monitor.conf"
+        "$HOME/.cf-vps-monitor.conf"
+        "/etc/vps-monitor.conf"
+        "/etc/cf-vps-monitor.conf"
+    )
+    for config_file in "${possible_configs[@]}"; do
+        if [[ -f "$config_file" ]]; then
+            rm -f "$config_file" 2>/dev/null || true
+            print_message "$CYAN" "  清理配置文件: $config_file"
+        fi
+    done
+
     print_message "$GREEN" "✓ VPS监控服务已彻底卸载"
+    print_message "$CYAN" "所有相关文件、配置和自启动设置已完全清除"
     print_message "$CYAN" "感谢使用VPS监控服务"
 }
 
@@ -2556,6 +3569,9 @@ show_help() {
     echo "  test        测试连接"
     echo "  menu        显示交互菜单"
     echo "  help        显示此帮助信息"
+    echo
+    echo "自启动管理:"
+    echo "  upgrade-autostart    升级自启动机制"
     echo
     echo "一键安装参数:"
     echo "  -i, --install           一键安装模式"
@@ -2584,12 +3600,17 @@ show_menu() {
         echo
         echo "1. 安装监控服务"
         echo "2. 启动监控服务"
+        echo
         echo "3. 停止监控服务"
         echo "4. 重启监控服务"
+        echo
         echo "5. 查看服务状态"
         echo "6. 查看运行日志"
+        echo
         echo "7. 配置监控参数"
         echo "8. 测试连接"
+        echo
+        print_message "$CYAN" "特殊操作:"
         echo "9. 彻底卸载服务"
         echo "0. 退出"
         echo
@@ -2790,7 +3811,17 @@ one_click_install() {
         systemd_available=true
     fi
 
+    # 配置多重自启动保障
+    echo
+    print_message "$BLUE" "配置自启动机制..."
+    if setup_auto_start; then
+        print_message "$GREEN" "✓ 自启动机制配置完成"
+    else
+        print_message "$YELLOW" "⚠ 自启动配置部分失败，但不影响基本功能"
+    fi
+
     # 启动服务
+    echo
     if start_service; then
         print_message "$GREEN" "✓ VPS监控服务一键安装成功"
         echo
@@ -2806,8 +3837,11 @@ one_click_install() {
             print_message "$GREEN" "  启动方式: 传统后台进程"
         fi
         echo
-        print_message "$YELLOW" "提示: 使用 '$0 status' 检查服务状态"
+        print_message "$GREEN" "✓ 已配置多重自启动保障，VPS重启后将自动运行"
+        echo
+        print_message "$YELLOW" "提示: 使用 '$0 status' 检查服务状态和自启动状态"
         print_message "$YELLOW" "提示: 使用 '$0 logs' 查看运行日志"
+        print_message "$YELLOW" "提示: 使用 '$0 upgrade-autostart' 升级自启动机制"
         return 0
     else
         print_message "$RED" "✗ 服务启动失败"
@@ -2858,6 +3892,10 @@ main() {
             ;;
         test)
             test_connection
+            ;;
+        upgrade-autostart)
+            print_message "$BLUE" "升级自启动机制..."
+            setup_auto_start
             ;;
         menu)
             show_menu
