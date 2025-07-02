@@ -1,5 +1,4 @@
 // VPS监控面板 - Cloudflare Worker解决方案
-// 版本: 2.1.0 - 代码结构优化版
 
 // ==================== 配置常量 ====================
 
@@ -66,6 +65,228 @@ function validateInput(input, type, maxLength = 255) {
   return validators[type] ? validators[type]() : input.trim().length > 0;
 }
 
+// ==================== 统一响应处理工具 ====================
+
+// 创建标准API响应
+function createApiResponse(data, status = 200, corsHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...corsHeaders }
+  });
+}
+
+// 创建错误响应
+function createErrorResponse(error, message, status = 500, corsHeaders = {}, details = null) {
+  const errorData = {
+    error,
+    message,
+    timestamp: Date.now()
+  };
+  if (details) errorData.details = details;
+
+  return createApiResponse(errorData, status, corsHeaders);
+}
+
+// 创建成功响应
+function createSuccessResponse(data, corsHeaders = {}) {
+  return createApiResponse({ success: true, ...data }, 200, corsHeaders);
+}
+
+// ==================== 统一验证工具 ====================
+
+// 服务器认证验证
+async function validateServerAuth(path, request, env) {
+  const serverId = extractAndValidateServerId(path);
+  if (!serverId) {
+    return { error: 'Invalid server ID', message: '无效的服务器ID格式' };
+  }
+
+  const apiKey = request.headers.get('X-API-Key');
+  if (!apiKey) {
+    return { error: 'API key required', message: '需要API密钥' };
+  }
+
+  try {
+    const serverData = await env.DB.prepare(
+      'SELECT id, name, api_key FROM servers WHERE id = ?'
+    ).bind(serverId).first();
+
+    if (!serverData || serverData.api_key !== apiKey) {
+      return { error: 'Invalid credentials', message: '无效的服务器ID或API密钥' };
+    }
+
+    return { success: true, serverId, serverData };
+  } catch (error) {
+    return { error: 'Database error', message: '数据库查询失败' };
+  }
+}
+
+// ==================== 统一数据库错误处理 ====================
+
+function handleDbError(error, corsHeaders, operation = 'database operation') {
+  console.error(`数据库操作错误 [${operation}]:`, error);
+
+  if (error.message.includes('no such table')) {
+    return createErrorResponse(
+      'Database table missing',
+      '数据库表不存在，请重试',
+      503,
+      corsHeaders,
+      '如果问题持续存在，请联系管理员'
+    );
+  }
+
+  return createErrorResponse(
+    'Internal server error',
+    `${operation}失败: ${error.message}`,
+    500,
+    corsHeaders,
+    '请稍后重试，如果问题持续存在请联系管理员'
+  );
+}
+
+// ==================== 缓存查询工具 ====================
+
+// VPS上报间隔缓存
+let vpsIntervalCache = {
+  value: null,
+  timestamp: 0,
+  ttl: 60000 // 1分钟缓存
+};
+
+// 获取VPS上报间隔（带缓存）
+async function getVpsReportInterval(env) {
+  const now = Date.now();
+
+  // 检查缓存是否有效
+  if (vpsIntervalCache.value !== null && (now - vpsIntervalCache.timestamp) < vpsIntervalCache.ttl) {
+    return vpsIntervalCache.value;
+  }
+
+  try {
+    const result = await env.DB.prepare(
+      'SELECT value FROM app_config WHERE key = ?'
+    ).bind('vps_report_interval_seconds').first();
+
+    const interval = result?.value ? parseInt(result.value, 10) : 60;
+    if (!isNaN(interval) && interval > 0) {
+      // 更新缓存
+      vpsIntervalCache.value = interval;
+      vpsIntervalCache.timestamp = now;
+      return interval;
+    }
+  } catch (error) {
+    console.warn("获取VPS上报间隔失败，使用默认值:", error);
+  }
+
+  // 默认值也缓存
+  vpsIntervalCache.value = 60;
+  vpsIntervalCache.timestamp = now;
+  return 60;
+}
+
+// 清除VPS间隔缓存（当设置更新时调用）
+function clearVpsIntervalCache() {
+  vpsIntervalCache.value = null;
+  vpsIntervalCache.timestamp = 0;
+}
+
+// ==================== VPS数据验证工具 ====================
+
+// 验证JSON对象结构
+function validateJsonObject(obj, fieldName) {
+  if (!obj || typeof obj !== 'object') {
+    console.warn(`${fieldName}字段不是有效的对象:`, obj);
+    return false;
+  }
+  return true;
+}
+
+// 验证VPS数据结构
+function validateVpsDataStructure(data, type) {
+  if (!validateJsonObject(data, type)) {
+    return false;
+  }
+
+  switch (type) {
+    case 'CPU':
+      return typeof data.usage_percent === 'number' &&
+             Array.isArray(data.load_avg) &&
+             data.load_avg.length === 3;
+    case '内存':
+    case '磁盘':
+      return typeof data.total === 'number' &&
+             typeof data.used === 'number' &&
+             typeof data.free === 'number' &&
+             typeof data.usage_percent === 'number';
+    case '网络':
+      return typeof data.upload_speed === 'number' &&
+             typeof data.download_speed === 'number' &&
+             typeof data.total_upload === 'number' &&
+             typeof data.total_download === 'number';
+    default:
+      return true;
+  }
+}
+
+// 验证和修复VPS上报数据
+function validateAndFixVpsData(reportData) {
+  const requiredFields = ['timestamp', 'cpu', 'memory', 'disk', 'network'];
+
+  // 检查必需字段
+  for (const field of requiredFields) {
+    if (!reportData[field]) {
+      return {
+        error: 'Invalid data format',
+        message: `缺少必需字段: ${field}`,
+        details: `上报数据必须包含以下字段: ${requiredFields.join(', ')}, uptime`,
+        received_fields: Object.keys(reportData)
+      };
+    }
+  }
+
+  if (typeof reportData.uptime === 'undefined') {
+    return {
+      error: 'Invalid data format',
+      message: '缺少uptime字段',
+      details: 'uptime字段是必需的，用于记录系统运行时间（秒）',
+      received_fields: Object.keys(reportData)
+    };
+  }
+
+  // 验证和修复数据结构
+  if (!validateVpsDataStructure(reportData.cpu, 'CPU')) {
+    console.warn('CPU数据结构无效，使用默认值:', reportData.cpu);
+    reportData.cpu = { usage_percent: 0, load_avg: [0, 0, 0] };
+  }
+  if (!validateVpsDataStructure(reportData.memory, '内存')) {
+    console.warn('内存数据结构无效，使用默认值:', reportData.memory);
+    reportData.memory = { total: 0, used: 0, free: 0, usage_percent: 0 };
+  }
+  if (!validateVpsDataStructure(reportData.disk, '磁盘')) {
+    console.warn('磁盘数据结构无效，使用默认值:', reportData.disk);
+    reportData.disk = { total: 0, used: 0, free: 0, usage_percent: 0 };
+  }
+  if (!validateVpsDataStructure(reportData.network, '网络')) {
+    console.warn('网络数据结构无效，使用默认值:', reportData.network);
+    reportData.network = { upload_speed: 0, download_speed: 0, total_upload: 0, total_download: 0 };
+  }
+
+  // 验证时间戳
+  if (!Number.isInteger(reportData.timestamp) || reportData.timestamp <= 0) {
+    console.warn('时间戳无效，使用当前时间:', reportData.timestamp);
+    reportData.timestamp = Math.floor(Date.now() / 1000);
+  }
+
+  // 验证uptime
+  if (!Number.isInteger(reportData.uptime) || reportData.uptime < 0) {
+    console.warn('运行时间无效，设置为0:', reportData.uptime);
+    reportData.uptime = 0;
+  }
+
+  return { success: true, data: reportData };
+}
+
 // ==================== 密码处理 ====================
 
 async function hashPassword(password) {
@@ -82,6 +303,29 @@ async function verifyPassword(password, hashedPassword) {
 }
 
 // ==================== JWT处理 ====================
+
+// JWT验证缓存
+const jwtCache = new Map();
+const JWT_CACHE_TTL = 60000; // 1分钟缓存
+const MAX_CACHE_SIZE = 1000; // 最大缓存条目数
+
+// 清理过期的缓存条目
+function cleanupJWTCache() {
+  const now = Date.now();
+  for (const [key, value] of jwtCache.entries()) {
+    if (now - value.timestamp > JWT_CACHE_TTL) {
+      jwtCache.delete(key);
+    }
+  }
+
+  // 如果缓存过大，删除最旧的条目
+  if (jwtCache.size > MAX_CACHE_SIZE) {
+    const entries = Array.from(jwtCache.entries());
+    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+    const toDelete = entries.slice(0, jwtCache.size - MAX_CACHE_SIZE);
+    toDelete.forEach(([key]) => jwtCache.delete(key));
+  }
+}
 
 async function createJWT(payload, env) {
   const config = getSecurityConfig(env);
@@ -108,6 +352,38 @@ async function createJWT(payload, env) {
   return data + '.' + encodedSignature;
 }
 
+// 带缓存的JWT验证函数
+async function verifyJWTCached(token, env) {
+  // 检查缓存
+  const cached = jwtCache.get(token);
+  if (cached && Date.now() - cached.timestamp < JWT_CACHE_TTL) {
+    // 检查token是否过期
+    if (cached.payload.exp && Date.now() > cached.payload.exp) {
+      jwtCache.delete(token);
+      return null;
+    }
+    return cached.payload;
+  }
+
+  // 缓存未命中，执行实际验证
+  const payload = await verifyJWT(token, env);
+  if (payload) {
+    // 定期清理缓存
+    if (Math.random() < 0.01) { // 1%的概率触发清理
+      cleanupJWTCache();
+    }
+
+    // 存入缓存
+    jwtCache.set(token, {
+      payload,
+      timestamp: Date.now()
+    });
+  }
+
+  return payload;
+}
+
+// 原始JWT验证函数（不使用缓存）
 async function verifyJWT(token, env) {
   try {
     const config = getSecurityConfig(env);
@@ -221,7 +497,8 @@ const D1_SCHEMAS = {
       api_key TEXT NOT NULL UNIQUE,
       created_at INTEGER NOT NULL,
       sort_order INTEGER,
-      last_notified_down_at INTEGER DEFAULT NULL
+      last_notified_down_at INTEGER DEFAULT NULL,
+      is_public INTEGER DEFAULT 1
     );`,
 
   metrics: `
@@ -247,7 +524,8 @@ const D1_SCHEMAS = {
       last_status_code INTEGER,
       last_response_time_ms INTEGER,
       sort_order INTEGER,
-      last_notified_down_at INTEGER DEFAULT NULL
+      last_notified_down_at INTEGER DEFAULT NULL,
+      is_public INTEGER DEFAULT 1
     );`,
 
   site_status_history: `
@@ -310,7 +588,9 @@ async function applySchemaAlterations(db) {
     "ALTER TABLE admin_credentials ADD COLUMN failed_attempts INTEGER DEFAULT 0",
     "ALTER TABLE admin_credentials ADD COLUMN locked_until INTEGER DEFAULT NULL",
     "ALTER TABLE admin_credentials ADD COLUMN must_change_password INTEGER DEFAULT 0",
-    "ALTER TABLE admin_credentials ADD COLUMN password_changed_at INTEGER DEFAULT NULL"
+    "ALTER TABLE admin_credentials ADD COLUMN password_changed_at INTEGER DEFAULT NULL",
+    "ALTER TABLE servers ADD COLUMN is_public INTEGER DEFAULT 1",
+    "ALTER TABLE monitored_sites ADD COLUMN is_public INTEGER DEFAULT 1"
   ];
 
   for (const alterSql of alterStatements) {
@@ -361,24 +641,37 @@ async function createDefaultAdmin(db, env) {
 
 // ==================== 身份验证 ====================
 
+// 优化的认证函数，使用JWT缓存和智能数据库查询
 async function authenticateRequest(request, env) {
   const authHeader = request.headers.get('Authorization');
   if (!authHeader?.startsWith('Bearer ')) return null;
 
   const token = authHeader.substring(7);
-  const payload = await verifyJWT(token, env);
+  const payload = await verifyJWTCached(token, env);
   if (!payload) return null;
 
-  // 验证用户状态
-  const user = await env.DB.prepare(
-    'SELECT username, locked_until FROM admin_credentials WHERE username = ?'
-  ).bind(payload.username).first();
+  // 只有在token需要刷新时才查询数据库验证用户状态
+  // 这大大减少了数据库查询次数
+  if (payload.shouldRefresh) {
+    const user = await env.DB.prepare(
+      'SELECT username, locked_until FROM admin_credentials WHERE username = ?'
+    ).bind(payload.username).first();
 
-  if (!user || (user.locked_until && Date.now() < user.locked_until)) {
-    return null;
+    if (!user || (user.locked_until && Date.now() < user.locked_until)) {
+      return null;
+    }
   }
 
   return payload;
+}
+
+// 可选认证函数 - 用于前台API，支持游客和管理员两种模式
+async function authenticateRequestOptional(request, env) {
+  try {
+    return await authenticateRequest(request, env);
+  } catch (error) {
+    return null; // 未登录或认证失败返回null
+  }
 }
 
 // ==================== CORS处理 ====================
@@ -409,6 +702,515 @@ function getSecureCorsHeaders(origin, env) {
   };
 }
 
+// ==================== API路由模块 ====================
+
+// 认证路由处理器
+async function handleAuthRoutes(path, method, request, env, corsHeaders, clientIP) {
+  // 登录处理
+  if (path === '/api/auth/login' && method === 'POST') {
+    try {
+      if (!checkLoginAttempts(clientIP, env)) {
+        return createErrorResponse(
+          'Too many login attempts',
+          '登录尝试次数过多，请15分钟后再试',
+          429,
+          corsHeaders
+        );
+      }
+
+      const { username, password } = await request.json();
+      if (!username || !password) {
+        recordLoginAttempt(clientIP);
+        return createErrorResponse(
+          'Missing credentials',
+          '用户名和密码不能为空',
+          400,
+          corsHeaders
+        );
+      }
+
+      const user = await env.DB.prepare(
+        'SELECT username, password_hash, locked_until, failed_attempts FROM admin_credentials WHERE username = ?'
+      ).bind(username).first();
+
+      if (!user) {
+        recordLoginAttempt(clientIP);
+        return createErrorResponse(
+          'Invalid credentials',
+          '用户名或密码错误',
+          401,
+          corsHeaders
+        );
+      }
+
+      if (user.locked_until && Date.now() < user.locked_until) {
+        return createErrorResponse(
+          'Account locked',
+          '账户已被锁定，请稍后再试',
+          423,
+          corsHeaders
+        );
+      }
+
+      const isValidPassword = await verifyPassword(password, user.password_hash);
+      if (!isValidPassword) {
+        recordLoginAttempt(clientIP);
+
+        const newFailedAttempts = (user.failed_attempts || 0) + 1;
+        const config = getSecurityConfig(env);
+        let lockedUntil = null;
+
+        if (newFailedAttempts >= config.MAX_LOGIN_ATTEMPTS) {
+          lockedUntil = Date.now() + config.LOGIN_ATTEMPT_WINDOW;
+        }
+
+        await env.DB.prepare(
+          'UPDATE admin_credentials SET failed_attempts = ?, locked_until = ? WHERE username = ?'
+        ).bind(newFailedAttempts, lockedUntil, username).run();
+
+        return createErrorResponse(
+          'Invalid credentials',
+          '用户名或密码错误',
+          401,
+          corsHeaders
+        );
+      }
+
+      // 登录成功，重置失败次数
+      await env.DB.prepare(
+        'UPDATE admin_credentials SET failed_attempts = 0, locked_until = NULL, last_login = ? WHERE username = ?'
+      ).bind(Date.now(), username).run();
+
+      const isUsingDefault = await isUsingDefaultPassword(username, password);
+      const token = await createJWT({ username, usingDefaultPassword: isUsingDefault }, env);
+
+      return createSuccessResponse({
+        token,
+        user: { username, usingDefaultPassword: isUsingDefault }
+      }, corsHeaders);
+
+    } catch (error) {
+      console.error("登录API错误:", error);
+      return handleDbError(error, corsHeaders, '登录');
+    }
+  }
+
+  // 认证状态检查
+  if (path === '/api/auth/status' && method === 'GET') {
+    try {
+      const user = await authenticateRequest(request, env);
+      if (!user) {
+        return createApiResponse({ authenticated: false }, 200, corsHeaders);
+      }
+
+      const dbUser = await env.DB.prepare(
+        'SELECT username FROM admin_credentials WHERE username = ?'
+      ).bind(user.username).first();
+
+      if (!dbUser) {
+        return createApiResponse({ authenticated: false }, 200, corsHeaders);
+      }
+
+      return createApiResponse({
+        authenticated: true,
+        user: {
+          username: user.username,
+          usingDefaultPassword: user.usingDefaultPassword || false
+        }
+      }, 200, corsHeaders);
+
+    } catch (error) {
+      console.error("认证状态检查错误:", error);
+      return createApiResponse({ authenticated: false }, 200, corsHeaders);
+    }
+  }
+
+  // 修改密码
+  if (path === '/api/auth/change-password' && method === 'POST') {
+    try {
+      const user = await authenticateRequest(request, env);
+      if (!user) {
+        return createErrorResponse('Unauthorized', '需要登录', 401, corsHeaders);
+      }
+
+      const { current_password, new_password } = await request.json();
+      if (!current_password || !new_password) {
+        return createErrorResponse(
+          'Missing fields',
+          '当前密码和新密码不能为空',
+          400,
+          corsHeaders
+        );
+      }
+
+      const config = getSecurityConfig(env);
+      if (new_password.length < config.MIN_PASSWORD_LENGTH) {
+        return createErrorResponse(
+          'Password too short',
+          `密码长度至少为${config.MIN_PASSWORD_LENGTH}位`,
+          400,
+          corsHeaders
+        );
+      }
+
+      const dbUser = await env.DB.prepare(
+        'SELECT password_hash FROM admin_credentials WHERE username = ?'
+      ).bind(user.username).first();
+
+      if (!dbUser || !await verifyPassword(current_password, dbUser.password_hash)) {
+        return createErrorResponse(
+          'Invalid current password',
+          '当前密码错误',
+          400,
+          corsHeaders
+        );
+      }
+
+      const newPasswordHash = await hashPassword(new_password);
+      await env.DB.prepare(
+        'UPDATE admin_credentials SET password_hash = ?, password_changed_at = ?, must_change_password = 0 WHERE username = ?'
+      ).bind(newPasswordHash, Date.now(), user.username).run();
+
+      return createSuccessResponse({ message: '密码修改成功' }, corsHeaders);
+
+    } catch (error) {
+      console.error("修改密码错误:", error);
+      return handleDbError(error, corsHeaders, '修改密码');
+    }
+  }
+
+  return null; // 不匹配此模块的路由
+}
+
+// 服务器管理路由处理器
+async function handleServerRoutes(path, method, request, env, corsHeaders) {
+  // 获取服务器列表（公开，支持管理员和游客模式）
+  if (path === '/api/servers' && method === 'GET') {
+    try {
+      const user = await authenticateRequestOptional(request, env);
+      const isAdmin = user !== null;
+
+      let query = 'SELECT id, name, description FROM servers';
+      if (!isAdmin) {
+        query += ' WHERE is_public = 1';
+      }
+      query += ' ORDER BY sort_order ASC NULLS LAST, name ASC';
+
+      const { results } = await env.DB.prepare(query).all();
+      return createApiResponse({ servers: results || [] }, 200, corsHeaders);
+
+    } catch (error) {
+      console.error("获取服务器列表错误:", error);
+      return handleDbError(error, corsHeaders, '获取服务器列表');
+    }
+  }
+
+  // 管理员获取服务器列表（包含详细信息）
+  if (path === '/api/admin/servers' && method === 'GET') {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const { results } = await env.DB.prepare(`
+        SELECT s.id, s.name, s.description, s.created_at, s.sort_order,
+               s.last_notified_down_at, s.api_key, s.is_public, m.timestamp as last_report
+        FROM servers s
+        LEFT JOIN metrics m ON s.id = m.server_id
+        ORDER BY s.sort_order ASC NULLS LAST, s.name ASC
+      `).all();
+
+      return createApiResponse({ servers: results || [] }, 200, corsHeaders);
+
+    } catch (error) {
+      console.error("获取管理员服务器列表错误:", error);
+      return handleDbError(error, corsHeaders, '获取管理员服务器列表');
+    }
+  }
+
+  // 添加服务器（管理员）
+  if (path === '/api/admin/servers' && method === 'POST') {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const { name, description } = await request.json();
+      if (!validateInput(name, 'serverName')) {
+        return createErrorResponse(
+          'Invalid server name',
+          '服务器名称格式无效',
+          400,
+          corsHeaders
+        );
+      }
+
+      const serverId = Math.random().toString(36).substring(2, 8);
+      const apiKey = crypto.randomUUID();
+      const now = Math.floor(Date.now() / 1000);
+
+      await env.DB.prepare(`
+        INSERT INTO servers (id, name, description, api_key, created_at, sort_order, is_public)
+        VALUES (?, ?, ?, ?, ?, 0, 1)
+      `).bind(serverId, name, description || '', apiKey, now).run();
+
+      return createSuccessResponse({
+        server: {
+          id: serverId,
+          name,
+          description: description || '',
+          api_key: apiKey,
+          created_at: now
+        }
+      }, corsHeaders);
+
+    } catch (error) {
+      console.error("添加服务器错误:", error);
+      return handleDbError(error, corsHeaders, '添加服务器');
+    }
+  }
+
+  // 更新服务器（管理员）
+  if (path.match(/\/api\/admin\/servers\/[^\/]+$/) && method === 'PUT') {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const serverId = extractAndValidateServerId(path);
+      if (!serverId) {
+        return createErrorResponse(
+          'Invalid server ID',
+          '无效的服务器ID格式',
+          400,
+          corsHeaders
+        );
+      }
+
+      const { name, description } = await request.json();
+      if (!validateInput(name, 'serverName')) {
+        return createErrorResponse(
+          'Invalid server name',
+          '服务器名称格式无效',
+          400,
+          corsHeaders
+        );
+      }
+
+      const info = await env.DB.prepare(`
+        UPDATE servers SET name = ?, description = ? WHERE id = ?
+      `).bind(name, description || '', serverId).run();
+
+      if (info.changes === 0) {
+        return createErrorResponse('Server not found', '服务器不存在', 404, corsHeaders);
+      }
+
+      return createSuccessResponse({
+        id: serverId,
+        name,
+        description: description || '',
+        message: '服务器更新成功'
+      }, corsHeaders);
+
+    } catch (error) {
+      console.error("更新服务器错误:", error);
+      return handleDbError(error, corsHeaders, '更新服务器');
+    }
+  }
+
+  // 删除服务器（管理员）
+  if (path.match(/\/api\/admin\/servers\/[^\/]+$/) && method === 'DELETE') {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const serverId = extractAndValidateServerId(path);
+      if (!serverId) {
+        return createErrorResponse(
+          'Invalid server ID',
+          '无效的服务器ID格式',
+          400,
+          corsHeaders
+        );
+      }
+
+      const info = await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(serverId).run();
+      if (info.changes === 0) {
+        return createErrorResponse('Server not found', '服务器不存在', 404, corsHeaders);
+      }
+
+      // 同时删除相关的监控数据
+      await env.DB.prepare('DELETE FROM metrics WHERE server_id = ?').bind(serverId).run();
+
+      return createSuccessResponse({ message: '服务器已删除' }, corsHeaders);
+
+    } catch (error) {
+      console.error("删除服务器错误:", error);
+      return handleDbError(error, corsHeaders, '删除服务器');
+    }
+  }
+
+  return null; // 不匹配此模块的路由
+}
+
+// VPS监控路由处理器
+async function handleVpsRoutes(path, method, request, env, corsHeaders) {
+  // VPS配置获取（使用API密钥认证）
+  if (path.startsWith('/api/config/') && method === 'GET') {
+    try {
+      const authResult = await validateServerAuth(path, request, env);
+      if (!authResult.success) {
+        return createErrorResponse(authResult.error, authResult.message,
+          authResult.error === 'Invalid server ID' ? 400 : 401, corsHeaders);
+      }
+
+      const { serverId, serverData } = authResult;
+      const reportInterval = await getVpsReportInterval(env);
+
+      const configData = {
+        success: true,
+        config: {
+          report_interval: reportInterval,
+          enabled_metrics: ['cpu', 'memory', 'disk', 'network', 'uptime'],
+          server_info: {
+            id: serverData.id,
+            name: serverData.name,
+            description: serverData.description || ''
+          }
+        },
+        timestamp: Math.floor(Date.now() / 1000)
+      };
+
+      return createApiResponse(configData, 200, corsHeaders);
+
+    } catch (error) {
+      console.error("配置获取API错误:", error);
+      return handleDbError(error, corsHeaders, '配置获取');
+    }
+  }
+
+  // VPS数据上报
+  if (path.startsWith('/api/report/') && method === 'POST') {
+    try {
+      const authResult = await validateServerAuth(path, request, env);
+      if (!authResult.success) {
+        return createErrorResponse(authResult.error, authResult.message,
+          authResult.error === 'Invalid server ID' ? 400 : 401, corsHeaders);
+      }
+
+      const { serverId } = authResult;
+
+      // 解析和验证上报数据
+      let reportData;
+      try {
+        const rawBody = await request.text();
+        console.log('收到的原始数据:', rawBody.substring(0, 200) + '...');
+        reportData = JSON.parse(rawBody);
+      } catch (parseError) {
+        console.error('JSON解析错误:', parseError.message);
+        return createErrorResponse(
+          'Invalid JSON format',
+          `JSON解析失败: ${parseError.message}`,
+          400,
+          corsHeaders,
+          '请检查上报的JSON格式是否正确'
+        );
+      }
+
+      const validationResult = validateAndFixVpsData(reportData);
+      if (!validationResult.success) {
+        console.error(`VPS数据验证失败:`, validationResult);
+        return createErrorResponse(
+          validationResult.error,
+          validationResult.message,
+          400,
+          corsHeaders,
+          validationResult.details
+        );
+      }
+
+      reportData = validationResult.data;
+
+      // 保存监控数据
+      await env.DB.prepare(`
+        REPLACE INTO metrics (server_id, timestamp, cpu, memory, disk, network, uptime)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        serverId,
+        reportData.timestamp,
+        JSON.stringify(reportData.cpu),
+        JSON.stringify(reportData.memory),
+        JSON.stringify(reportData.disk),
+        JSON.stringify(reportData.network),
+        reportData.uptime
+      ).run();
+
+      const currentInterval = await getVpsReportInterval(env);
+      return createSuccessResponse({ interval: currentInterval }, corsHeaders);
+
+    } catch (error) {
+      console.error("数据上报API错误:", error);
+      return handleDbError(error, corsHeaders, '数据上报');
+    }
+  }
+
+  // VPS状态查询（公开，无需认证）
+  if (path.startsWith('/api/status/') && method === 'GET') {
+    try {
+      const serverId = path.split('/')[3]; // 从 /api/status/{serverId} 提取ID
+      if (!serverId) {
+        return createErrorResponse('Invalid server ID', '无效的服务器ID', 400, corsHeaders);
+      }
+
+      // 查询服务器信息（移除权限限制，让前台能正常显示）
+      const serverData = await env.DB.prepare(
+        'SELECT id, name, description FROM servers WHERE id = ?'
+      ).bind(serverId).first();
+
+      if (!serverData) {
+        return createErrorResponse('Server not found', '服务器不存在', 404, corsHeaders);
+      }
+
+      // 查询最新的VPS监控数据
+      const metricsData = await env.DB.prepare(`
+        SELECT * FROM metrics
+        WHERE server_id = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+      `).bind(serverId).first();
+
+      // 解析JSON字符串为对象
+      if (metricsData) {
+        try {
+          if (metricsData.cpu) metricsData.cpu = JSON.parse(metricsData.cpu);
+          if (metricsData.memory) metricsData.memory = JSON.parse(metricsData.memory);
+          if (metricsData.disk) metricsData.disk = JSON.parse(metricsData.disk);
+          if (metricsData.network) metricsData.network = JSON.parse(metricsData.network);
+        } catch (parseError) {
+          console.error("监控数据JSON解析错误:", parseError);
+        }
+      }
+
+      return createApiResponse({
+        server: serverData,
+        metrics: metricsData || null,
+        error: false
+      }, 200, corsHeaders);
+
+    } catch (error) {
+      console.error("VPS状态查询错误:", error);
+      return handleDbError(error, corsHeaders, 'VPS状态查询');
+    }
+  }
+
+  return null; // 不匹配此模块的路由
+}
+
 // ==================== API请求处理 ====================
 
 async function handleApiRequest(request, env, ctx) {
@@ -426,13 +1228,32 @@ async function handleApiRequest(request, env, ctx) {
 
   // 速率限制检查（登录接口除外）
   if (path !== '/api/auth/login' && !checkRateLimit(clientIP, path, env)) {
-    return new Response(JSON.stringify({
-      error: 'Rate limit exceeded',
-      message: '请求过于频繁，请稍后再试'
-    }), {
-      status: 429,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
+    return createErrorResponse(
+      'Rate limit exceeded',
+      '请求过于频繁，请稍后再试',
+      429,
+      corsHeaders
+    );
+  }
+
+  // ==================== 路由分发 ====================
+
+  // 认证相关路由
+  if (path.startsWith('/api/auth/')) {
+    const authResult = await handleAuthRoutes(path, method, request, env, corsHeaders, clientIP);
+    if (authResult) return authResult;
+  }
+
+  // 服务器管理路由
+  if (path.startsWith('/api/servers') || path.startsWith('/api/admin/servers')) {
+    const serverResult = await handleServerRoutes(path, method, request, env, corsHeaders);
+    if (serverResult) return serverResult;
+  }
+
+  // VPS监控路由
+  if (path.startsWith('/api/config/') || path.startsWith('/api/report/') || path.startsWith('/api/status/')) {
+    const vpsResult = await handleVpsRoutes(path, method, request, env, corsHeaders);
+    if (vpsResult) return vpsResult;
   }
 
   // 数据库初始化API（无需认证）
@@ -440,1114 +1261,42 @@ async function handleApiRequest(request, env, ctx) {
     try {
       console.log("手动触发数据库初始化...");
       await ensureTablesExist(env.DB, env);
-      return new Response(JSON.stringify({
-        success: true,
+      return createSuccessResponse({
         message: '数据库初始化完成'
-      }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
+      }, corsHeaders);
     } catch (error) {
       console.error("数据库初始化失败:", error);
-      return new Response(JSON.stringify({
-        error: 'Database initialization failed',
-        message: `数据库初始化失败: ${error.message}`
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
+      return createErrorResponse(
+        'Database initialization failed',
+        `数据库初始化失败: ${error.message}`,
+        500,
+        corsHeaders
+      );
     }
   }
 
-  // ==================== 认证API ====================
-
-  // 登录处理
-  if (path === '/api/auth/login' && method === 'POST') {
-    try {
-      if (!checkLoginAttempts(clientIP, env)) {
-        return new Response(JSON.stringify({
-          error: 'Too many login attempts',
-          message: '登录尝试次数过多，请15分钟后再试'
-        }), {
-          status: 429,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      const { username, password } = await request.json();
-      if (!username || !password) {
-        recordLoginAttempt(clientIP);
-        return new Response(JSON.stringify({
-          error: 'Missing credentials',
-          message: '用户名和密码不能为空'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 获取用户凭证
-      const user = await env.DB.prepare(`
-        SELECT username, password_hash, failed_attempts, locked_until, must_change_password
-        FROM admin_credentials WHERE username = ?
-      `).bind(username).first();
-
-      if (!user) {
-        recordLoginAttempt(clientIP);
-        return new Response(JSON.stringify({
-          error: 'Invalid credentials',
-          message: '用户名或密码错误。如果是首次部署，请等待1-2分钟让数据库初始化完成。'
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 检查账户锁定状态
-      if (user.locked_until && Date.now() < user.locked_until) {
-        const unlockTime = new Date(user.locked_until).toLocaleString('zh-CN');
-        return new Response(JSON.stringify({
-          error: 'Account locked',
-          message: `账户已被锁定，解锁时间：${unlockTime}`
-        }), {
-          status: 423,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 密码验证
-      const isValidPassword = await verifyPassword(password, user.password_hash);
-      if (!isValidPassword) {
-        recordLoginAttempt(clientIP);
-
-        const newFailedAttempts = (user.failed_attempts || 0) + 1;
-        const config = getSecurityConfig(env);
-        const lockedUntil = newFailedAttempts >= config.MAX_LOGIN_ATTEMPTS
-          ? Date.now() + config.LOGIN_ATTEMPT_WINDOW
-          : null;
-
-        await env.DB.prepare(`
-          UPDATE admin_credentials SET failed_attempts = ?, locked_until = ? WHERE username = ?
-        `).bind(newFailedAttempts, lockedUntil, username).run();
-
-        return new Response(JSON.stringify({
-          error: 'Invalid credentials',
-          message: '用户名或密码错误'
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 登录成功处理
-      const now = Math.floor(Date.now() / 1000);
-      await env.DB.prepare(`
-        UPDATE admin_credentials SET failed_attempts = 0, locked_until = NULL, last_login = ? WHERE username = ?
-      `).bind(now, username).run();
-
-      // 检查默认密码使用情况
-      const usingDefaultPassword = await isUsingDefaultPassword(username, password);
-      console.log('登录检查 - 使用默认密码:', usingDefaultPassword);
-
-      // 生成JWT令牌
-      const tokenPayload = { username };
-      if (usingDefaultPassword) {
-        tokenPayload.usingDefaultPassword = true;
-      }
-
-      const token = await createJWT(tokenPayload, env);
-      const config = getSecurityConfig(env);
-      const responseData = {
-        token,
-        user: { username },
-        expires_in: config.TOKEN_EXPIRY / 1000
-      };
-
-      if (usingDefaultPassword) {
-        responseData.usingDefaultPassword = true;
-        responseData.message = '您正在使用默认密码，建议修改密码以确保安全';
-      }
-
-      return new Response(JSON.stringify(responseData), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-
-    } catch (error) {
-      console.error("Login error:", error);
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: '服务器内部错误'
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
-  
-  // 密码修改
-  if (path === '/api/auth/change-password' && method === 'POST') {
-    const user = await authenticateRequest(request, env);
-    if (!user) {
-      return new Response(JSON.stringify({
-        error: 'Unauthorized',
-        message: '需要登录'
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-
-    try {
-      const { current_password, new_password } = await request.json();
-      if (!current_password || !new_password) {
-        return new Response(JSON.stringify({
-          error: 'Missing required fields',
-          message: '当前密码和新密码都是必需的'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 密码强度验证
-      const config = getSecurityConfig(env);
-      if (new_password.length < config.MIN_PASSWORD_LENGTH) {
-        return new Response(JSON.stringify({
-          error: 'Password too weak',
-          message: `新密码长度不能少于${config.MIN_PASSWORD_LENGTH}个字符`
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 获取当前用户信息
-      const currentUser = await env.DB.prepare(`
-        SELECT username, password_hash FROM admin_credentials WHERE username = ?
-      `).bind(user.username).first();
-
-      if (!currentUser) {
-        return new Response(JSON.stringify({
-          error: 'User not found',
-          message: '用户不存在'
-        }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 验证当前密码
-      const isCurrentPasswordValid = await verifyPassword(current_password, currentUser.password_hash);
-      if (!isCurrentPasswordValid) {
-        return new Response(JSON.stringify({
-          error: 'Invalid current password',
-          message: '当前密码错误'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 更新密码
-      const newPasswordHash = await hashPassword(new_password);
-      const now = Math.floor(Date.now() / 1000);
-      await env.DB.prepare(`
-        UPDATE admin_credentials SET password_hash = ?, password_changed_at = ? WHERE username = ?
-      `).bind(newPasswordHash, now, user.username).run();
-
-      return new Response(JSON.stringify({
-        success: true,
-        message: '密码修改成功'
-      }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-
-    } catch (error) {
-      console.error("Change password error:", error);
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: '服务器内部错误'
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
-
-  // 令牌刷新
-  if (path === '/api/auth/refresh' && method === 'POST') {
-    const user = await authenticateRequest(request, env);
-    if (!user) {
-      return new Response(JSON.stringify({
-        error: 'Unauthorized',
-        message: '需要有效的令牌'
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-
-    try {
-      const newToken = await createJWT({ username: user.username }, env);
-      const config = getSecurityConfig(env);
-      return new Response(JSON.stringify({
-        token: newToken,
-        user: { username: user.username },
-        expires_in: config.TOKEN_EXPIRY / 1000,
-        message: '令牌刷新成功'
-      }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    } catch (error) {
-      console.error("令牌刷新错误:", error);
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: '令牌刷新失败'
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
-
-  // 登录状态检查
-  if (path === '/api/auth/status' && method === 'GET') {
-    const user = await authenticateRequest(request, env);
-    const responseData = {
-      authenticated: !!user,
-      user: user ? {
-        username: user.username,
-        mustChangePassword: user.mustChangePassword || false,
-        shouldRefresh: user.shouldRefresh || false,
-        usingDefaultPassword: user.usingDefaultPassword || false
-      } : null
-    };
-
-    return new Response(JSON.stringify(responseData), {
-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
-    });
-  }
 
 
   
-  // ==================== 服务器API ====================
 
-  // 获取服务器列表（公开）
-  if (path === '/api/servers' && method === 'GET') {
-    try {
-      const { results } = await env.DB.prepare(
-        'SELECT id, name, description FROM servers ORDER BY sort_order ASC NULLS LAST, name ASC'
-      ).all();
 
-      return new Response(JSON.stringify({ servers: results || [] }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    } catch (error) {
-      console.error("获取服务器列表错误:", error);
-      if (error.message.includes('no such table')) {
-        console.warn("服务器表不存在，尝试创建...");
-        try {
-          await env.DB.exec(D1_SCHEMAS.servers);
-          return new Response(JSON.stringify({ servers: [] }), {
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        } catch (createError) {
-          console.error("创建服务器表失败:", createError);
-          return new Response(JSON.stringify({
-            error: 'Database error',
-            message: createError.message
-          }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        }
-      }
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: error.message
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
+
+
+
   
-  // 获取服务器状态（公开）
-  if (path.startsWith('/api/status/') && method === 'GET') {
-    try {
-      const serverId = extractAndValidateServerId(path);
-      if (!serverId) {
-        return new Response(JSON.stringify({
-          error: 'Invalid server ID',
-          message: '无效的服务器ID格式'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
 
-      // 获取服务器信息
-      const serverData = await env.DB.prepare(
-        'SELECT id, name, description FROM servers WHERE id = ?'
-      ).bind(serverId).first();
 
-      if (!serverData) {
-        return new Response(JSON.stringify({ error: 'Server not found' }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
 
-      // 获取监控数据
-      const metricsResult = await env.DB.prepare(
-        'SELECT timestamp, cpu, memory, disk, network, uptime FROM metrics WHERE server_id = ?'
-      ).bind(serverId).first();
 
-      let metricsData = null;
-      if (metricsResult) {
-        try {
-          metricsData = {
-            timestamp: metricsResult.timestamp,
-            cpu: JSON.parse(metricsResult.cpu || '{}'),
-            memory: JSON.parse(metricsResult.memory || '{}'),
-            disk: JSON.parse(metricsResult.disk || '{}'),
-            network: JSON.parse(metricsResult.network || '{}'),
-            uptime: metricsResult.uptime
-          };
-        } catch (parseError) {
-          console.error(`解析服务器 ${serverId} 监控数据错误:`, parseError);
-          metricsData = {
-            timestamp: metricsResult.timestamp,
-            uptime: metricsResult.uptime
-          };
-        }
-      }
 
-      return new Response(JSON.stringify({
-        server: serverData,
-        metrics: metricsData
-      }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    } catch (error) {
-      console.error("获取服务器状态错误:", error);
-      if (error.message.includes('no such table')) {
-        console.warn("服务器或监控表不存在，尝试创建...");
-        try {
-          await env.DB.exec(D1_SCHEMAS.servers + D1_SCHEMAS.metrics);
-          return new Response(JSON.stringify({
-            error: 'Server not found (tables created)'
-          }), {
-            status: 404,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        } catch (createError) {
-          console.error("创建表失败:", createError);
-          return new Response(JSON.stringify({
-            error: 'Database error',
-            message: createError.message
-          }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        }
-      }
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: error.message
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
+
+
+
   
-  // ==================== 管理员API ====================
 
-  // 获取所有服务器（管理员）
-  if (path === '/api/admin/servers' && method === 'GET') {
-    const user = await authenticateRequest(request, env);
-    if (!user) {
-      return new Response(JSON.stringify({
-        error: 'Unauthorized',
-        message: '需要管理员权限'
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
 
-    try {
-      const { results } = await env.DB.prepare(`
-        SELECT s.id, s.name, s.description, s.created_at, s.sort_order,
-               s.last_notified_down_at, s.api_key, m.timestamp as last_report
-        FROM servers s
-        LEFT JOIN metrics m ON s.id = m.server_id
-        ORDER BY s.sort_order ASC NULLS LAST, s.name ASC
-      `).all();
 
-      return new Response(JSON.stringify({ servers: results || [] }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    } catch (error) {
-      console.error("管理员获取服务器列表错误:", error);
-      if (error.message.includes('no such table')) {
-        console.warn("服务器或监控表不存在，尝试创建...");
-        try {
-          await env.DB.exec(D1_SCHEMAS.servers + D1_SCHEMAS.metrics);
-          return new Response(JSON.stringify({ servers: [] }), {
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        } catch (createError) {
-          console.error("创建表失败:", createError);
-          return new Response(JSON.stringify({
-            error: 'Database error',
-            message: createError.message
-          }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        }
-      }
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: '服务器内部错误'
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
-  
-  // 添加新服务器（管理员）
-  if (path === '/api/admin/servers' && method === 'POST') {
-    const user = await authenticateRequest(request, env);
-    if (!user) {
-      return new Response(JSON.stringify({
-        error: 'Unauthorized',
-        message: '需要管理员权限'
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
 
-    try {
-      const { name, description } = await request.json();
-
-      // 输入验证
-      if (!name?.trim()) {
-        return new Response(JSON.stringify({
-          error: 'Server name is required',
-          message: '服务器名称不能为空'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      if (name.trim().length > 100) {
-        return new Response(JSON.stringify({
-          error: 'Server name too long',
-          message: '服务器名称不能超过100个字符'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 生成服务器ID和API密钥
-      const serverId = Math.random().toString(36).substring(2, 10);
-      const apiKey = Math.random().toString(36).substring(2, 15) +
-                     Math.random().toString(36).substring(2, 15);
-      const createdAt = Math.floor(Date.now() / 1000);
-
-      // 获取下一个排序序号
-      const maxOrderResult = await env.DB.prepare(
-        'SELECT MAX(sort_order) as max_order FROM servers'
-      ).first();
-      const nextSortOrder = (maxOrderResult?.max_order && typeof maxOrderResult.max_order === 'number')
-        ? maxOrderResult.max_order + 1
-        : 0;
-
-      // 保存服务器数据
-      await env.DB.prepare(`
-        INSERT INTO servers (id, name, description, api_key, created_at, sort_order)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).bind(serverId, name, description || '', apiKey, createdAt, nextSortOrder).run();
-
-      const serverData = {
-        id: serverId,
-        name,
-        description: description || '',
-        api_key: apiKey,
-        created_at: createdAt,
-        sort_order: nextSortOrder
-      };
-
-      return new Response(JSON.stringify({ server: serverData }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    } catch (error) {
-      console.error("管理员添加服务器错误:", error);
-
-      if (error.message.includes('UNIQUE constraint failed')) {
-        return new Response(JSON.stringify({
-          error: 'Server ID or API Key conflict',
-          message: '服务器ID或API密钥冲突，请重试'
-        }), {
-          status: 409,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      if (error.message.includes('no such table')) {
-        console.warn("服务器表不存在，尝试创建...");
-        try {
-          await env.DB.exec(D1_SCHEMAS.servers);
-          return new Response(JSON.stringify({
-            error: 'Database table created, please retry',
-            message: '数据库表已创建，请重试添加操作'
-          }), {
-            status: 503,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        } catch (createError) {
-          console.error("创建服务器表失败:", createError);
-          return new Response(JSON.stringify({
-            error: 'Database error',
-            message: createError.message
-          }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        }
-      }
-
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: error.message
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
-  
-  // 删除服务器（管理员）
-  if (path.match(/\/api\/admin\/servers\/[^\/]+$/) && method === 'DELETE') {
-    const user = await authenticateRequest(request, env);
-    if (!user) {
-      return new Response(JSON.stringify({
-        error: 'Unauthorized',
-        message: '需要管理员权限'
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-
-    try {
-      const serverId = extractAndValidateServerId(path);
-      if (!serverId) {
-        return new Response(JSON.stringify({
-          error: 'Invalid server ID',
-          message: '无效的服务器ID格式'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 删除服务器（外键约束会自动删除关联的metrics数据）
-      const info = await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(serverId).run();
-
-      if (info.changes === 0) {
-        return new Response(JSON.stringify({
-          error: 'Server not found',
-          message: '服务器不存在'
-        }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        success: true,
-        message: '服务器删除成功'
-      }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    } catch (error) {
-      console.error("管理员删除服务器错误:", error);
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: '服务器内部错误'
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
-  
-  // 更新服务器（管理员）
-  if (path.match(/\/api\/admin\/servers\/[^\/]+$/) && method === 'PUT') {
-    const user = await authenticateRequest(request, env);
-    if (!user) {
-      return new Response(JSON.stringify({
-        error: 'Unauthorized',
-        message: '需要管理员权限'
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-
-    try {
-      const serverId = extractAndValidateServerId(path);
-      if (!serverId) {
-        return new Response(JSON.stringify({
-          error: 'Invalid server ID',
-          message: '无效的服务器ID格式'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      const { name, description } = await request.json();
-
-      // 输入验证
-      if (!name || !validateInput(name, 'serverName')) {
-        return new Response(JSON.stringify({
-          error: 'Invalid server name',
-          message: '服务器名称格式无效（1-100个字符，支持字母、数字、空格、连字符、下划线、中文）'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      if (description && !validateInput(description, 'description')) {
-        return new Response(JSON.stringify({
-          error: 'Invalid description',
-          message: '描述格式无效（最多500个字符）'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 构建动态更新查询
-      const setClauses = [];
-      const bindings = [];
-
-      if (name !== undefined) {
-        setClauses.push("name = ?");
-        bindings.push(name);
-      }
-      if (description !== undefined) {
-        setClauses.push("description = ?");
-        bindings.push(description || '');
-      }
-
-      if (setClauses.length === 0) {
-        return new Response(JSON.stringify({
-          error: 'No fields to update provided'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      bindings.push(serverId);
-      const info = await env.DB.prepare(
-        `UPDATE servers SET ${setClauses.join(', ')} WHERE id = ?`
-      ).bind(...bindings).run();
-
-      if (info.changes === 0) {
-        return new Response(JSON.stringify({
-          error: 'Server not found'
-        }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    } catch (error) {
-      console.error("管理员更新服务器错误:", error);
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: error.message
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
-  
-  // ==================== 配置获取API ====================
-
-  // VPS配置获取（使用API密钥认证）
-  if (path.startsWith('/api/config/') && method === 'GET') {
-    try {
-      const serverId = extractAndValidateServerId(path);
-      if (!serverId) {
-        return new Response(JSON.stringify({
-          error: 'Invalid server ID',
-          message: '无效的服务器ID格式'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      const apiKey = request.headers.get('X-API-Key');
-      if (!apiKey) {
-        return new Response(JSON.stringify({
-          error: 'API key required',
-          message: '需要API密钥'
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 验证服务器和API密钥
-      const serverData = await env.DB.prepare(
-        'SELECT id, name, description, api_key FROM servers WHERE id = ?'
-      ).bind(serverId).first();
-
-      if (!serverData) {
-        return new Response(JSON.stringify({
-          error: 'Server not found',
-          message: '服务器不存在'
-        }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      if (serverData.api_key !== apiKey) {
-        return new Response(JSON.stringify({
-          error: 'Invalid API key',
-          message: 'API密钥无效'
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 获取VPS上报间隔设置
-      let reportInterval = 60; // 默认值
-      try {
-        const intervalResult = await env.DB.prepare(
-          'SELECT value FROM app_config WHERE key = ?'
-        ).bind('vps_report_interval_seconds').first();
-
-        if (intervalResult?.value) {
-          const parsedInterval = parseInt(intervalResult.value, 10);
-          if (!isNaN(parsedInterval) && parsedInterval > 0) {
-            reportInterval = parsedInterval;
-          }
-        }
-      } catch (intervalError) {
-        console.warn("获取VPS上报间隔失败，使用默认值:", intervalError);
-      }
-
-      // 返回配置信息
-      const configData = {
-        success: true,
-        config: {
-          report_interval: reportInterval,
-          enabled_metrics: ['cpu', 'memory', 'disk', 'network', 'uptime'],
-          server_info: {
-            id: serverData.id,
-            name: serverData.name,
-            description: serverData.description || ''
-          }
-        },
-        timestamp: Math.floor(Date.now() / 1000)
-      };
-
-      return new Response(JSON.stringify(configData), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-
-    } catch (error) {
-      console.error("配置获取API错误:", error, {
-        serverId,
-        errorType: error.constructor.name,
-        errorMessage: error.message,
-        stack: error.stack
-      });
-
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: `服务器内部错误: ${error.message}`,
-        details: '请稍后重试，如果问题持续存在请联系管理员'
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
-
-  // ==================== 数据上报API ====================
-
-  // VPS数据上报
-  if (path.startsWith('/api/report/') && method === 'POST') {
-    try {
-      const serverId = extractAndValidateServerId(path);
-      if (!serverId) {
-        return new Response(JSON.stringify({
-          error: 'Invalid server ID',
-          message: '无效的服务器ID格式'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      const apiKey = request.headers.get('X-API-Key');
-      if (!apiKey) {
-        return new Response(JSON.stringify({
-          error: 'API key required'
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 验证服务器和API密钥
-      const serverData = await env.DB.prepare(
-        'SELECT api_key FROM servers WHERE id = ?'
-      ).bind(serverId).first();
-
-      if (!serverData) {
-        return new Response(JSON.stringify({
-          error: 'Server not found'
-        }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      if (serverData.api_key !== apiKey) {
-        return new Response(JSON.stringify({
-          error: 'Invalid API key'
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 解析和验证上报数据
-      let reportData;
-      let rawBody;
-      try {
-        rawBody = await request.text();
-        console.log('收到的原始数据:', rawBody.substring(0, 200) + '...');
-        reportData = JSON.parse(rawBody);
-      } catch (parseError) {
-        console.error('JSON解析错误:', parseError.message);
-        console.error('原始数据:', rawBody || '无法读取原始数据');
-        return new Response(JSON.stringify({
-          error: 'Invalid JSON format',
-          message: `JSON解析失败: ${parseError.message}`,
-          details: '请检查上报的JSON格式是否正确'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-      const requiredFields = ['timestamp', 'cpu', 'memory', 'disk', 'network'];
-
-      for (const field of requiredFields) {
-        if (!reportData[field]) {
-          console.error(`VPS数据验证失败 - 缺少字段: ${field}`, {
-            serverId,
-            receivedFields: Object.keys(reportData),
-            missingField: field
-          });
-          return new Response(JSON.stringify({
-            error: 'Invalid data format',
-            message: `缺少必需字段: ${field}`,
-            details: `上报数据必须包含以下字段: ${requiredFields.join(', ')}, uptime`,
-            received_fields: Object.keys(reportData)
-          }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        }
-      }
-
-      if (typeof reportData.uptime === 'undefined') {
-        console.error(`VPS数据验证失败 - 缺少uptime字段`, {
-          serverId,
-          receivedFields: Object.keys(reportData)
-        });
-        return new Response(JSON.stringify({
-          error: 'Invalid data format',
-          message: '缺少uptime字段',
-          details: 'uptime字段是必需的，用于记录系统运行时间（秒）',
-          received_fields: Object.keys(reportData)
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 增强的JSON对象结构验证
-      const validateJsonObject = (obj, fieldName) => {
-        if (!obj || typeof obj !== 'object') {
-          console.warn(`${fieldName}字段不是有效的对象:`, obj);
-          return false;
-        }
-        return true;
-      };
-
-      // 详细的数据结构验证
-      const validateDataStructure = (data, type) => {
-        if (!validateJsonObject(data, type)) {
-          return false;
-        }
-
-        switch (type) {
-          case 'CPU':
-            return typeof data.usage_percent === 'number' &&
-                   Array.isArray(data.load_avg) &&
-                   data.load_avg.length === 3;
-          case '内存':
-          case '磁盘':
-            return typeof data.total === 'number' &&
-                   typeof data.used === 'number' &&
-                   typeof data.free === 'number' &&
-                   typeof data.usage_percent === 'number';
-          case '网络':
-            return typeof data.upload_speed === 'number' &&
-                   typeof data.download_speed === 'number' &&
-                   typeof data.total_upload === 'number' &&
-                   typeof data.total_download === 'number';
-          default:
-            return true;
-        }
-      };
-
-      // 验证各个JSON字段的结构，如果无效则使用默认值
-      if (!validateDataStructure(reportData.cpu, 'CPU')) {
-        console.warn('CPU数据结构无效，使用默认值:', reportData.cpu);
-        reportData.cpu = { usage_percent: 0, load_avg: [0, 0, 0] };
-      }
-      if (!validateDataStructure(reportData.memory, '内存')) {
-        console.warn('内存数据结构无效，使用默认值:', reportData.memory);
-        reportData.memory = { total: 0, used: 0, free: 0, usage_percent: 0 };
-      }
-      if (!validateDataStructure(reportData.disk, '磁盘')) {
-        console.warn('磁盘数据结构无效，使用默认值:', reportData.disk);
-        reportData.disk = { total: 0, used: 0, free: 0, usage_percent: 0 };
-      }
-      if (!validateDataStructure(reportData.network, '网络')) {
-        console.warn('网络数据结构无效，使用默认值:', reportData.network);
-        reportData.network = { upload_speed: 0, download_speed: 0, total_upload: 0, total_download: 0 };
-      }
-
-      // 验证时间戳
-      if (!Number.isInteger(reportData.timestamp) || reportData.timestamp <= 0) {
-        console.warn('时间戳无效，使用当前时间:', reportData.timestamp);
-        reportData.timestamp = Math.floor(Date.now() / 1000);
-      }
-
-      // 验证uptime
-      if (!Number.isInteger(reportData.uptime) || reportData.uptime < 0) {
-        console.warn('运行时间无效，设置为0:', reportData.uptime);
-        reportData.uptime = 0;
-      }
-
-      // 保存监控数据
-      await env.DB.prepare(`
-        REPLACE INTO metrics (server_id, timestamp, cpu, memory, disk, network, uptime)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        serverId,
-        reportData.timestamp,
-        JSON.stringify(reportData.cpu),
-        JSON.stringify(reportData.memory),
-        JSON.stringify(reportData.disk),
-        JSON.stringify(reportData.network),
-        reportData.uptime
-      ).run();
-
-      // 获取VPS上报间隔设置
-      let currentInterval = 60;
-      try {
-        const intervalResult = await env.DB.prepare(
-          'SELECT value FROM app_config WHERE key = ?'
-        ).bind('vps_report_interval_seconds').first();
-
-        if (intervalResult?.value) {
-          const parsedInterval = parseInt(intervalResult.value, 10);
-          if (!isNaN(parsedInterval) && parsedInterval > 0) {
-            currentInterval = parsedInterval;
-          }
-        }
-      } catch (intervalError) {
-        console.warn("获取VPS上报间隔失败，使用默认值:", intervalError);
-      }
-
-      return new Response(JSON.stringify({
-        success: true,
-        interval: currentInterval
-      }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    } catch (error) {
-      console.error("数据上报API错误:", error, {
-        serverId,
-        errorType: error.constructor.name,
-        errorMessage: error.message,
-        stack: error.stack
-      });
-
-      if (error.message.includes('no such table')) {
-        console.warn("服务器或监控表不存在，尝试创建...");
-        try {
-          await env.DB.exec(D1_SCHEMAS.servers + D1_SCHEMAS.metrics);
-          return new Response(JSON.stringify({
-            error: 'Database table created or server not found, please retry or verify server ID/API Key',
-            message: '数据库表已创建或服务器不存在，请重试或验证服务器ID/API密钥',
-            details: '如果问题持续存在，请检查服务器配置',
-            retry_suggested: true
-          }), {
-            status: 503,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        } catch (createError) {
-          console.error("创建表失败:", createError);
-          return new Response(JSON.stringify({
-            error: 'Database error',
-            message: `数据库错误: ${createError.message}`,
-            details: '无法创建必需的数据库表，请联系管理员'
-          }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        }
-      }
-
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: `服务器内部错误: ${error.message}`,
-        details: '请稍后重试，如果问题持续存在请联系管理员',
-        error_id: Date.now().toString(36) // 简单的错误ID用于追踪
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
   
 
 
@@ -1789,6 +1538,54 @@ async function handleApiRequest(request, env, ctx) {
     }
   }
 
+  // 更新服务器显示状态（管理员）
+  if (path.match(/^\/api\/admin\/servers\/([^\/]+)\/visibility$/) && method === 'POST') {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+      return new Response(JSON.stringify({
+        error: 'Unauthorized',
+        message: '需要管理员权限'
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+
+    try {
+      const serverId = path.split('/')[4];
+      const { is_public } = await request.json();
+
+      // 验证输入
+      if (typeof is_public !== 'boolean') {
+        return new Response(JSON.stringify({
+          error: 'Invalid input',
+          message: '显示状态必须为布尔值'
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 更新服务器显示状态
+      await env.DB.prepare(`
+        UPDATE servers SET is_public = ? WHERE id = ?
+      `).bind(is_public ? 1 : 0, serverId).run();
+
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error("更新服务器显示状态错误:", error);
+      return new Response(JSON.stringify({
+        error: 'Internal server error',
+        message: error.message
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
+
 
 
   // ==================== 网站监控API ====================
@@ -1809,7 +1606,7 @@ async function handleApiRequest(request, env, ctx) {
     try {
       const { results } = await env.DB.prepare(`
         SELECT id, name, url, added_at, last_checked, last_status, last_status_code,
-               last_response_time_ms, sort_order, last_notified_down_at
+               last_response_time_ms, sort_order, last_notified_down_at, is_public
         FROM monitored_sites
         ORDER BY sort_order ASC NULLS LAST, name ASC, url ASC
       `).all();
@@ -2033,6 +1830,49 @@ async function handleApiRequest(request, env, ctx) {
         status: 500,
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
+    }
+  }
+
+  // 更新监控站点（管理员）
+  if (path.match(/\/api\/admin\/sites\/[^\/]+$/) && method === 'PUT') {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const siteId = path.split('/').pop();
+      if (!siteId) {
+        return createErrorResponse('Invalid site ID', '无效的网站ID', 400, corsHeaders);
+      }
+
+      const { url, name } = await request.json();
+      if (!url || !url.trim()) {
+        return createErrorResponse('Invalid URL', 'URL不能为空', 400, corsHeaders);
+      }
+
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        return createErrorResponse('Invalid URL format', 'URL必须以http://或https://开头', 400, corsHeaders);
+      }
+
+      const info = await env.DB.prepare(`
+        UPDATE monitored_sites SET url = ?, name = ? WHERE id = ?
+      `).bind(url.trim(), name?.trim() || '', siteId).run();
+
+      if (info.changes === 0) {
+        return createErrorResponse('Site not found', '网站不存在', 404, corsHeaders);
+      }
+
+      return createSuccessResponse({
+        id: siteId,
+        url: url.trim(),
+        name: name?.trim() || '',
+        message: '网站更新成功'
+      }, corsHeaders);
+
+    } catch (error) {
+      console.error("更新监控站点错误:", error);
+      return handleDbError(error, corsHeaders, '更新监控站点');
     }
   }
 
@@ -2303,19 +2143,97 @@ async function handleApiRequest(request, env, ctx) {
     }
   }
 
+  // 更新网站显示状态（管理员）
+  if (path.match(/^\/api\/admin\/sites\/([^\/]+)\/visibility$/) && method === 'POST') {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+      return new Response(JSON.stringify({
+        error: 'Unauthorized',
+        message: '需要管理员权限'
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+
+    try {
+      const siteId = path.split('/')[4];
+      const { is_public } = await request.json();
+
+      // 验证输入
+      if (typeof is_public !== 'boolean') {
+        return new Response(JSON.stringify({
+          error: 'Invalid input',
+          message: '显示状态必须为布尔值'
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 更新网站显示状态
+      await env.DB.prepare(`
+        UPDATE monitored_sites SET is_public = ? WHERE id = ?
+      `).bind(is_public ? 1 : 0, siteId).run();
+
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error("更新网站显示状态错误:", error);
+      return new Response(JSON.stringify({
+        error: 'Internal server error',
+        message: error.message
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
+
 
   // ==================== 公共API ====================
 
-  // 获取所有监控站点状态（公开，不包含URL）
+  // 获取所有监控站点状态（公开，支持管理员和游客模式）
   if (path === '/api/sites/status' && method === 'GET') {
     try {
-      const { results } = await env.DB.prepare(`
+      // 检查是否为管理员登录状态
+      const user = await authenticateRequestOptional(request, env);
+      const isAdmin = user !== null;
+
+      let query = `
         SELECT id, name, last_checked, last_status, last_status_code, last_response_time_ms
         FROM monitored_sites
-        ORDER BY sort_order ASC NULLS LAST, name ASC, id ASC
-      `).all();
+      `;
+      if (!isAdmin) {
+        query += ` WHERE is_public = 1`;
+      }
+      query += ` ORDER BY sort_order ASC NULLS LAST, name ASC, id ASC`;
 
-      return new Response(JSON.stringify({ sites: results || [] }), {
+      const { results } = await env.DB.prepare(query).all();
+      const sites = results || [];
+
+      // 为每个站点附加24小时历史数据
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const twentyFourHoursAgoSeconds = nowSeconds - (24 * 60 * 60);
+
+      for (const site of sites) {
+        try {
+          const { results: historyResults } = await env.DB.prepare(`
+            SELECT timestamp, status, status_code, response_time_ms
+            FROM site_status_history
+            WHERE site_id = ? AND timestamp >= ?
+            ORDER BY timestamp DESC
+          `).bind(site.id, twentyFourHoursAgoSeconds).all();
+
+          site.history = historyResults || [];
+        } catch (historyError) {
+          console.error(`获取站点 ${site.id} 历史数据错误:`, historyError);
+          site.history = [];
+        }
+      }
+
+      return new Response(JSON.stringify({ sites }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
@@ -2522,6 +2440,10 @@ async function handleApiRequest(request, env, ctx) {
       });
     }
   }
+
+
+
+
 
   // 获取监控站点24小时历史状态（公开）
   if (path.match(/\/api\/sites\/[^\/]+\/history$/) && method === 'GET') {
@@ -3153,6 +3075,13 @@ function getIndexHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VPS监控面板</title>
+    <script>
+        // 立即设置主题，避免闪烁
+        (function() {
+            const theme = localStorage.getItem('vps-monitor-theme') || 'light';
+            document.documentElement.setAttribute('data-bs-theme', theme);
+        })();
+    </script>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
@@ -3486,6 +3415,13 @@ function getLoginHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>登录 - VPS监控面板</title>
+    <script>
+        // 立即设置主题，避免闪烁
+        (function() {
+            const theme = localStorage.getItem('vps-monitor-theme') || 'light';
+            document.documentElement.setAttribute('data-bs-theme', theme);
+        })();
+    </script>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
@@ -3717,6 +3653,13 @@ function getAdminHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>管理后台 - VPS监控面板</title>
+    <script>
+        // 立即设置主题，避免闪烁
+        (function() {
+            const theme = localStorage.getItem('vps-monitor-theme') || 'light';
+            document.documentElement.setAttribute('data-bs-theme', theme);
+        })();
+    </script>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
@@ -3727,51 +3670,77 @@ function getAdminHtml() {
             <a class="navbar-brand" href="/">VPS监控面板</a>
             <div class="d-flex align-items-center flex-wrap">
                 <a class="nav-link text-light me-2" href="/" style="white-space: nowrap;">返回首页</a>
-                <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-1" title="GitHub Repository">
+
+                <!-- PC端直接显示的按钮 -->
+                <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2 desktop-only" title="GitHub Repository">
                     <i class="bi bi-github"></i>
                 </a>
-                <button id="themeToggler" class="btn btn-outline-light btn-sm me-1" title="切换主题">
+
+                <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
                     <i class="bi bi-moon-stars-fill"></i>
                 </button>
-                <button id="changePasswordBtn" class="btn btn-outline-light btn-sm me-1" style="font-size: 0.75rem; padding: 0.25rem 0.5rem;">密码</button>
+
+                <button class="btn btn-outline-light btn-sm me-1 desktop-only" id="changePasswordBtnDesktop" title="修改密码">
+                    <i class="bi bi-key"></i>
+                </button>
+
+                <!-- 移动端下拉菜单 -->
+                <div class="dropdown me-1 mobile-only">
+                    <button class="btn btn-outline-light btn-sm dropdown-toggle" type="button" id="adminMenuDropdown" data-bs-toggle="dropdown" aria-expanded="false" title="更多选项">
+                        <i class="bi bi-three-dots"></i>
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="adminMenuDropdown">
+                        <li><a class="dropdown-item" href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer">
+                            <i class="bi bi-github me-2"></i>GitHub
+                        </a></li>
+                        <li><button class="dropdown-item" id="changePasswordBtn">
+                            <i class="bi bi-key me-2"></i>修改密码
+                        </button></li>
+                    </ul>
+                </div>
+
                 <button id="logoutBtn" class="btn btn-outline-light btn-sm" style="font-size: 0.75rem; padding: 0.25rem 0.5rem;">退出</button>
             </div>
         </div>
     </nav>
 
     <div class="container mt-4">
-        <div class="d-flex align-items-center mb-4"> <!-- Main flex container for the header row -->
-            <h2 class="mb-0 me-3">服务器管理</h2> <!-- Server Management Heading -->
-
-            <!-- VPS Data Update Frequency Form -->
-            <form id="globalSettingsFormPartial" class="row gx-2 gy-2 align-items-center me-auto"> <!-- me-auto pushes Add Server button to the right -->
-                <div class="col-auto">
-                     <label for="vpsReportInterval" class="col-form-label col-form-label-sm">VPS数据更新频率 (秒):</label>
-                </div>
-                <div class="col-auto">
-                    <input type="number" class="form-control form-control-sm" id="vpsReportInterval" placeholder="例如: 60" min="1" style="width: 100px;">
-                </div>
-                <div class="col-auto">
-                    <button type="button" id="saveVpsReportIntervalBtn" class="btn btn-info btn-sm">保存频率</button>
-                </div>
-            </form>
-
-            <!-- Server Auto Sort Dropdown -->
-            <div class="dropdown me-2">
-                <button class="btn btn-outline-secondary dropdown-toggle" type="button" id="serverAutoSortDropdown" data-bs-toggle="dropdown" aria-expanded="false">
-                    <i class="bi bi-sort-alpha-down"></i> 自动排序
-                </button>
-                <ul class="dropdown-menu" aria-labelledby="serverAutoSortDropdown">
-                    <li><a class="dropdown-item active" href="#" onclick="autoSortServers('custom')">自定义排序</a></li>
-                    <li><a class="dropdown-item" href="#" onclick="autoSortServers('name')">按名称排序</a></li>
-                    <li><a class="dropdown-item" href="#" onclick="autoSortServers('status')">按状态排序</a></li>
-                </ul>
+        <div class="admin-header-row mb-4"> <!-- 优化的标题行容器 -->
+            <div class="admin-header-title">
+                <h2 class="mb-0">服务器管理</h2>
             </div>
+            <div class="admin-header-content">
+                <!-- VPS Data Update Frequency Form -->
+                <form id="globalSettingsFormPartial" class="admin-settings-form">
+                    <div class="settings-group">
+                        <label for="vpsReportInterval" class="form-label">VPS数据更新频率 (秒):</label>
+                        <div class="input-group">
+                            <input type="number" class="form-control form-control-sm" id="vpsReportInterval" placeholder="例如: 60" min="1" style="width: 100px;">
+                            <button type="button" id="saveVpsReportIntervalBtn" class="btn btn-info btn-sm">保存频率</button>
+                        </div>
+                    </div>
+                </form>
 
-            <!-- Add Server Button -->
-            <button id="addServerBtn" class="btn btn-primary">
-                <i class="bi bi-plus-circle"></i> 添加服务器
-            </button>
+                <!-- Action Buttons Group -->
+                <div class="admin-actions-group">
+                    <!-- Server Auto Sort Dropdown -->
+                    <div class="dropdown me-2">
+                        <button class="btn btn-outline-secondary dropdown-toggle" type="button" id="serverAutoSortDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                            <i class="bi bi-sort-alpha-down"></i> 自动排序
+                        </button>
+                        <ul class="dropdown-menu" aria-labelledby="serverAutoSortDropdown">
+                            <li><a class="dropdown-item active" href="#" onclick="autoSortServers('custom')">自定义排序</a></li>
+                            <li><a class="dropdown-item" href="#" onclick="autoSortServers('name')">按名称排序</a></li>
+                            <li><a class="dropdown-item" href="#" onclick="autoSortServers('status')">按状态排序</a></li>
+                        </ul>
+                    </div>
+
+                    <!-- Add Server Button -->
+                    <button id="addServerBtn" class="btn btn-primary">
+                        <i class="bi bi-plus-circle"></i> 添加服务器
+                    </button>
+                </div>
+            </div>
         </div>
         <!-- Removed globalSettingsAlert as serverAlert will be used -->
         <div id="serverAlert" class="alert d-none"></div>
@@ -3790,7 +3759,7 @@ function getAdminHtml() {
                                 <th>最后更新</th>
                                 <th>API密钥</th>
                                 <th>VPS脚本</th>
-                                <!-- Removed <th>频繁通知 (10分钟)</th> -->
+                                <th>显示 <i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="是否对游客展示此服务器"></i></th>
                                 <th>操作</th>
                             </tr>
                         </thead>
@@ -3817,25 +3786,30 @@ function getAdminHtml() {
 
     <!-- Website Monitoring Section -->
     <div class="container mt-5">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <h2>网站监控管理</h2>
-            <div class="d-flex align-items-center">
-                <!-- Site Auto Sort Dropdown -->
-                <div class="dropdown me-2">
-                    <button class="btn btn-outline-secondary dropdown-toggle" type="button" id="siteAutoSortDropdown" data-bs-toggle="dropdown" aria-expanded="false">
-                        <i class="bi bi-sort-alpha-down"></i> 自动排序
-                    </button>
-                    <ul class="dropdown-menu" aria-labelledby="siteAutoSortDropdown">
-                        <li><a class="dropdown-item active" href="#" onclick="autoSortSites('custom')">自定义排序</a></li>
-                        <li><a class="dropdown-item" href="#" onclick="autoSortSites('name')">按名称排序</a></li>
-                        <li><a class="dropdown-item" href="#" onclick="autoSortSites('url')">按URL排序</a></li>
-                        <li><a class="dropdown-item" href="#" onclick="autoSortSites('status')">按状态排序</a></li>
-                    </ul>
-                </div>
+        <div class="admin-header-row mb-4"> <!-- 优化的标题行容器 -->
+            <div class="admin-header-title">
+                <h2 class="mb-0">网站监控管理</h2>
+            </div>
+            <div class="admin-header-content">
+                <!-- Action Buttons Group -->
+                <div class="admin-actions-group">
+                    <!-- Site Auto Sort Dropdown -->
+                    <div class="dropdown me-2">
+                        <button class="btn btn-outline-secondary dropdown-toggle" type="button" id="siteAutoSortDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                            <i class="bi bi-sort-alpha-down"></i> 自动排序
+                        </button>
+                        <ul class="dropdown-menu" aria-labelledby="siteAutoSortDropdown">
+                            <li><a class="dropdown-item active" href="#" onclick="autoSortSites('custom')">自定义排序</a></li>
+                            <li><a class="dropdown-item" href="#" onclick="autoSortSites('name')">按名称排序</a></li>
+                            <li><a class="dropdown-item" href="#" onclick="autoSortSites('url')">按URL排序</a></li>
+                            <li><a class="dropdown-item" href="#" onclick="autoSortSites('status')">按状态排序</a></li>
+                        </ul>
+                    </div>
 
-                <button id="addSiteBtn" class="btn btn-success">
-                    <i class="bi bi-plus-circle"></i> 添加监控网站
-                </button>
+                    <button id="addSiteBtn" class="btn btn-success">
+                        <i class="bi bi-plus-circle"></i> 添加监控网站
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -3855,13 +3829,13 @@ function getAdminHtml() {
                                 <th>状态码</th>
                                 <th>响应时间 (ms)</th>
                                 <th>最后检查</th>
-                                <!-- Removed <th>频繁通知 (10分钟)</th> -->
+                                <th>显示 <i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="是否对游客展示此网站"></i></th>
                                 <th>操作</th>
                             </tr>
                         </thead>
                         <tbody id="siteTableBody">
                             <tr>
-                                <td colspan="10" class="text-center">加载中...</td>
+                                <td colspan="9" class="text-center">加载中...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -4162,6 +4136,11 @@ body {
         display: block !important;
     }
 
+    /* 移动端隐藏桌面端按钮 */
+    .desktop-only {
+        display: none !important;
+    }
+
     /* 移动端导航栏优化 */
     .navbar-brand {
         font-size: 1rem;
@@ -4190,6 +4169,66 @@ body {
         font-size: 0.8rem;
         padding: 0.25rem 0.5rem;
         margin: 0;
+    }
+
+    /* 移动端导航栏下拉菜单优化 */
+    .navbar .dropdown-menu {
+        font-size: 0.875rem;
+        min-width: 150px;
+    }
+
+    .navbar .dropdown-item {
+        padding: 0.5rem 1rem;
+        font-size: 0.875rem;
+    }
+
+    .navbar .dropdown-item i {
+        width: 1.2rem;
+    }
+
+    /* 移动端管理区域标题行优化 */
+    .admin-header-row {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+    }
+
+    .admin-header-title h2 {
+        font-size: 1.5rem;
+        margin-bottom: 0;
+    }
+
+    .admin-header-content {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+    }
+
+    .admin-settings-form {
+        order: 2; /* 设置表单在移动端显示在按钮组下方 */
+    }
+
+    .admin-actions-group {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        order: 1; /* 按钮组在移动端显示在上方 */
+    }
+
+    .settings-group {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+
+    .settings-group .form-label {
+        font-size: 0.875rem;
+        margin-bottom: 0;
+        font-weight: 500;
+    }
+
+    .settings-group .input-group {
+        max-width: 250px;
     }
 
     /* 超小屏幕优化 (小于400px) */
@@ -4221,10 +4260,61 @@ body {
     }
 }
 
-/* 桌面端隐藏卡片容器 */
+/* 桌面端隐藏卡片容器和移动端菜单 */
 @media (min-width: 769px) {
     .mobile-card-container {
         display: none !important;
+    }
+
+    .mobile-only {
+        display: none !important;
+    }
+}
+
+    /* 桌面端管理区域标题行样式 */
+    .admin-header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        flex-wrap: wrap;
+        gap: 1rem;
+    }
+
+    .admin-header-title {
+        flex: 0 0 auto;
+    }
+
+    .admin-header-content {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        flex: 1 1 auto;
+        justify-content: flex-end;
+    }
+
+    .admin-settings-form {
+        order: 1;
+        margin-right: auto; /* 推送到左侧 */
+    }
+
+    .admin-actions-group {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        order: 2;
+    }
+
+    .settings-group {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .settings-group .form-label {
+        margin-bottom: 0;
+        white-space: nowrap;
+        font-size: 0.875rem;
     }
 }
 
@@ -4257,6 +4347,25 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: center;
+}
+
+.mobile-card-header-left {
+    flex: 0 0 auto;
+}
+
+.mobile-card-header-right {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    font-size: 0.875rem;
+}
+
+.mobile-card-footer {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--bs-border-color, rgba(0,0,0,.125));
+    font-size: 0.875rem;
+    color: var(--bs-secondary);
 }
 
 @media (max-width: 768px) {
@@ -4455,6 +4564,40 @@ body {
         font-size: 1rem;
         line-height: 1.3;
         font-weight: 600;
+    }
+
+    /* 移动端管理页面按钮优化 */
+    .admin-actions-group .btn {
+        font-size: 0.875rem;
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.375rem;
+        transition: all 0.2s ease-in-out;
+    }
+
+    .admin-actions-group .btn:active {
+        transform: scale(0.95);
+    }
+
+    .admin-actions-group .dropdown-toggle {
+        min-width: auto;
+    }
+
+    /* 移动端卡片间距优化 */
+    .mobile-server-card, .mobile-site-card {
+        margin-bottom: 1rem;
+    }
+
+    .mobile-card-body {
+        padding: 0.75rem;
+    }
+
+    .mobile-card-row {
+        padding: 0.375rem 0;
+        border-bottom: 1px solid var(--bs-border-color-translucent, rgba(0,0,0,.08));
+    }
+
+    .mobile-card-row:last-child {
+        border-bottom: none;
     }
 }
 
@@ -4834,6 +4977,93 @@ let serverDataCache = {}; // Cache server data to avoid re-fetching for details
 const DEFAULT_VPS_REFRESH_INTERVAL_MS = 60000; // Default to 60 seconds for VPS data if backend setting fails
 const DEFAULT_SITE_REFRESH_INTERVAL_MS = 60000; // Default to 60 seconds for Site data
 
+// ==================== 统一API请求工具 ====================
+
+// 获取认证头
+function getAuthHeaders() {
+    const token = localStorage.getItem('auth_token');
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) {
+        headers['Authorization'] = 'Bearer ' + token;
+    }
+    return headers;
+}
+
+// 统一API请求函数（用于需要认证的请求）
+async function apiRequest(url, options = {}) {
+    const defaultOptions = {
+        headers: getAuthHeaders(),
+        ...options
+    };
+
+    try {
+        const response = await fetch(url, defaultOptions);
+
+        // 处理认证失败
+        if (response.status === 401) {
+            localStorage.removeItem('auth_token');
+            if (window.location.pathname !== '/login.html') {
+                window.location.href = 'login.html';
+            }
+            throw new Error('认证失败，请重新登录');
+        }
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || \`请求失败 (\${response.status})\`);
+        }
+
+        return await response.json();
+    } catch (error) {
+        console.error(\`API请求错误 [\${url}]:\`, error);
+        throw error;
+    }
+}
+
+// 公开API请求函数（用于不需要认证的请求）
+async function publicApiRequest(url, options = {}) {
+    const defaultOptions = {
+        headers: getAuthHeaders(), // 仍然发送token（如果有），但不强制要求
+        ...options
+    };
+
+    try {
+        const response = await fetch(url, defaultOptions);
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || \`请求失败 (\${response.status})\`);
+        }
+
+        return await response.json();
+    } catch (error) {
+        console.error(\`公开API请求错误 [\${url}]:\`, error);
+        throw error;
+    }
+}
+
+// 显示错误消息
+function showError(message, containerId = null) {
+    console.error('错误:', message);
+    if (containerId) {
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = \`<div class="alert alert-danger">\${message}</div>\`;
+        }
+    }
+}
+
+// 显示成功消息
+function showSuccess(message, containerId = null) {
+    console.log('成功:', message);
+    if (containerId) {
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = \`<div class="alert alert-success">\${message}</div>\`;
+        }
+    }
+}
+
 // Function to fetch VPS refresh interval and start periodic VPS data updates
 async function initializeVpsDataUpdates() {
     console.log('initializeVpsDataUpdates() called');
@@ -4841,21 +5071,14 @@ async function initializeVpsDataUpdates() {
 
     try {
         console.log('Fetching VPS refresh interval from API...');
-        const response = await fetch('/api/admin/settings/vps-report-interval'); // This API is public for GET
-        console.log('API response status:', response.status);
+        const data = await publicApiRequest('/api/admin/settings/vps-report-interval');
+        console.log('API response data:', data);
 
-        if (response.ok) {
-            const data = await response.json();
-            console.log('API response data:', data);
-
-            if (data && typeof data.interval === 'number' && data.interval > 0) {
-                vpsRefreshIntervalMs = data.interval * 1000; // Convert seconds to milliseconds
-                console.log(\`Using backend-defined VPS refresh interval: \${data.interval}s (\${vpsRefreshIntervalMs}ms)\`);
-            } else {
-                console.warn('Invalid VPS interval from backend, using default:', data);
-            }
+        if (data && typeof data.interval === 'number' && data.interval > 0) {
+            vpsRefreshIntervalMs = data.interval * 1000; // Convert seconds to milliseconds
+            console.log(\`Using backend-defined VPS refresh interval: \${data.interval}s (\${vpsRefreshIntervalMs}ms)\`);
         } else {
-            console.warn('Failed to fetch VPS refresh interval from backend, using default. Status:', response.status);
+            console.warn('Invalid VPS interval from backend, using default:', data);
         }
     } catch (error) {
         console.error('Error fetching VPS refresh interval, using default:', error);
@@ -4978,28 +5201,16 @@ async function updateAdminLink() {
             return;
         }
 
-        const response = await fetch('/api/auth/status', {
-            headers: {
-                'Authorization': \`Bearer \${token}\`
-            }
-        });
-
-        if (response.ok) {
-            const data = await response.json();
-            if (data.authenticated) {
-                // Logged in
-                adminLink.textContent = '管理后台';
-                adminLink.href = '/admin.html';
-            } else {
-                // Invalid token or not authenticated
-                adminLink.textContent = '管理员登录';
-                adminLink.href = '/login.html';
-                localStorage.removeItem('auth_token'); // Clean up invalid token
-            }
+        const data = await publicApiRequest('/api/auth/status');
+        if (data.authenticated) {
+            // Logged in
+            adminLink.textContent = '管理后台';
+            adminLink.href = '/admin.html';
         } else {
-            // API error, assume not logged in
+            // Invalid token or not authenticated
             adminLink.textContent = '管理员登录';
             adminLink.href = '/login.html';
+            localStorage.removeItem('auth_token'); // Clean up invalid token
         }
     } catch (error) {
         console.error('Error checking auth status for navbar link:', error);
@@ -5069,9 +5280,9 @@ function populateDetailsRow(serverId, detailsRow) {
          detailsHtml += \`
             <div class="detail-item">
                 <strong>硬盘 (/):</strong>
-                总计: \${metrics.disk.total.toFixed(2)} GB<br>
-                已用: \${metrics.disk.used.toFixed(2)} GB<br>
-                空闲: \${metrics.disk.free.toFixed(2)} GB
+                总计: \${typeof metrics.disk.total === 'number' ? metrics.disk.total.toFixed(2) : '-'} GB<br>
+                已用: \${typeof metrics.disk.used === 'number' ? metrics.disk.used.toFixed(2) : '-'} GB<br>
+                空闲: \${typeof metrics.disk.free === 'number' ? metrics.disk.free.toFixed(2) : '-'} GB
             </div>
         \`;
     }
@@ -5095,12 +5306,16 @@ function populateDetailsRow(serverId, detailsRow) {
 async function loadAllServerStatuses() {
     console.log('loadAllServerStatuses() called at', new Date().toLocaleTimeString());
     try {
-        // 1. Get server list
-        const serversResponse = await fetch('/api/servers');
-        if (!serversResponse.ok) {
-            throw new Error('Failed to get server list');
+        // 1. Get server list (with optional authentication for admin users)
+        let serversData;
+        try {
+            serversData = await publicApiRequest('/api/servers');
+        } catch (error) {
+            // 如果获取服务器列表失败，可能是数据库未初始化，尝试初始化
+            console.log('服务器列表获取失败，尝试初始化数据库...');
+            await publicApiRequest('/api/init-db');
+            serversData = await publicApiRequest('/api/servers');
         }
-        const serversData = await serversResponse.json();
         const servers = serversData.servers || [];
         console.log('Found', servers.length, 'servers');
 
@@ -5121,9 +5336,9 @@ async function loadAllServerStatuses() {
 
         // 2. Fetch status for all servers in parallel
         const statusPromises = servers.map(server =>
-            fetch(\`/api/status/\${server.id}\`)
-                .then(res => res.ok ? res.json() : Promise.resolve({ server: server, metrics: null, error: true }))
-                .catch(() => Promise.resolve({ server: server, metrics: null, error: true }))
+            publicApiRequest(\`/api/status/\${server.id}\`)
+                .then(data => data)
+                .catch(() => ({ server: server, metrics: null, error: true }))
         );
 
         const allStatuses = await Promise.all(statusPromises);
@@ -5132,7 +5347,6 @@ async function loadAllServerStatuses() {
         allStatuses.forEach(data => {
              serverDataCache[data.server.id] = data;
         });
-
 
         // 3. Render the table using DOM manipulation
         renderServerTable(allStatuses);
@@ -5201,50 +5415,7 @@ function formatBytes(bytes) {
     return \`\${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB\`;
 }
 
-function renderHistoryBar(container, history) {
-    if (!history || history.length === 0) {
-        container.innerHTML = '<small class="text-muted">暂无历史记录</small>';
-        return;
-    }
 
-    let historyHtml = '';
-    const now = new Date();
-
-    for (let i = 0; i < 24; i++) {
-        const slotTime = new Date(now);
-        slotTime.setHours(now.getHours() - i);
-
-        const slotStart = new Date(slotTime);
-        slotStart.setMinutes(0, 0, 0);
-
-        const slotEnd = new Date(slotTime);
-        slotEnd.setMinutes(59, 59, 999);
-
-        const slotStartTimestamp = Math.floor(slotStart.getTime() / 1000);
-        const slotEndTimestamp = Math.floor(slotEnd.getTime() / 1000);
-
-        const recordForHour = history.find(
-            r => r.timestamp >= slotStartTimestamp && r.timestamp <= slotEndTimestamp
-        );
-
-        let barClass = 'history-bar-pending';
-        let titleText = \`\${String(slotStart.getHours()).padStart(2, '0')}:00 - \${String((slotStart.getHours() + 1) % 24).padStart(2, '0')}:00: 无记录\`;
-
-        if (recordForHour) {
-            if (recordForHour.status === 'UP') {
-                barClass = 'history-bar-up';
-            } else if (['DOWN', 'TIMEOUT', 'ERROR'].includes(recordForHour.status)) {
-                barClass = 'history-bar-down';
-            }
-            const recordDate = new Date(recordForHour.timestamp * 1000);
-            titleText = \`\${recordDate.toLocaleString()}: \${recordForHour.status} (\${recordForHour.status_code || 'N/A'}), \${recordForHour.response_time_ms || '-'}ms\`;
-        }
-
-        historyHtml += \`<div class="history-bar \${barClass}" title="\${titleText}"></div>\`;
-    }
-
-    container.innerHTML = historyHtml;
-}
 
 // 移动端服务器卡片渲染函数
 function renderMobileServerCards(allStatuses) {
@@ -5310,9 +5481,9 @@ function renderMobileServerCards(allStatuses) {
         cardBody.className = 'mobile-card-body';
 
         // 获取所有数据
-        const cpuValue = metrics && metrics.cpu ? \`\${metrics.cpu.usage_percent.toFixed(1)}%\` : '-';
-        const memoryValue = metrics && metrics.memory ? \`\${metrics.memory.usage_percent.toFixed(1)}%\` : '-';
-        const diskValue = metrics && metrics.disk ? \`\${metrics.disk.usage_percent.toFixed(1)}%\` : '-';
+        const cpuValue = metrics && metrics.cpu && typeof metrics.cpu.usage_percent === 'number' ? \`\${metrics.cpu.usage_percent.toFixed(1)}%\` : '-';
+        const memoryValue = metrics && metrics.memory && typeof metrics.memory.usage_percent === 'number' ? \`\${metrics.memory.usage_percent.toFixed(1)}%\` : '-';
+        const diskValue = metrics && metrics.disk && typeof metrics.disk.usage_percent === 'number' ? \`\${metrics.disk.usage_percent.toFixed(1)}%\` : '-';
         const uptimeValue = metrics && metrics.uptime ? formatUptime(metrics.uptime) : '-';
         const uploadSpeed = metrics && metrics.network ? formatNetworkSpeed(metrics.network.upload_speed) : '-';
         const downloadSpeed = metrics && metrics.network ? formatNetworkSpeed(metrics.network.download_speed) : '-';
@@ -5463,20 +5634,18 @@ function renderMobileSiteCards(sites) {
         \`;
         cardBody.appendChild(lastCheckRow);
 
-        // 24小时历史记录
-        if (site.history && site.history.length > 0) {
-            const historyContainer = document.createElement('div');
-            historyContainer.className = 'mobile-history-container';
-            historyContainer.innerHTML = \`
-                <div class="mobile-history-label">24小时记录</div>
-                <div class="history-bar-container"></div>
-            \`;
-            cardBody.appendChild(historyContainer);
+        // 24小时历史记录 - 始终显示，即使没有数据
+        const historyContainer = document.createElement('div');
+        historyContainer.className = 'mobile-history-container';
+        historyContainer.innerHTML = \`
+            <div class="mobile-history-label">24小时记录</div>
+            <div class="history-bar-container"></div>
+        \`;
+        cardBody.appendChild(historyContainer);
 
-            // 渲染历史记录条
-            const historyBarContainer = historyContainer.querySelector('.history-bar-container');
-            renderHistoryBar(historyBarContainer, site.history);
-        }
+        // 使用统一的历史记录渲染函数
+        const historyBarContainer = historyContainer.querySelector('.history-bar-container');
+        renderSiteHistoryBar(historyBarContainer, site.history || []);
 
         // 组装卡片
         card.appendChild(cardHeader);
@@ -5486,182 +5655,9 @@ function renderMobileSiteCards(sites) {
     });
 }
 
-// 管理页面移动端服务器卡片渲染函数
-function renderMobileAdminServerCards(servers) {
-    const mobileContainer = document.getElementById('mobileAdminServerContainer');
-    if (!mobileContainer) return;
 
-    mobileContainer.innerHTML = '';
 
-    if (!servers || servers.length === 0) {
-        mobileContainer.innerHTML = '<div class="text-center p-3 text-muted">暂无服务器数据</div>';
-        return;
-    }
 
-    servers.forEach(server => {
-        const card = document.createElement('div');
-        card.className = 'mobile-server-card';
-        card.setAttribute('data-server-id', server.id);
-
-        // 卡片头部
-        const cardHeader = document.createElement('div');
-        cardHeader.className = 'mobile-card-header';
-        cardHeader.innerHTML = \`
-            <h6 class="mobile-card-title">\${server.name || '未命名服务器'}</h6>
-            <span class="badge bg-primary">ID: \${server.id}</span>
-        \`;
-
-        // 卡片主体
-        const cardBody = document.createElement('div');
-        cardBody.className = 'mobile-card-body';
-
-        // 基本信息 - 两列布局
-        const lastUpdate = server.last_update ? new Date(server.last_update * 1000).toLocaleString() : '从未';
-
-        // 描述 - 单行
-        if (server.description) {
-            const descRow = document.createElement('div');
-            descRow.className = 'mobile-card-row';
-            descRow.innerHTML = \`
-                <span class="mobile-card-label">描述</span>
-                <span class="mobile-card-value">\${server.description}</span>
-            \`;
-            cardBody.appendChild(descRow);
-        }
-
-        // 最后更新 - 单行
-        const lastUpdateRow = document.createElement('div');
-        lastUpdateRow.className = 'mobile-card-row';
-        lastUpdateRow.innerHTML = \`
-            <span class="mobile-card-label">最后更新</span>
-            <span class="mobile-card-value">\${lastUpdate}</span>
-        \`;
-        cardBody.appendChild(lastUpdateRow);
-
-        // API密钥 - 单行（部分显示）
-        const apiKeyDisplay = server.api_key ? \`\${server.api_key.substring(0, 8)}...\` : '-';
-        const apiKeyRow = document.createElement('div');
-        apiKeyRow.className = 'mobile-card-row';
-        apiKeyRow.innerHTML = \`
-            <span class="mobile-card-label">API密钥</span>
-            <span class="mobile-card-value">\${apiKeyDisplay}</span>
-        \`;
-        cardBody.appendChild(apiKeyRow);
-
-        // 操作按钮
-        const actionsRow = document.createElement('div');
-        actionsRow.className = 'mobile-card-row';
-        actionsRow.innerHTML = \`
-            <div class="d-flex gap-2 w-100">
-                <button class="btn btn-outline-primary btn-sm flex-fill" onclick="editServer('\${server.id}')">
-                    <i class="bi bi-pencil"></i> 编辑
-                </button>
-                <button class="btn btn-outline-info btn-sm flex-fill" onclick="copyInstallScript('\${server.id}', this)">
-                    <i class="bi bi-clipboard"></i> 脚本
-                </button>
-                <button class="btn btn-outline-danger btn-sm" onclick="deleteServer('\${server.id}')">
-                    <i class="bi bi-trash"></i>
-                </button>
-            </div>
-        \`;
-        cardBody.appendChild(actionsRow);
-
-        // 组装卡片
-        card.appendChild(cardHeader);
-        card.appendChild(cardBody);
-
-        mobileContainer.appendChild(card);
-    });
-}
-
-// 管理页面移动端网站卡片渲染函数
-function renderMobileAdminSiteCards(sites) {
-    const mobileContainer = document.getElementById('mobileAdminSiteContainer');
-    if (!mobileContainer) return;
-
-    mobileContainer.innerHTML = '';
-
-    if (!sites || sites.length === 0) {
-        mobileContainer.innerHTML = '<div class="text-center p-3 text-muted">暂无监控网站数据</div>';
-        return;
-    }
-
-    sites.forEach(site => {
-        const card = document.createElement('div');
-        card.className = 'mobile-site-card';
-
-        const statusInfo = getSiteStatusBadge(site.last_status);
-        const lastCheckTime = site.last_checked ? new Date(site.last_checked * 1000).toLocaleString() : '从未';
-        const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
-
-        // 卡片头部
-        const cardHeader = document.createElement('div');
-        cardHeader.className = 'mobile-card-header';
-        cardHeader.innerHTML = \`
-            <h6 class="mobile-card-title">\${site.name || '未命名网站'}</h6>
-            <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
-        \`;
-
-        // 卡片主体
-        const cardBody = document.createElement('div');
-        cardBody.className = 'mobile-card-body';
-
-        // URL - 单行
-        const urlRow = document.createElement('div');
-        urlRow.className = 'mobile-card-row';
-        urlRow.innerHTML = \`
-            <span class="mobile-card-label">URL</span>
-            <span class="mobile-card-value" style="word-break: break-all;">\${site.url}</span>
-        \`;
-        cardBody.appendChild(urlRow);
-
-        // 状态码 | 响应时间
-        const statusCode = site.last_status_code || '-';
-        const statusResponseRow = document.createElement('div');
-        statusResponseRow.className = 'mobile-card-two-columns';
-        statusResponseRow.innerHTML = \`
-            <div class="mobile-card-column-item">
-                <span class="mobile-card-label">状态码</span>
-                <span class="mobile-card-value">\${statusCode}</span>
-            </div>
-            <div class="mobile-card-column-item">
-                <span class="mobile-card-label">响应时间</span>
-                <span class="mobile-card-value">\${responseTime}</span>
-            </div>
-        \`;
-        cardBody.appendChild(statusResponseRow);
-
-        // 最后检查 - 单行
-        const lastCheckRow = document.createElement('div');
-        lastCheckRow.className = 'mobile-card-row';
-        lastCheckRow.innerHTML = \`
-            <span class="mobile-card-label">最后检查</span>
-            <span class="mobile-card-value">\${lastCheckTime}</span>
-        \`;
-        cardBody.appendChild(lastCheckRow);
-
-        // 操作按钮
-        const actionsRow = document.createElement('div');
-        actionsRow.className = 'mobile-card-row';
-        actionsRow.innerHTML = \`
-            <div class="d-flex gap-2 w-100">
-                <button class="btn btn-outline-primary btn-sm flex-fill" onclick="editSite('\${site.id}')">
-                    <i class="bi bi-pencil"></i> 编辑
-                </button>
-                <button class="btn btn-outline-danger btn-sm" onclick="deleteSite('\${site.id}')">
-                    <i class="bi bi-trash"></i> 删除
-                </button>
-            </div>
-        \`;
-        cardBody.appendChild(actionsRow);
-
-        // 组装卡片
-        card.appendChild(cardHeader);
-        card.appendChild(cardBody);
-
-        mobileContainer.appendChild(card);
-    });
-}
 
 // Render the server table using DOM manipulation
 function renderServerTable(allStatuses) {
@@ -5825,11 +5821,15 @@ function formatUptime(totalSeconds) {
 // Load all website statuses
 async function loadAllSiteStatuses() {
     try {
-        const response = await fetch('/api/sites/status');
-        if (!response.ok) {
-            throw new Error('Failed to get website status list');
+        let data;
+        try {
+            data = await publicApiRequest('/api/sites/status');
+        } catch (error) {
+            // 如果获取网站状态失败，可能是数据库未初始化，尝试初始化
+            console.log('网站状态获取失败，尝试初始化数据库...');
+            await publicApiRequest('/api/init-db');
+            data = await publicApiRequest('/api/sites/status');
         }
-        const data = await response.json();
         const sites = data.sites || [];
 
         const noSitesAlert = document.getElementById('noSites');
@@ -5871,7 +5871,9 @@ async function renderSiteStatusTable(sites) {
         const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
 
         const historyCell = document.createElement('td');
-        historyCell.innerHTML = '<div class="history-bar-container"></div>'; // Placeholder
+        const historyContainer = document.createElement('div');
+        historyContainer.className = 'history-bar-container';
+        historyCell.appendChild(historyContainer);
 
         row.innerHTML = \`
             <td>\${site.name || '-'}</td>
@@ -5883,78 +5885,51 @@ async function renderSiteStatusTable(sites) {
         row.appendChild(historyCell);
         tableBody.appendChild(row);
 
-        // Asynchronously fetch and render history for this site
-        fetchAndRenderSiteHistory(site.id, historyCell.querySelector('.history-bar-container'));
+        // 直接使用站点的历史数据渲染历史条
+        renderSiteHistoryBar(historyContainer, site.history || []);
     }
 
     // 同时渲染移动端卡片
     renderMobileSiteCards(sites);
 }
 
-// Fetch and render 24h history for a site
-async function fetchAndRenderSiteHistory(siteId, containerElement) {
-    try {
-        const response = await fetch(\`/api/sites/\${siteId}/history\`);
-        if (!response.ok) {
-            console.warn(\`Failed to fetch history for site \${siteId}\`);
-            containerElement.innerHTML = '<small class="text-muted">Error fetching</small>';
-            return;
-        }
-        const data = await response.json();
-        const fetchedHistory = data.history || []; // API now returns newest first
+// Render 24h history bar for a site (unified function for PC and mobile)
+function renderSiteHistoryBar(containerElement, history) {
+    let historyHtml = '';
+    const now = new Date();
 
-        let historyHtml = '';
-        const now = new Date();
-        
-        // Iterate over the last 24 hours, i=0 is current hour's slot, i=23 is 23 hours ago's slot
-        for (let i = 0; i < 24; i++) {
-            const slotTime = new Date(now);
-            slotTime.setHours(now.getHours() - i); // Sets the hour for the slot (e.g., if now=4:30, i=0 -> 4:xx, i=1 -> 3:xx)
+    for (let i = 0; i < 24; i++) {
+        const slotTime = new Date(now);
+        slotTime.setHours(now.getHours() - i);
+        const slotStart = new Date(slotTime);
+        slotStart.setMinutes(0, 0, 0);
+        const slotEnd = new Date(slotTime);
+        slotEnd.setMinutes(59, 59, 999);
 
-            const slotStart = new Date(slotTime);
-            slotStart.setMinutes(0, 0, 0); // Start of that hour, e.g., 4:00:00
+        const slotStartTimestamp = Math.floor(slotStart.getTime() / 1000);
+        const slotEndTimestamp = Math.floor(slotEnd.getTime() / 1000);
 
-            const slotEnd = new Date(slotTime);
-            slotEnd.setMinutes(59, 59, 999); // End of that hour, e.g., 4:59:59
+        const recordForHour = history?.find(
+            r => r.timestamp >= slotStartTimestamp && r.timestamp <= slotEndTimestamp
+        );
 
-            const slotStartTimestamp = Math.floor(slotStart.getTime() / 1000);
-            const slotEndTimestamp = Math.floor(slotEnd.getTime() / 1000);
+        let barClass = 'history-bar-pending';
+        let titleText = \`\${String(slotStart.getHours()).padStart(2, '0')}:00 - \${String((slotStart.getHours() + 1) % 24).padStart(2, '0')}:00: 无记录\`;
 
-            // Find the most recent record within this hour slot
-            // fetchedHistory is newest first, so the first match is the most recent in the slot
-            const recordForHour = fetchedHistory.find(
-                r => r.timestamp >= slotStartTimestamp && r.timestamp <= slotEndTimestamp
-            );
-
-            let barClass = 'history-bar-pending';
-            // Display slot time, e.g., "04:00 - 05:00"
-            let titleText = \`\${String(slotStart.getHours()).padStart(2, '0')}:00 - \${String((slotStart.getHours() + 1) % 24).padStart(2, '0')}:00: No record\`;
-
-            if (recordForHour) {
-                if (recordForHour.status === 'UP') {
-                    barClass = 'history-bar-up';
-                } else if (['DOWN', 'TIMEOUT', 'ERROR'].includes(recordForHour.status)) {
-                    barClass = 'history-bar-down';
-                }
-                const recordDate = new Date(recordForHour.timestamp * 1000);
-                // Keep detailed title if record exists
-                titleText = \`\${recordDate.toLocaleString()}: \${recordForHour.status} (\${recordForHour.status_code || 'N/A'}), \${recordForHour.response_time_ms || '-'}ms\`;
+        if (recordForHour) {
+            if (recordForHour.status === 'UP') {
+                barClass = 'history-bar-up';
+            } else if (['DOWN', 'TIMEOUT', 'ERROR'].includes(recordForHour.status)) {
+                barClass = 'history-bar-down';
             }
-            // Append HTML. With flex-direction:row-reverse, first DOM element is rightmost.
-            // i=0 (current hour slot) is added first, so it will be the rightmost.
-            historyHtml += \`<div class="history-bar \${barClass}" title="\${titleText}"></div>\`;
-        }
-        
-        if (!historyHtml) {
-             containerElement.innerHTML = '<small class="text-muted">No records for last 24h</small>';
-        } else {
-             containerElement.innerHTML = historyHtml;
+            const recordDate = new Date(recordForHour.timestamp * 1000);
+            titleText = \`\${recordDate.toLocaleString()}: \${recordForHour.status} (\${recordForHour.status_code || 'N/A'}), \${recordForHour.response_time_ms || '-'}ms\`;
         }
 
-    } catch (error) {
-        console.error(\`Error fetching/rendering history for site \${siteId}:\`, error);
-        containerElement.innerHTML = '<small class="text-muted">Error rendering</small>';
+        historyHtml += \`<div class="history-bar \${barClass}" title="\${titleText}"></div>\`;
     }
+
+    containerElement.innerHTML = historyHtml;
 }
 
 
@@ -5974,6 +5949,30 @@ function getSiteStatusBadge(status) {
 
 function getLoginJs() {
   return `// login.js - 登录页面的JavaScript逻辑
+
+// ==================== 统一API请求工具 ====================
+
+// 统一API请求函数
+async function apiRequest(url, options = {}) {
+    const defaultOptions = {
+        headers: { 'Content-Type': 'application/json' },
+        ...options
+    };
+
+    try {
+        const response = await fetch(url, defaultOptions);
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || \`请求失败 (\${response.status})\`);
+        }
+
+        return await response.json();
+    } catch (error) {
+        console.error(\`API请求错误 [\${url}]:\`, error);
+        throw error;
+    }
+}
 
 // --- Theme Management (copied from main.js) ---
 const THEME_KEY = 'themePreference';
@@ -6062,19 +6061,14 @@ async function checkLoginStatus() {
         if (!token) {
             return;
         }
-        
-        const response = await fetch('/api/auth/status', {
-            headers: {
-                'Authorization': 'Bearer ' + token
-            }
+
+        const data = await apiRequest('/api/auth/status', {
+            headers: { 'Authorization': 'Bearer ' + token }
         });
-        
-        if (response.ok) {
-            const data = await response.json();
-            if (data.authenticated) {
-                // 已登录，重定向到管理后台
-                window.location.href = 'admin.html';
-            }
+
+        if (data.authenticated) {
+            // 已登录，重定向到管理后台
+            window.location.href = 'admin.html';
         }
     } catch (error) {
         console.error('检查登录状态错误:', error);
@@ -6085,39 +6079,38 @@ async function checkLoginStatus() {
 async function login(username, password) {
     try {
         // 显示加载状态
+        const loginForm = document.getElementById('loginForm');
         const submitBtn = loginForm.querySelector('button[type="submit"]');
         const originalBtnText = submitBtn.innerHTML;
         submitBtn.disabled = true;
         submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 登录中...';
-        
+
         // 发送登录请求
-        const response = await fetch('/api/auth/login', {
+        const data = await apiRequest('/api/auth/login', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
             body: JSON.stringify({ username, password })
         });
-        
+
         // 恢复按钮状态
         submitBtn.disabled = false;
         submitBtn.innerHTML = originalBtnText;
-        
-        if (response.ok) {
-            const data = await response.json();
-            // 保存token到localStorage
-            localStorage.setItem('auth_token', data.token);
 
-            // 直接跳转到管理后台
-            window.location.href = 'admin.html';
-        } else {
-            // 登录失败
-            const data = await response.json();
-            showLoginError(data.message || '用户名或密码错误');
-        }
+        // 保存token到localStorage
+        localStorage.setItem('auth_token', data.token);
+
+        // 直接跳转到管理后台
+        window.location.href = 'admin.html';
+
     } catch (error) {
         console.error('登录错误:', error);
-        showLoginError('登录请求失败，请稍后重试');
+
+        // 恢复按钮状态
+        const loginForm = document.getElementById('loginForm');
+        const submitBtn = loginForm.querySelector('button[type="submit"]');
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '登录';
+
+        showLoginError(error.message || '登录请求失败，请稍后重试');
     }
 }
 
@@ -6139,6 +6132,47 @@ function showLoginError(message) {
 function getAdminJs() {
   return `// admin.js - 管理后台的JavaScript逻辑
 
+// ==================== 统一API请求工具 ====================
+
+// 获取认证头
+function getAuthHeaders() {
+    const token = localStorage.getItem('auth_token');
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) {
+        headers['Authorization'] = 'Bearer ' + token;
+    }
+    return headers;
+}
+
+// 统一API请求函数
+async function apiRequest(url, options = {}) {
+    const defaultOptions = {
+        headers: getAuthHeaders(),
+        ...options
+    };
+
+    try {
+        const response = await fetch(url, defaultOptions);
+
+        // 处理认证失败
+        if (response.status === 401) {
+            localStorage.removeItem('auth_token');
+            window.location.href = 'login.html';
+            throw new Error('认证失败，请重新登录');
+        }
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || \`请求失败 (\${response.status})\`);
+        }
+
+        return await response.json();
+    } catch (error) {
+        console.error(\`API请求错误 [\${url}]:\`, error);
+        throw error;
+    }
+}
+
 // Global variables for VPS data updates
 let vpsUpdateInterval = null;
 const DEFAULT_VPS_REFRESH_INTERVAL_MS = 60000; // Default to 60 seconds for VPS data if backend setting fails
@@ -6150,21 +6184,14 @@ async function initializeVpsDataUpdates() {
 
     try {
         console.log('Fetching VPS refresh interval from API...');
-        const response = await fetch('/api/admin/settings/vps-report-interval'); // This API is public for GET
-        console.log('API response status:', response.status);
+        const data = await apiRequest('/api/admin/settings/vps-report-interval');
+        console.log('API response data:', data);
 
-        if (response.ok) {
-            const data = await response.json();
-            console.log('API response data:', data);
-
-            if (data && typeof data.interval === 'number' && data.interval > 0) {
-                vpsRefreshIntervalMs = data.interval * 1000; // Convert seconds to milliseconds
-                console.log(\`Using backend-defined VPS refresh interval: \${data.interval}s (\${vpsRefreshIntervalMs}ms)\`);
-            } else {
-                console.warn('Invalid VPS interval from backend, using default:', data);
-            }
+        if (data && typeof data.interval === 'number' && data.interval > 0) {
+            vpsRefreshIntervalMs = data.interval * 1000; // Convert seconds to milliseconds
+            console.log(\`Using backend-defined VPS refresh interval: \${data.interval}s (\${vpsRefreshIntervalMs}ms)\`);
         } else {
-            console.warn('Failed to fetch VPS refresh interval from backend, using default. Status:', response.status);
+            console.warn('Invalid VPS interval from backend, using default:', data);
         }
     } catch (error) {
         console.error('Error fetching VPS refresh interval, using default:', error);
@@ -6224,6 +6251,22 @@ function applyTheme(theme) {
 }
 // --- End Theme Management ---
 
+// 工具提示现在使用浏览器原生title属性，无需JavaScript初始化
+
+// 优化的清理函数 - 清理可能卡住的开关
+function cleanupStuckToggles() {
+    const stuckToggles = document.querySelectorAll('[data-updating="true"]');
+    if (stuckToggles.length > 0) {
+        console.log('清理', stuckToggles.length, '个卡住的开关');
+        stuckToggles.forEach(toggle => {
+            toggle.disabled = false;
+            delete toggle.dataset.updating;
+            toggle.style.opacity = '1';
+        });
+    }
+}
+
+// 移除了复杂的waitForToggleReady函数，现在直接在API响应后更新UI状态
 
 // 全局变量
 let currentServerId = null;
@@ -6233,15 +6276,21 @@ let siteList = []; // For monitored sites
 let hasAddedNewServer = false; // 标记是否添加了新服务器
 
 // 页面加载完成后执行
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', async function() {
     // Initialize theme
     initializeTheme();
 
-    // 检查登录状态
-    checkLoginStatus();
+    // 检查登录状态 - 必须先完成认证检查
+    await checkLoginStatus();
 
     // 初始化事件监听
     initEventListeners();
+
+    // 初始化Bootstrap tooltips
+    const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+    tooltipTriggerList.map(function (tooltipTriggerEl) {
+        return new bootstrap.Tooltip(tooltipTriggerEl);
+    });
 
     // 加载服务器列表
     loadServerList();
@@ -6252,11 +6301,14 @@ document.addEventListener('DOMContentLoaded', function() {
     // 加载全局设置 (VPS Report Interval) - will use serverAlert for notifications
     loadGlobalSettings();
 
-    // 初始化VPS数据自动更新
+    // 初始化管理后台的定时刷新机制
     initializeVpsDataUpdates();
 
     // 检查是否使用默认密码
     checkDefaultPasswordUsage();
+
+    // 启动定期状态清理，每30秒检查一次卡住的开关（优化后减少频率）
+    setInterval(cleanupStuckToggles, 30000);
 });
 
 // 检查登录状态
@@ -6270,20 +6322,9 @@ async function checkLoginStatus() {
             return;
         }
 
-        const response = await fetch('/api/auth/status', {
-            headers: {
-                'Authorization': 'Bearer ' + token
-            }
-        });
-
-        if (response.ok) {
-            const data = await response.json();
-            if (!data.authenticated) {
-                // 未登录，重定向到登录页面
-                window.location.href = 'login.html';
-            }
-        } else {
-            // 请求失败，重定向到登录页面
+        const data = await apiRequest('/api/auth/status');
+        if (!data.authenticated) {
+            // 未登录，重定向到登录页面
             window.location.href = 'login.html';
         }
     } catch (error) {
@@ -6306,15 +6347,8 @@ async function checkDefaultPasswordUsage() {
         const token = localStorage.getItem('auth_token');
         console.log('检查token:', token ? '存在' : '不存在');
         if (token) {
-            const statusResponse = await fetch('/api/auth/status', {
-                headers: {
-                    'Authorization': 'Bearer ' + token
-                }
-            });
-
-            console.log('状态检查响应:', statusResponse.status);
-            if (statusResponse.ok) {
-                const statusData = await statusResponse.json();
+            try {
+                const statusData = await apiRequest('/api/auth/status');
                 console.log('状态数据:', statusData);
                 if (statusData.authenticated && statusData.user && statusData.user.usingDefaultPassword) {
                     console.log('检测到使用默认密码，显示提醒');
@@ -6331,6 +6365,8 @@ async function checkDefaultPasswordUsage() {
                 } else {
                     console.log('未检测到使用默认密码');
                 }
+            } catch (error) {
+                console.error('检查默认密码使用情况错误:', error);
             }
         }
     } catch (error) {
@@ -6403,8 +6439,13 @@ function initEventListeners() {
         }
     });
     
-    // 修改密码按钮
+    // 修改密码按钮（移动端）
     document.getElementById('changePasswordBtn').addEventListener('click', function() {
+        showPasswordModal();
+    });
+
+    // 修改密码按钮（PC端）
+    document.getElementById('changePasswordBtnDesktop').addEventListener('click', function() {
         showPasswordModal();
     });
     
@@ -6466,10 +6507,11 @@ function initEventListeners() {
 // 获取认证头
 function getAuthHeaders() {
     const token = localStorage.getItem('auth_token');
-    return {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + token
-    };
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) {
+        headers['Authorization'] = 'Bearer ' + token;
+    }
+    return headers;
 }
 
 // --- Server Management Functions ---
@@ -6477,17 +6519,10 @@ function getAuthHeaders() {
 // 加载服务器列表
 async function loadServerList() {
     try {
-        const response = await fetch('/api/admin/servers', {
-            headers: getAuthHeaders()
-        });
-
-        if (!response.ok) {
-            throw new Error('获取服务器列表失败');
-        }
-
-        const data = await response.json();
+        const data = await apiRequest('/api/admin/servers');
         serverList = data.servers || [];
 
+        // 简化逻辑：直接渲染，智能状态显示会处理更新中的按钮
         renderServerTable(serverList);
     } catch (error) {
         console.error('加载服务器列表错误:', error);
@@ -6498,12 +6533,17 @@ async function loadServerList() {
 // 渲染服务器表格
 function renderServerTable(servers) {
     const tableBody = document.getElementById('serverTableBody');
+
+    // 简化状态管理：不再需要复杂的状态保存机制
+
     tableBody.innerHTML = '';
 
     if (servers.length === 0) {
         const row = document.createElement('tr');
-        row.innerHTML = '<td colspan="9" class="text-center">暂无服务器数据</td>'; // Updated colspan
+        row.innerHTML = '<td colspan="10" class="text-center">暂无服务器数据</td>'; // Updated colspan
         tableBody.appendChild(row);
+        // 同时更新移动端卡片
+        renderMobileAdminServerCards([]);
         return;
     }
 
@@ -6532,6 +6572,12 @@ function renderServerTable(servers) {
             }
         }
 
+        // 智能状态显示：完整保存更新中按钮的所有状态
+        const existingToggle = document.querySelector('.server-visibility-toggle[data-server-id="' + server.id + '"]');
+        const isCurrentlyUpdating = existingToggle && existingToggle.dataset.updating === 'true';
+        const displayState = isCurrentlyUpdating ? existingToggle.checked : server.is_public;
+        const needsUpdatingState = isCurrentlyUpdating;
+
         row.innerHTML =
             '<td>' +
                 '<div class="btn-group">' +
@@ -6559,7 +6605,11 @@ function renderServerTable(servers) {
                     '<i class="bi bi-clipboard-plus"></i> 复制脚本' +
                 '</button>' +
             '</td>' +
-            '<!-- Removed frequent notification toggle column -->' +
+            '<td>' +
+                '<div class="form-check form-switch">' +
+                    '<input class="form-check-input server-visibility-toggle" type="checkbox" data-server-id="' + server.id + '" ' + (displayState ? 'checked' : '') + (needsUpdatingState ? ' data-updating="true"' : '') + '>' +
+                '</div>' +
+            '</td>' +
             '<td>' +
                 '<div class="btn-group">' +
                     '<button class="btn btn-sm btn-outline-primary edit-server-btn" data-id="' + server.id + '">' +
@@ -6616,7 +6666,38 @@ function renderServerTable(servers) {
         });
     });
 
-    // Removed event listener for server-frequent-notify-toggle as it's deleted from HTML
+    // 优化的显示开关事件监听 - 直接处理状态切换
+    document.querySelectorAll('.server-visibility-toggle').forEach(toggle => {
+        toggle.addEventListener('click', function(event) {
+            // 如果开关正在更新中，忽略点击
+            if (this.disabled || this.dataset.updating === 'true') {
+                event.preventDefault();
+                return;
+            }
+
+            const serverId = this.getAttribute('data-server-id');
+            const targetState = this.checked; // 点击后的状态就是目标状态
+            const originalState = !this.checked; // 原始状态是目标状态的相反
+
+            console.log('用户点击开关，服务器:', serverId, '原始状态:', originalState, '目标状态:', targetState);
+
+            // 立即设置为加载状态
+            this.disabled = true;
+            this.style.opacity = '0.6';
+            this.dataset.updating = 'true';
+
+            updateServerVisibility(serverId, targetState, originalState, this);
+        });
+    });
+
+    // 重新应用正在更新按钮的视觉状态（因为重新渲染会创建新元素）
+    document.querySelectorAll('.server-visibility-toggle[data-updating="true"]').forEach(toggle => {
+        toggle.disabled = true;
+        toggle.style.opacity = '0.6';
+    });
+
+    // 同时渲染移动端卡片
+    renderMobileAdminServerCards(servers);
 }
 
 // 初始化服务器拖拽排序
@@ -6726,16 +6807,10 @@ async function performServerDragSort(draggedServerId, targetServerId, insertBefo
         newOrder.splice(insertIndex, 0, draggedServerId); // 插入到新位置
 
         // 发送批量排序请求
-        const response = await fetch('/api/admin/servers/batch-reorder', {
+        await apiRequest('/api/admin/servers/batch-reorder', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({ serverIds: newOrder })
         });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '拖拽排序失败');
-        }
 
         // 重新加载服务器列表
         await loadServerList();
@@ -6795,19 +6870,76 @@ async function copyVpsInstallScript(serverId, serverName, buttonElement) {
     }
 }
 
+// 更新服务器显示状态
+async function updateServerVisibility(serverId, isPublic, originalState, toggleElement) {
+    const startTime = Date.now();
+    console.log('API请求开始：服务器', serverId, '从', originalState, '切换到', isPublic, '时间:', new Date().toISOString());
+
+    try {
+        const data = await apiRequest('/api/admin/servers/' + serverId + '/visibility', {
+            method: 'POST',
+            body: JSON.stringify({ is_public: isPublic })
+        });
+
+        const requestTime = Date.now() - startTime;
+        console.log('API成功：服务器', serverId, '最终状态', isPublic);
+
+        // 更新本地数据
+        const serverIndex = serverList.findIndex(s => s.id === serverId);
+        if (serverIndex !== -1) {
+            serverList[serverIndex].is_public = isPublic;
+        }
+
+        // 成功后设置最终正常状态 - 使用可靠的恢复机制
+        function restoreButtonState(retryCount = 0) {
+            const currentToggle = document.querySelector('.server-visibility-toggle[data-server-id="' + serverId + '"]');
+            if (currentToggle) {
+                console.log('API成功，恢复按钮状态：', serverId, '目标状态:', isPublic, '重试次数:', retryCount);
+                currentToggle.checked = isPublic;
+                currentToggle.style.opacity = '1';
+                currentToggle.disabled = false;
+                delete currentToggle.dataset.updating;
+
+                // 直接显示成功提醒
+                showAlert('success', '服务器显示状态已' + (isPublic ? '开启' : '关闭'), 'serverAlert');
+            } else if (retryCount < 3) {
+                console.log('按钮元素未找到，100ms后重试：', serverId, '重试次数:', retryCount);
+                setTimeout(() => restoreButtonState(retryCount + 1), 100);
+            } else {
+                console.error('API成功但多次重试后仍找不到按钮元素：', serverId);
+            }
+        }
+
+        // 立即尝试恢复，如果失败则重试
+        restoreButtonState();
+
+    } catch (error) {
+        console.error('API失败：服务器', serverId, '错误:', error);
+
+        // 失败时恢复原始状态
+        const currentToggle = document.querySelector('.server-visibility-toggle[data-server-id="' + serverId + '"]');
+        if (currentToggle) {
+            currentToggle.checked = originalState;
+            currentToggle.style.opacity = '1';
+            currentToggle.disabled = false;
+            delete currentToggle.dataset.updating;
+
+            // 直接显示错误提醒，不需要等待状态变化
+            showAlert('danger', '更新显示状态失败: ' + error.message, 'serverAlert');
+        } else {
+            // 如果找不到开关元素，立即显示错误
+            showAlert('danger', '更新显示状态失败: ' + error.message, 'serverAlert');
+        }
+    }
+}
+
 // 移动服务器顺序
 async function moveServer(serverId, direction) {
     try {
-        const response = await fetch('/api/admin/servers/' + serverId + '/reorder', {
+        await apiRequest('/api/admin/servers/' + serverId + '/reorder', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({ direction })
         });
-
-        if (!response.ok) {
-             const errorData = await response.json();
-             throw new Error(errorData.message || '移动服务器失败');
-        }
 
         // 重新加载列表以反映新顺序
         await loadServerList();
@@ -6871,38 +7003,27 @@ async function saveServer() {
     }
     
     try {
-        let response;
         let data;
-        
+
         if (serverId) {
             // 更新服务器
-            response = await fetch('/api/admin/servers/' + serverId, {
+            data = await apiRequest('/api/admin/servers/' + serverId, {
                 method: 'PUT',
-                headers: getAuthHeaders(),
                 body: JSON.stringify({
                     name: serverName,
                     description: serverDescription
-                    // enable_frequent_down_notifications: enableFrequentNotifications // Removed
                 })
             });
         } else {
             // 添加服务器
-            response = await fetch('/api/admin/servers', {
+            data = await apiRequest('/api/admin/servers', {
                 method: 'POST',
-                headers: getAuthHeaders(),
                 body: JSON.stringify({
                     name: serverName,
                     description: serverDescription
-                    // enable_frequent_down_notifications: enableFrequentNotifications // Removed
                 })
             });
         }
-        
-        if (!response.ok) {
-            throw new Error('保存服务器失败');
-        }
-        
-        data = await response.json();
 
         // 如果是新添加的服务器，流畅地切换到密钥显示（不隐藏模态框）
         if (!serverId && data.server && data.server.api_key) {
@@ -7008,19 +7129,14 @@ function showDeleteConfirmation(serverId, serverName) {
 // 删除服务器
 async function deleteServer(serverId) {
     try {
-        const response = await fetch('/api/admin/servers/' + serverId, {
-            method: 'DELETE',
-            headers: getAuthHeaders()
+        await apiRequest('/api/admin/servers/' + serverId, {
+            method: 'DELETE'
         });
-        
-        if (!response.ok) {
-            throw new Error('删除服务器失败');
-        }
-        
+
         // 隐藏模态框
         const deleteModal = bootstrap.Modal.getInstance(document.getElementById('deleteModal'));
         deleteModal.hide();
-        
+
         // 重新加载服务器列表
         loadServerList();
         showAlert('success', '服务器删除成功');
@@ -7033,19 +7149,78 @@ async function deleteServer(serverId) {
 
 // --- Site Monitoring Functions (Continued) ---
 
+// 更新网站显示状态
+async function updateSiteVisibility(siteId, isPublic, originalState, toggleElement) {
+    const startTime = Date.now();
+    console.log('API请求开始：网站', siteId, '从', originalState, '切换到', isPublic, '时间:', new Date().toISOString());
+
+    try {
+        await apiRequest('/api/admin/sites/' + siteId + '/visibility', {
+            method: 'POST',
+            body: JSON.stringify({ is_public: isPublic })
+        });
+
+        const requestTime = Date.now() - startTime;
+        console.log('API请求完成：网站', siteId, '耗时:', requestTime + 'ms');
+
+        console.log('API成功：网站', siteId, '最终状态', isPublic);
+
+        // 更新本地数据
+        const siteIndex = siteList.findIndex(s => s.id === siteId);
+        if (siteIndex !== -1) {
+            siteList[siteIndex].is_public = isPublic;
+        }
+
+        // 成功后设置最终正常状态 - 使用可靠的恢复机制
+        function restoreButtonState(retryCount = 0) {
+            const currentToggle = document.querySelector('.site-visibility-toggle[data-site-id="' + siteId + '"]');
+            if (currentToggle) {
+                console.log('API成功，恢复网站按钮状态：', siteId, '目标状态:', isPublic, '重试次数:', retryCount);
+                currentToggle.checked = isPublic;
+                currentToggle.style.opacity = '1';
+                currentToggle.disabled = false;
+                delete currentToggle.dataset.updating;
+
+                // 直接显示成功提醒
+                showAlert('success', '网站显示状态已' + (isPublic ? '开启' : '关闭'), 'siteAlert');
+            } else if (retryCount < 3) {
+                console.log('网站按钮元素未找到，100ms后重试：', siteId, '重试次数:', retryCount);
+                setTimeout(() => restoreButtonState(retryCount + 1), 100);
+            } else {
+                console.error('API成功但多次重试后仍找不到网站按钮元素：', siteId);
+            }
+        }
+
+        // 立即尝试恢复，如果失败则重试
+        restoreButtonState();
+
+    } catch (error) {
+        console.error('API失败：网站', siteId, '错误:', error);
+
+        // 失败时恢复原始状态
+        const currentToggle = document.querySelector('.site-visibility-toggle[data-site-id="' + siteId + '"]');
+        if (currentToggle) {
+            currentToggle.checked = originalState;
+            currentToggle.style.opacity = '1';
+            currentToggle.disabled = false;
+            delete currentToggle.dataset.updating;
+
+            // 直接显示错误提醒，不需要等待状态变化
+            showAlert('danger', '更新显示状态失败: ' + error.message, 'siteAlert');
+        } else {
+            // 如果找不到开关元素，立即显示错误
+            showAlert('danger', '更新显示状态失败: ' + error.message, 'siteAlert');
+        }
+    }
+}
+
 // 移动网站顺序
 async function moveSite(siteId, direction) {
     try {
-        const response = await fetch('/api/admin/sites/' + siteId + '/reorder', {
+        await apiRequest('/api/admin/sites/' + siteId + '/reorder', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({ direction })
         });
-
-        if (!response.ok) {
-             const errorData = await response.json().catch(() => ({}));
-             throw new Error(errorData.message || '移动网站失败');
-        }
 
         // 重新加载列表以反映新顺序
         await loadSiteList();
@@ -7088,28 +7263,22 @@ async function changePassword() {
     }
     
     try {
-        const response = await fetch('/api/auth/change-password', {
+        await apiRequest('/api/auth/change-password', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({
                 current_password: currentPassword,
                 new_password: newPassword
             })
         });
-        
-        if (response.ok) {
-            // 隐藏模态框
-            const passwordModal = bootstrap.Modal.getInstance(document.getElementById('passwordModal'));
-            passwordModal.hide();
 
-            // 清除默认密码提醒标记，这样如果用户再次使用默认密码登录会重新提醒
-            localStorage.removeItem('hasShownDefaultPasswordWarning');
+        // 隐藏模态框
+        const passwordModal = bootstrap.Modal.getInstance(document.getElementById('passwordModal'));
+        passwordModal.hide();
 
-            showAlert('success', '密码修改成功', 'serverAlert'); // Use main alert
-        } else {
-            const data = await response.json();
-            showPasswordAlert('danger', data.message || '密码修改失败');
-        }
+        // 清除默认密码提醒标记，这样如果用户再次使用默认密码登录会重新提醒
+        localStorage.removeItem('hasShownDefaultPasswordWarning');
+
+        showAlert('success', '密码修改成功', 'serverAlert'); // Use main alert
     } catch (error) {
         console.error('修改密码错误:', error);
         showPasswordAlert('danger', '密码修改请求失败，请稍后重试');
@@ -7135,15 +7304,10 @@ function logout() {
 // 加载监控网站列表
 async function loadSiteList() {
     try {
-        const response = await fetch('/api/admin/sites', {
-            headers: getAuthHeaders()
-        });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '获取监控网站列表失败');
-        }
-        const data = await response.json();
+        const data = await apiRequest('/api/admin/sites');
         siteList = data.sites || [];
+
+        // 简化逻辑：直接渲染，智能状态显示会处理更新中的按钮
         renderSiteTable(siteList);
     } catch (error) {
         console.error('加载监控网站列表错误:', error);
@@ -7154,10 +7318,15 @@ async function loadSiteList() {
 // 渲染监控网站表格
 function renderSiteTable(sites) {
     const tableBody = document.getElementById('siteTableBody');
+
+    // 简化状态管理：不再需要复杂的状态保存机制
+
     tableBody.innerHTML = '';
 
     if (sites.length === 0) {
         tableBody.innerHTML = '<tr><td colspan="9" class="text-center">暂无监控网站</td></tr>'; // Colspan updated
+        // 同时更新移动端卡片
+        renderMobileAdminSiteCards([]);
         return;
     }
 
@@ -7170,6 +7339,12 @@ function renderSiteTable(sites) {
         const statusInfo = getSiteStatusBadge(site.last_status);
         const lastCheckTime = site.last_checked ? new Date(site.last_checked * 1000).toLocaleString() : '从未';
         const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
+
+        // 智能状态显示：完整保存更新中按钮的所有状态
+        const existingToggle = document.querySelector('.site-visibility-toggle[data-site-id="' + site.id + '"]');
+        const isCurrentlyUpdating = existingToggle && existingToggle.dataset.updating === 'true';
+        const displayState = isCurrentlyUpdating ? existingToggle.checked : site.is_public;
+        const needsUpdatingState = isCurrentlyUpdating;
 
         row.innerHTML = \`
              <td>
@@ -7189,7 +7364,11 @@ function renderSiteTable(sites) {
             <td>\${site.last_status_code || '-'}</td>
             <td>\${responseTime}</td>
             <td>\${lastCheckTime}</td>
-            <!-- Removed frequent notification toggle column -->
+            <td>
+                <div class="form-check form-switch">
+                    <input class="form-check-input site-visibility-toggle" type="checkbox" data-site-id="\${site.id}" \${displayState ? 'checked' : ''}\${needsUpdatingState ? ' data-updating="true"' : ''}>
+                </div>
+            </td>
             <td>
                 <div class="btn-group">
                     <button class="btn btn-sm btn-outline-primary edit-site-btn" data-id="\${site.id}" title="编辑">
@@ -7233,7 +7412,38 @@ function renderSiteTable(sites) {
         });
     });
 
-    // Removed event listener for site-frequent-notify-toggle as it's deleted from HTML
+    // 优化的网站显示开关事件监听 - 直接处理状态切换
+    document.querySelectorAll('.site-visibility-toggle').forEach(toggle => {
+        toggle.addEventListener('click', function(event) {
+            // 如果开关正在更新中，忽略点击
+            if (this.disabled || this.dataset.updating === 'true') {
+                event.preventDefault();
+                return;
+            }
+
+            const siteId = this.getAttribute('data-site-id');
+            const targetState = this.checked; // 点击后的状态就是目标状态
+            const originalState = !this.checked; // 原始状态是目标状态的相反
+
+            console.log('用户点击开关，网站:', siteId, '原始状态:', originalState, '目标状态:', targetState);
+
+            // 立即设置为加载状态
+            this.disabled = true;
+            this.style.opacity = '0.6';
+            this.dataset.updating = 'true';
+
+            updateSiteVisibility(siteId, targetState, originalState, this);
+        });
+    });
+
+    // 重新应用正在更新按钮的视觉状态（因为重新渲染会创建新元素）
+    document.querySelectorAll('.site-visibility-toggle[data-updating="true"]').forEach(toggle => {
+        toggle.disabled = true;
+        toggle.style.opacity = '0.6';
+    });
+
+    // 同时渲染移动端卡片
+    renderMobileAdminSiteCards(sites);
 }
 
 // 初始化网站拖拽排序
@@ -7343,16 +7553,10 @@ async function performSiteDragSort(draggedSiteId, targetSiteId, insertBefore) {
         newOrder.splice(insertIndex, 0, draggedSiteId); // 插入到新位置
 
         // 发送批量排序请求
-        const response = await fetch('/api/admin/sites/batch-reorder', {
+        await apiRequest('/api/admin/sites/batch-reorder', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({ siteIds: newOrder })
         });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '拖拽排序失败');
-        }
 
         // 重新加载网站列表
         await loadSiteList();
@@ -7443,18 +7647,10 @@ async function saveSite() {
     }
 
     try {
-        const response = await fetch(apiUrl, {
+        const responseData = await apiRequest(apiUrl, {
             method: method,
-            headers: getAuthHeaders(),
             body: JSON.stringify(requestBody)
         });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || \`\${siteId ? '更新' : '添加'}网站失败 (\${response.status})\`);
-        }
-        
-        const responseData = await response.json();
 
         const siteModalInstance = bootstrap.Modal.getInstance(document.getElementById('siteModal'));
         if (siteModalInstance) {
@@ -7483,15 +7679,9 @@ function showDeleteSiteConfirmation(siteId, siteName, siteUrl) {
 // 删除网站监控
 async function deleteSite(siteId) {
     try {
-        const response = await fetch(\`/api/admin/sites/\${siteId}\`, {
-            method: 'DELETE',
-            headers: getAuthHeaders()
+        await apiRequest(\`/api/admin/sites/\${siteId}\`, {
+            method: 'DELETE'
         });
-
-        if (!response.ok) {
-             const errorData = await response.json().catch(() => ({}));
-             throw new Error(errorData.message || \`删除网站失败 (\${response.status})\`);
-        }
 
         // Hide modal and reload list
         const deleteModal = bootstrap.Modal.getInstance(document.getElementById('deleteSiteModal'));
@@ -7547,14 +7737,7 @@ function showPasswordAlert(type, message) {
 // 加载Telegram通知设置
 async function loadTelegramSettings() {
     try {
-        const response = await fetch('/api/admin/telegram-settings', {
-            headers: getAuthHeaders()
-        });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '获取Telegram设置失败');
-        }
-        const settings = await response.json();
+        const settings = await apiRequest('/api/admin/telegram-settings');
         if (settings) {
             document.getElementById('telegramBotToken').value = settings.bot_token || '';
             document.getElementById('telegramChatId').value = settings.chat_id || '';
@@ -7586,9 +7769,8 @@ async function saveTelegramSettings() {
 
 
     try {
-        const response = await fetch('/api/admin/telegram-settings', {
+        await apiRequest('/api/admin/telegram-settings', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({
                 bot_token: botToken,
                 chat_id: chatId,
@@ -7596,12 +7778,6 @@ async function saveTelegramSettings() {
             })
         });
 
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '保存Telegram设置失败');
-        }
-        
-        await response.json(); // Consume response body
         showAlert('success', 'Telegram设置已成功保存。', 'telegramSettingsAlert');
 
     } catch (error) {
@@ -7613,14 +7789,7 @@ async function saveTelegramSettings() {
 // --- Global Settings Functions (VPS Report Interval) ---
 async function loadGlobalSettings() {
     try {
-        const response = await fetch('/api/admin/settings/vps-report-interval', {
-            headers: getAuthHeaders()
-        });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '获取VPS报告间隔失败');
-        }
-        const settings = await response.json();
+        const settings = await apiRequest('/api/admin/settings/vps-report-interval');
         if (settings && typeof settings.interval === 'number') {
             document.getElementById('vpsReportInterval').value = settings.interval;
         } else {
@@ -7644,18 +7813,11 @@ async function saveVpsReportInterval() {
     // Removed warning for interval < 10
 
     try {
-        const response = await fetch('/api/admin/settings/vps-report-interval', {
+        await apiRequest('/api/admin/settings/vps-report-interval', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({ interval: interval })
         });
 
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '保存VPS报告间隔失败');
-        }
-        
-        await response.json(); // Consume response body
         showAlert('success', 'VPS数据更新频率已成功保存。前端刷新间隔已立即更新。', 'serverAlert'); // Changed to serverAlert
 
         // Immediately update the frontend refresh interval
@@ -7679,16 +7841,10 @@ async function saveVpsReportInterval() {
 // 服务器自动排序
 async function autoSortServers(sortBy) {
     try {
-        const response = await fetch('/api/admin/servers/auto-sort', {
+        await apiRequest('/api/admin/servers/auto-sort', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({ sortBy: sortBy, order: 'asc' })
         });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '自动排序失败');
-        }
 
         // 更新下拉菜单选中状态
         updateServerSortDropdownSelection(sortBy);
@@ -7706,16 +7862,10 @@ async function autoSortServers(sortBy) {
 // 网站自动排序
 async function autoSortSites(sortBy) {
     try {
-        const response = await fetch('/api/admin/sites/auto-sort', {
+        await apiRequest('/api/admin/sites/auto-sort', {
             method: 'POST',
-            headers: getAuthHeaders(),
             body: JSON.stringify({ sortBy: sortBy, order: 'asc' })
         });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '自动排序失败');
-        }
 
         // 更新下拉菜单选中状态
         updateSiteSortDropdownSelection(sortBy);
@@ -7775,6 +7925,321 @@ function updateSiteSortDropdownSelection(selectedSortBy) {
     if (selectedItem) {
         selectedItem.classList.add('active');
     }
+}
+
+// 管理页面移动端服务器卡片渲染函数
+function renderMobileAdminServerCards(servers) {
+    const mobileContainer = document.getElementById('mobileAdminServerContainer');
+    if (!mobileContainer) return;
+
+    mobileContainer.innerHTML = '';
+
+    if (!servers || servers.length === 0) {
+        mobileContainer.innerHTML = '<div class="text-center p-3 text-muted">暂无服务器数据</div>';
+        return;
+    }
+
+    servers.forEach(server => {
+        const card = document.createElement('div');
+        card.className = 'mobile-server-card';
+        card.setAttribute('data-server-id', server.id);
+
+        // 状态显示逻辑（与PC端一致）
+        let statusBadge = '<span class="badge bg-secondary">未知</span>';
+        let lastUpdateText = '从未';
+
+        if (server.last_report) {
+            const lastUpdate = new Date(server.last_report * 1000);
+            lastUpdateText = lastUpdate.toLocaleString();
+
+            // 检查是否在线（最后报告时间在5分钟内）
+            const now = new Date();
+            const diffMinutes = (now - lastUpdate) / (1000 * 60);
+
+            if (diffMinutes <= 5) {
+                statusBadge = '<span class="badge bg-success">在线</span>';
+            } else {
+                statusBadge = '<span class="badge bg-danger">离线</span>';
+            }
+        }
+
+        // 卡片头部
+        const cardHeader = document.createElement('div');
+        cardHeader.className = 'mobile-card-header';
+        cardHeader.innerHTML = \`
+            <div class="mobile-card-header-left">
+                \${statusBadge}
+            </div>
+            <h6 class="mobile-card-title text-center">\${server.name || '未命名服务器'}</h6>
+            <div class="mobile-card-header-right">
+                <span class="me-2">显示</span>
+                <div class="form-check form-switch d-inline-block">
+                    <input class="form-check-input server-visibility-toggle" type="checkbox"
+                           data-server-id="\${server.id}" \${server.is_public ? 'checked' : ''}>
+                </div>
+            </div>
+        \`;
+
+        // 卡片主体
+        const cardBody = document.createElement('div');
+        cardBody.className = 'mobile-card-body';
+
+        // 描述 - 单行
+        if (server.description) {
+            const descRow = document.createElement('div');
+            descRow.className = 'mobile-card-row';
+            descRow.innerHTML = \`
+                <span class="mobile-card-label">描述</span>
+                <span class="mobile-card-value">\${server.description}</span>
+            \`;
+            cardBody.appendChild(descRow);
+        }
+
+
+
+        // 四个按钮 - 两行两列布局
+        const buttonsContainer = document.createElement('div');
+        buttonsContainer.className = 'mobile-card-buttons-grid';
+        buttonsContainer.innerHTML = \`
+            <div class="d-flex gap-2 mb-2">
+                <button class="btn btn-outline-secondary btn-sm flex-fill" onclick="showServerApiKey('\${server.id}')">
+                    <i class="bi bi-key"></i> 查看密钥
+                </button>
+                <button class="btn btn-outline-info btn-sm flex-fill" onclick="copyVpsInstallScript('\${server.id}', '\${server.name}', this)">
+                    <i class="bi bi-clipboard"></i> 复制脚本
+                </button>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="btn btn-outline-primary btn-sm flex-fill" onclick="editServer('\${server.id}')">
+                    <i class="bi bi-pencil"></i> 编辑
+                </button>
+                <button class="btn btn-outline-danger btn-sm flex-fill" onclick="deleteServer('\${server.id}')">
+                    <i class="bi bi-trash"></i> 删除
+                </button>
+            </div>
+        \`;
+        cardBody.appendChild(buttonsContainer);
+
+        // 最后更新时间 - 底部单行（与PC端功能一致）
+        const lastUpdateRow = document.createElement('div');
+        lastUpdateRow.className = 'mobile-card-row mobile-card-footer';
+        lastUpdateRow.innerHTML = \`
+            <span class="mobile-card-label">最后更新</span>
+            <span class="mobile-card-value">\${lastUpdateText}</span>
+        \`;
+        cardBody.appendChild(lastUpdateRow);
+
+        // 组装卡片
+        card.appendChild(cardHeader);
+        card.appendChild(cardBody);
+
+        mobileContainer.appendChild(card);
+    });
+
+    // 为移动端显示开关添加事件监听器
+    document.querySelectorAll('.server-visibility-toggle').forEach(toggle => {
+        toggle.addEventListener('change', function() {
+            const serverId = this.dataset.serverId;
+            const isPublic = this.checked;
+            toggleServerVisibility(serverId, isPublic);
+        });
+    });
+}
+
+// 切换服务器显示状态
+async function toggleServerVisibility(serverId, isPublic) {
+    try {
+        const toggle = document.querySelector(\`.server-visibility-toggle[data-server-id="\${serverId}"]\`);
+        if (toggle) {
+            toggle.disabled = true;
+            toggle.style.opacity = '0.6';
+        }
+
+        await apiRequest(\`/api/admin/servers/\${serverId}/visibility\`, {
+            method: 'POST',
+            body: JSON.stringify({ is_public: isPublic })
+        });
+
+        // 更新本地数据
+        const serverIndex = serverList.findIndex(s => s.id === serverId);
+        if (serverIndex !== -1) {
+            serverList[serverIndex].is_public = isPublic;
+        }
+
+        if (toggle) {
+            toggle.disabled = false;
+            toggle.style.opacity = '1';
+        }
+
+        showAlert('success', '服务器显示状态已' + (isPublic ? '开启' : '关闭'), 'serverAlert');
+
+    } catch (error) {
+        console.error('切换服务器显示状态错误:', error);
+
+        // 恢复开关状态
+        const toggle = document.querySelector(\`.server-visibility-toggle[data-server-id="\${serverId}"]\`);
+        if (toggle) {
+            toggle.checked = !isPublic;
+            toggle.disabled = false;
+            toggle.style.opacity = '1';
+        }
+
+        showAlert('danger', '切换显示状态失败: ' + error.message, 'serverAlert');
+    }
+}
+
+// 管理页面移动端网站卡片渲染函数
+function renderMobileAdminSiteCards(sites) {
+    const mobileContainer = document.getElementById('mobileAdminSiteContainer');
+    if (!mobileContainer) return;
+
+    mobileContainer.innerHTML = '';
+
+    if (!sites || sites.length === 0) {
+        mobileContainer.innerHTML = '<div class="text-center p-3 text-muted">暂无监控网站数据</div>';
+        return;
+    }
+
+    sites.forEach(site => {
+        const card = document.createElement('div');
+        card.className = 'mobile-site-card';
+
+        const statusInfo = getSiteStatusBadge(site.last_status);
+        const lastCheckTime = site.last_checked ? new Date(site.last_checked * 1000).toLocaleString() : '从未';
+        const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
+
+        // 卡片头部
+        const cardHeader = document.createElement('div');
+        cardHeader.className = 'mobile-card-header';
+        cardHeader.innerHTML = \`
+            <h6 class="mobile-card-title">\${site.name || '未命名网站'}</h6>
+            <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+        \`;
+
+        // 卡片主体
+        const cardBody = document.createElement('div');
+        cardBody.className = 'mobile-card-body';
+
+        // URL - 单行
+        const urlRow = document.createElement('div');
+        urlRow.className = 'mobile-card-row';
+        urlRow.innerHTML = \`
+            <span class="mobile-card-label">URL</span>
+            <span class="mobile-card-value" style="word-break: break-all;">\${site.url}</span>
+        \`;
+        cardBody.appendChild(urlRow);
+
+        // 状态码 | 响应时间
+        const statusCode = site.last_status_code || '-';
+        const statusResponseRow = document.createElement('div');
+        statusResponseRow.className = 'mobile-card-two-columns';
+        statusResponseRow.innerHTML = \`
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">状态码</span>
+                <span class="mobile-card-value">\${statusCode}</span>
+            </div>
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">响应时间</span>
+                <span class="mobile-card-value">\${responseTime}</span>
+            </div>
+        \`;
+        cardBody.appendChild(statusResponseRow);
+
+        // 最后检查和显示开关 - 两列
+        const lastCheckVisibilityRow = document.createElement('div');
+        lastCheckVisibilityRow.className = 'mobile-card-two-columns';
+        lastCheckVisibilityRow.innerHTML = \`
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">最后检查</span>
+                <span class="mobile-card-value">\${lastCheckTime}</span>
+            </div>
+            <div class="mobile-card-column-item">
+                <span class="mobile-card-label">显示开关</span>
+                <div class="form-check form-switch">
+                    <input class="form-check-input site-visibility-toggle" type="checkbox"
+                           data-site-id="\${site.id}" \${site.is_public ? 'checked' : ''}>
+                </div>
+            </div>
+        \`;
+        cardBody.appendChild(lastCheckVisibilityRow);
+
+        // 操作按钮
+        const actionsRow = document.createElement('div');
+        actionsRow.className = 'mobile-card-row';
+        actionsRow.innerHTML = \`
+            <div class="d-flex gap-2 w-100">
+                <button class="btn btn-outline-primary btn-sm flex-fill" onclick="editSite('\${site.id}')">
+                    <i class="bi bi-pencil"></i> 编辑
+                </button>
+                <button class="btn btn-outline-danger btn-sm" onclick="deleteSite('\${site.id}')">
+                    <i class="bi bi-trash"></i> 删除
+                </button>
+            </div>
+        \`;
+        cardBody.appendChild(actionsRow);
+
+        // 组装卡片
+        card.appendChild(cardHeader);
+        card.appendChild(cardBody);
+
+        mobileContainer.appendChild(card);
+    });
+
+    // 为移动端网站显示开关添加事件监听器
+    document.querySelectorAll('.site-visibility-toggle').forEach(toggle => {
+        toggle.addEventListener('change', function() {
+            const siteId = this.dataset.siteId;
+            const isPublic = this.checked;
+            toggleSiteVisibility(siteId, isPublic);
+        });
+    });
+}
+
+// 切换网站显示状态
+async function toggleSiteVisibility(siteId, isPublic) {
+    try {
+        const toggle = document.querySelector(\`.site-visibility-toggle[data-site-id="\${siteId}"]\`);
+        if (toggle) {
+            toggle.disabled = true;
+            toggle.style.opacity = '0.6';
+        }
+
+        await apiRequest(\`/api/admin/sites/\${siteId}/visibility\`, {
+            method: 'POST',
+            body: JSON.stringify({ is_public: isPublic })
+        });
+
+        // 更新本地数据
+        const siteIndex = siteList.findIndex(s => s.id === siteId);
+        if (siteIndex !== -1) {
+            siteList[siteIndex].is_public = isPublic;
+        }
+
+        if (toggle) {
+            toggle.disabled = false;
+            toggle.style.opacity = '1';
+        }
+
+        showAlert('success', '网站显示状态已' + (isPublic ? '开启' : '关闭'), 'siteAlert');
+
+    } catch (error) {
+        console.error('切换网站显示状态错误:', error);
+
+        // 恢复开关状态
+        const toggle = document.querySelector(\`.site-visibility-toggle[data-site-id="\${siteId}"]\`);
+        if (toggle) {
+            toggle.checked = !isPublic;
+            toggle.disabled = false;
+            toggle.style.opacity = '1';
+        }
+
+        showAlert('danger', '切换显示状态失败: ' + error.message, 'siteAlert');
+    }
+}
+
+// 移动端查看服务器API密钥
+function showServerApiKey(serverId) {
+    viewApiKey(serverId);
 }
 `;
 }
