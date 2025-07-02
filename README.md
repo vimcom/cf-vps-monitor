@@ -1,20 +1,24 @@
 # cf-vps-monitor
 [简体中文](https://github.com/kadidalax/cf-vps-monitor/blob/main/README.md) | [English](https://github.com/kadidalax/cf-vps-monitor/blob/main/README-EN.md)
 ## 用cloudflare worker搭建的vps探针 + 网站检测面板。
-## 前排警告：本项目仅供学习和娱乐使用，不保证数据的准确性和可靠性。在生产环境中使用请谨慎评估。
+## ⚠️前排警告：本项目仅供学习和娱乐使用，不保证数据的准确性和可靠性。在生产环境中使用请谨慎评估。
 面板示例：https://vps-monitor.abo-vendor289.workers.dev/
 
-前端：
+PC端前台：
 
 ![image](https://github.com/user-attachments/assets/bca3c2c5-b5cd-45fe-bada-c617194e4d6e)
 
+移动端前台：
+
+![image](https://github.com/user-attachments/assets/4b438c11-2c1c-4190-b529-a9e109f1d03d)
+
 后台：
 
-![image](https://github.com/user-attachments/assets/743b523a-3892-4f3c-bb15-46dc0542378f)
+![image](https://github.com/user-attachments/assets/ddbae326-200b-4f4d-adf9-b295f2ac52d6)
 
 VPS端：
 
-![image](https://github.com/user-attachments/assets/91a45fbc-5456-4297-be93-360e96d5cdf8)
+![image](https://github.com/user-attachments/assets/947a8853-f5de-49f6-93e0-86464310817b)
 
 
 # VPS 监控面板 (Cloudflare Worker + D1 版) - 部署指南
@@ -58,7 +62,8 @@ CREATE TABLE IF NOT EXISTS servers (
   api_key TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
   sort_order INTEGER,
-  last_notified_down_at INTEGER DEFAULT NULL
+  last_notified_down_at INTEGER DEFAULT NULL,
+  is_public INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS metrics (
@@ -82,7 +87,8 @@ CREATE TABLE IF NOT EXISTS monitored_sites (
   last_status_code INTEGER,
   last_response_time_ms INTEGER,
   sort_order INTEGER,
-  last_notified_down_at INTEGER DEFAULT NULL
+  last_notified_down_at INTEGER DEFAULT NULL,
+  is_public INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS site_status_history (
