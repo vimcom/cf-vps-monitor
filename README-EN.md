@@ -4,17 +4,21 @@
 ## ⚠️First Thing First: This project is for learning and entertainment purposes only. Data accuracy and reliability are not guaranteed. Use with caution in production environments.
 Panel Demo: https://vps-monitor.abo-vendor289.workers.dev/
 
-Frontend:
+PC Frontend:
 
 ![image](https://github.com/user-attachments/assets/bca3c2c5-b5cd-45fe-bada-c617194e4d6e)
 
+Mobile Frontend:
+
+![image](https://github.com/user-attachments/assets/4b438c11-2c1c-4190-b529-a9e109f1d03d)
+
 Backend:
 
-![image](https://github.com/user-attachments/assets/743b523a-3892-4f3c-bb15-46dc0542378f)
+![image](https://github.com/user-attachments/assets/ddbae326-200b-4f4d-adf9-b295f2ac52d6)
 
 VPS Side:
 
-![image](https://github.com/user-attachments/assets/91a45fbc-5456-4297-be93-360e96d5cdf8)
+![image](https://github.com/user-attachments/assets/947a8853-f5de-49f6-93e0-86464310817b)
 
 
 # VPS Monitoring Panel (Cloudflare Worker + D1 Version) - Deployment Guide
@@ -59,7 +63,8 @@ CREATE TABLE IF NOT EXISTS servers (
   api_key TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
   sort_order INTEGER,
-  last_notified_down_at INTEGER DEFAULT NULL
+  last_notified_down_at INTEGER DEFAULT NULL,
+  is_public INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS metrics (
@@ -83,7 +88,8 @@ CREATE TABLE IF NOT EXISTS monitored_sites (
   last_status_code INTEGER,
   last_response_time_ms INTEGER,
   sort_order INTEGER,
-  last_notified_down_at INTEGER DEFAULT NULL
+  last_notified_down_at INTEGER DEFAULT NULL,
+  is_public INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS site_status_history (
