@@ -1,7 +1,7 @@
 # cf-vps-monitor
 [简体中文](https://github.com/kadidalax/cf-vps-monitor/blob/main/README.md) | [English](https://github.com/kadidalax/cf-vps-monitor/blob/main/README-EN.md)
 ## VPS monitoring probe + website detection panel built with Cloudflare Worker.
-## ⚠️First Thing Tirst: This project is for learning and entertainment purposes only. Data accuracy and reliability are not guaranteed. Use with caution in production environments.
+## ⚠️First Thing First: This project is for learning and entertainment purposes only. Data accuracy and reliability are not guaranteed. Use with caution in production environments.
 Panel Demo: https://vps-monitor.abo-vendor289.workers.dev/
 
 Frontend:
