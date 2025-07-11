@@ -1,7 +1,6 @@
 # cf-vps-monitor
 [简体中文](https://github.com/kadidalax/cf-vps-monitor/blob/main/README.md) | [English](https://github.com/kadidalax/cf-vps-monitor/blob/main/README-EN.md)
 ## 用cloudflare worker搭建的vps探针 + 网站检测面板。
-## ⚠️前排警告：本项目仅供学习和娱乐使用，不保证数据的准确性和可靠性。在生产环境中使用请谨慎评估。
 面板示例：https://vps-monitor.abo-vendor289.workers.dev/
 
 PC端前台：
