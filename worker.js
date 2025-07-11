@@ -8917,7 +8917,6 @@ async function moveSite(siteId, direction) {
 function showPasswordModal() {
     // 重置表单
     document.getElementById('passwordForm').reset();
-    document.getElementById('passwordAlert').classList.add('d-none');
 
     const passwordModal = new bootstrap.Modal(document.getElementById('passwordModal'));
     passwordModal.show();
