@@ -6,19 +6,16 @@
 
 PC端前台：
 
-![image](https://github.com/user-attachments/assets/bca3c2c5-b5cd-45fe-bada-c617194e4d6e)
+![image](https://github.com/kadidalax/cf-vps-monitor/blob/main/pic/front.jpg)
 
 移动端前台：
 
-![image](https://github.com/user-attachments/assets/4b438c11-2c1c-4190-b529-a9e109f1d03d)
+![image](https://github.com/kadidalax/cf-vps-monitor/blob/main/pic/mobile.jpg)
 
 后台：
 
-![image](https://github.com/user-attachments/assets/ddbae326-200b-4f4d-adf9-b295f2ac52d6)
+![image](https://github.com/kadidalax/cf-vps-monitor/blob/main/pic/back.jpg)
 
-VPS端：
-
-![image](https://github.com/user-attachments/assets/947a8853-f5de-49f6-93e0-86464310817b)
 
 
 # VPS 监控面板 (Cloudflare Worker + D1 版) - 部署指南
@@ -40,89 +37,6 @@ VPS端：
 3.  在下拉菜单中，选择 `D1 SQL 数据库`。
 4.  点击 `创建数据库`。
 5.  为数据库命名（例如 `vps-monitor-db`），然后点击 `创建`。
-6.  **重要：初始化数据库表**
-    *   数据库创建后，你会看到数据库的概览页面。点击 `控制台` 标签页。
-    *   复制下面的 SQL 命令，粘贴到控制台的输入框中，然后点击 `执行`：
-```
-CREATE TABLE IF NOT EXISTS admin_credentials (
-  username TEXT PRIMARY KEY,
-  password_hash TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  last_login INTEGER,
-  failed_attempts INTEGER DEFAULT 0,
-  locked_until INTEGER DEFAULT NULL,
-  must_change_password INTEGER DEFAULT 0,
-  password_changed_at INTEGER DEFAULT NULL
-);
-
-CREATE TABLE IF NOT EXISTS servers (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  description TEXT,
-  api_key TEXT NOT NULL UNIQUE,
-  created_at INTEGER NOT NULL,
-  sort_order INTEGER,
-  last_notified_down_at INTEGER DEFAULT NULL,
-  is_public INTEGER DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS metrics (
-  server_id TEXT PRIMARY KEY,
-  timestamp INTEGER,
-  cpu TEXT,
-  memory TEXT,
-  disk TEXT,
-  network TEXT,
-  uptime INTEGER,
-  FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS monitored_sites (
-  id TEXT PRIMARY KEY,
-  url TEXT NOT NULL UNIQUE,
-  name TEXT,
-  added_at INTEGER NOT NULL,
-  last_checked INTEGER,
-  last_status TEXT DEFAULT 'PENDING',
-  last_status_code INTEGER,
-  last_response_time_ms INTEGER,
-  sort_order INTEGER,
-  last_notified_down_at INTEGER DEFAULT NULL,
-  is_public INTEGER DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS site_status_history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  site_id TEXT NOT NULL,
-  timestamp INTEGER NOT NULL,
-  status TEXT NOT NULL,
-  status_code INTEGER,
-  response_time_ms INTEGER,
-  FOREIGN KEY(site_id) REFERENCES monitored_sites(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_site_status_history_site_id_timestamp ON site_status_history (site_id, timestamp DESC);
-
-CREATE TABLE IF NOT EXISTS telegram_config (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  bot_token TEXT,
-  chat_id TEXT,
-  enable_notifications INTEGER DEFAULT 0,
-  updated_at INTEGER
-);
-
-INSERT OR IGNORE INTO telegram_config (id, bot_token, chat_id, enable_notifications, updated_at) VALUES (1, NULL, NULL, 0, NULL);
-
-CREATE TABLE IF NOT EXISTS app_config (
-  key TEXT PRIMARY KEY,
-  value TEXT
-);
-
-INSERT OR IGNORE INTO app_config (key, value) VALUES ('vps_report_interval_seconds', '60');
-```
-
- *   正常会看到 `此查询已成功执行。响应时间 1090 毫秒，查询时间 0.24 毫秒`，现在你的数据库表结构已经准备好了。
-
 ### 2. 创建并配置 Worker
 
 接下来，创建 Worker 并将代码部署上去。
@@ -147,6 +61,7 @@ Worker 需要访问你之前创建的 D1 数据库。
 3.  在 `变量名称` 处输入 `DB` (必须大写)。
 4.  在 `D1 数据库` 下拉菜单中，选择你之前创建的数据库 (例如 `vps-monitor-db`)。
 5.  点击 `部署`。
+6.  **重要！初始化数据库：** 复制你的Worker URL到浏览器，后面加上`/api/init-db`，如`vps-monitor.abo-vendor289.workers.dev/api/init-db`，打开此链接后会看到 `{"success":true,"message":"数据库初始化完成"}` 即表明数据库已准备完毕。
 
 ### 4. 添加环境变量
 
@@ -178,7 +93,7 @@ Worker 需要访问你之前创建的 D1 数据库。
 3.  使用凭据登录：
     *   用户名: `admin`
     *   密码: `monitor2025!`
-4.  登录后，立即修改密码！！！
+4.  登录后，立即修改密码！立即修改密码！立即修改密码！！！
 
 ### 2. 添加服务器
 
@@ -186,7 +101,7 @@ Worker 需要访问你之前创建的 D1 数据库。
 2.  找到添加服务器的选项。
 3.  输入服务器的名称和可选的描述。
 4.  点击 `保存`。
-5.  面板会自动生成一个唯一的 `服务器 ID` 和 `API 密钥`。**请记下这个 服务器ID 和 API 密钥**，部署 Agent 时需要用到。
+5.  面板会自动生成一个唯一的 `服务器 ID` 和 `API 密钥`，后台可以随时查看，部署 Agent 时需要用到。
 
 ### 3. 部署 Agent (探针)
 
@@ -195,11 +110,11 @@ Agent 是一个需要在你的 VPS 上运行的脚本，用于收集状态信息
 有两种方式安装Agent脚本：
 
 第一种是直接从后台复制带有参数的命令一键安装（推荐）
-![image](https://github.com/user-attachments/assets/11e3c3bf-84c1-41ec-ae67-310c566830b3)
+![image](https://github.com/kadidalax/cf-vps-monitor/blob/main/pic/setting.jpg)
 
 第二种是：下载脚本并运行：
 ```
-wget https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-monitor.sh -O cf-vps-monitor.sh && chmod +x cf-vps-monitor.sh && ./cf-vps-monitor.sh
+wget -O cf-vps-monitor.sh https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-monitor.sh && chmod +x cf-vps-monitor.sh && ./cf-vps-monitor.sh
 ```
 或者下载脚本并运行：
 ```
@@ -233,7 +148,15 @@ curl -O https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-m
 1.  BotFather创建bot并获取`Bot Token`。
 2.  `@userinfobot`获取自己的`ID`。
 3.  将上述两项分别填入。
-4.  启用通知，点击`保存Telegram设置`。
+4.  启用通知，点击`保存Telegram设置`后会受到一条测试通知，说明配置正确。
+
+### 7. 配置自定义背景和透明度
+
+1.  找一张好看的背景图。
+2.  上传此图到图床，得到该图的链接（如：https://i.111666.best/image/QbF51RYyzcHFTBnOhICxdY.jpg ）
+3.  将此链接填入背景图片URL框，并勾选 `启用自定义背景`。
+4.  调整 `面透明度` 滑块。
+5.  点击 `保存背景设置`
 
 ## 注意事项
 
@@ -242,5 +165,6 @@ curl -O https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-m
 *   **错误处理:** 如果面板或 Agent 遇到问题，可以检查 Worker 的日志（在 Cloudflare 控制面板 Worker 页面）和 Agent 的日志。
 *   以上所有内容和代码均为AI生成，出现问题请直接拿着代码找AI吧。
 
-### 赞助：
+### 诚邀赞助🤣：
+
 [![Powered by DartNode](https://dartnode.com/branding/DN-Open-Source-sm.png)](https://dartnode.com "Powered by DartNode - Free VPS for Open Source")
