@@ -8822,7 +8822,12 @@ async function moveSite(siteId, direction) {
 function showPasswordModal() {
     // 重置表单
     document.getElementById('passwordForm').reset();
-    document.getElementById('passwordAlert').classList.add('d-none');
+
+    // 安全地隐藏密码警告（如果存在）
+    const passwordAlert = document.getElementById('passwordAlert');
+    if (passwordAlert) {
+        passwordAlert.classList.add('d-none');
+    }
 
     const passwordModal = new bootstrap.Modal(document.getElementById('passwordModal'));
     passwordModal.show();
