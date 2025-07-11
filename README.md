@@ -152,7 +152,7 @@ curl -O https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-m
 ### 7. 配置自定义背景和透明度
 
 1.  找一张好看的背景图。
-2.  上传此图到图床，得到该图的链接（如：https://i.111666.best/image/QbF51RYyzcHFTBnOhICxdY.jpg ）
+2.  上传到图床，得到该图的链接（如：https://i.111666.best/image/QbF51RYyzcHFTBnOhICxdY.jpg ）
 3.  将此链接填入背景图片URL框，并勾选 `启用自定义背景`。
 4.  调整 `面透明度` 滑块。
 5.  点击 `保存背景设置`
