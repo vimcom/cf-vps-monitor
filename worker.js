@@ -31,6 +31,99 @@ function getSecurityConfig(env) {
 const rateLimitStore = new Map();
 const loginAttemptStore = new Map();
 
+// VPS数据批量处理器
+class VpsBatchProcessor {
+  constructor() {
+    this.batchBuffer = [];
+    this.lastBatch = Math.floor(Date.now() / 1000);
+    this.maxBatchSize = 100; // 最大批量大小
+  }
+
+  // 添加VPS上报数据到批量缓冲区
+  addReport(serverId, reportData, batchInterval) {
+    this.batchBuffer.push({
+      serverId,
+      timestamp: reportData.timestamp,
+      cpu: JSON.stringify(reportData.cpu),
+      memory: JSON.stringify(reportData.memory),
+      disk: JSON.stringify(reportData.disk),
+      network: JSON.stringify(reportData.network),
+      uptime: reportData.uptime
+    });
+
+    // 检查是否需要立即刷新（时间到或缓冲区满）
+    const now = Math.floor(Date.now() / 1000);
+    if (now - this.lastBatch >= batchInterval || this.batchBuffer.length >= this.maxBatchSize) {
+      return true; // 需要刷新
+    }
+    return false;
+  }
+
+  // 获取并清空批量数据
+  getBatchData() {
+    const data = [...this.batchBuffer];
+    this.batchBuffer = [];
+    this.lastBatch = Math.floor(Date.now() / 1000);
+    return data;
+  }
+
+  // 检查是否需要定时刷新
+  shouldFlush(batchInterval) {
+    const now = Math.floor(Date.now() / 1000);
+    return this.batchBuffer.length > 0 && (now - this.lastBatch >= batchInterval);
+  }
+}
+
+// 全局批量处理器实例
+const vpsBatchProcessor = new VpsBatchProcessor();
+
+// 批量写入VPS数据到数据库
+async function flushVpsBatchData(env) {
+  const batchData = vpsBatchProcessor.getBatchData();
+  if (batchData.length === 0) return;
+
+  try {
+    // 使用D1的batch操作进行批量写入
+    const statements = batchData.map(report =>
+      env.DB.prepare(`
+        REPLACE INTO metrics (server_id, timestamp, cpu, memory, disk, network, uptime)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        report.serverId,
+        report.timestamp,
+        report.cpu,
+        report.memory,
+        report.disk,
+        report.network,
+        report.uptime
+      )
+    );
+
+    await env.DB.batch(statements);
+    console.log(`批量写入${batchData.length}条VPS数据`);
+  } catch (error) {
+    console.error('批量写入VPS数据失败:', error);
+    // 如果批量写入失败，将数据重新加入缓冲区
+    vpsBatchProcessor.batchBuffer.unshift(...batchData);
+    throw error;
+  }
+}
+
+// 定时刷新VPS批量数据（在主请求处理中调用）
+async function scheduleVpsBatchFlush(env, ctx) {
+  try {
+    const batchInterval = await getVpsReportInterval(env);
+    if (vpsBatchProcessor.shouldFlush(batchInterval)) {
+      ctx.waitUntil(flushVpsBatchData(env));
+    }
+  } catch (error) {
+    // 使用默认间隔60秒
+    if (vpsBatchProcessor.shouldFlush(60)) {
+      ctx.waitUntil(flushVpsBatchData(env));
+    }
+  }
+}
+
 // ==================== 配置缓存系统 ====================
 
 class ConfigCache {
@@ -1399,23 +1492,22 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders, ctx) {
 
       reportData = validationResult.data;
 
-      // 保存监控数据
-      await env.DB.prepare(`
-        REPLACE INTO metrics (server_id, timestamp, cpu, memory, disk, network, uptime)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        serverId,
-        reportData.timestamp,
-        JSON.stringify(reportData.cpu),
-        JSON.stringify(reportData.memory),
-        JSON.stringify(reportData.disk),
-        JSON.stringify(reportData.network),
-        reportData.uptime
-      ).run();
-
-      // VPS状态变化检测已移至前端
-
+      // 获取当前的批量写入间隔（与VPS上报间隔一致）
       const currentInterval = await getVpsReportInterval(env);
+
+      // 使用批量处理器处理VPS数据
+      const shouldFlush = vpsBatchProcessor.addReport(serverId, reportData, currentInterval);
+
+      // 如果需要刷新或使用ctx.waitUntil进行异步刷新
+      if (shouldFlush) {
+        ctx.waitUntil(flushVpsBatchData(env));
+      } else {
+        // 检查是否有定时需要刷新的数据
+        if (vpsBatchProcessor.shouldFlush(currentInterval)) {
+          ctx.waitUntil(flushVpsBatchData(env));
+        }
+      }
+
       return createSuccessResponse({ interval: currentInterval }, corsHeaders);
 
     } catch (error) {
@@ -3144,6 +3236,9 @@ export default {
         // 静默处理数据库初始化失败
       }
     }
+
+    // 定时刷新VPS批量数据（在每个请求中检查）
+    scheduleVpsBatchFlush(env, ctx);
 
     const url = new URL(request.url);
     const path = url.pathname;
@@ -8822,12 +8917,7 @@ async function moveSite(siteId, direction) {
 function showPasswordModal() {
     // 重置表单
     document.getElementById('passwordForm').reset();
-
-    // 安全地隐藏密码警告（如果存在）
-    const passwordAlert = document.getElementById('passwordAlert');
-    if (passwordAlert) {
-        passwordAlert.classList.add('d-none');
-    }
+    document.getElementById('passwordAlert').classList.add('d-none');
 
     const passwordModal = new bootstrap.Modal(document.getElementById('passwordModal'));
     passwordModal.show();
@@ -9261,7 +9351,7 @@ function showDeleteSiteConfirmation(siteId, siteName, siteUrl) {
 // 删除网站监控
 async function deleteSite(siteId) {
     try {
-        await apiRequest(\`/api/admin/sites/\${siteId}\`, {
+        await apiRequest(\`/api/admin/sites/\${siteId}?confirm=true\`, {
             method: 'DELETE'
         });
 
