@@ -1,5 +1,5 @@
 // VPS监控面板 - Cloudflare Worker解决方案
-
+// 版本: 1.1.0
 // ==================== 配置常量 ====================
 
 // 默认管理员账户配置
@@ -8,16 +8,21 @@ const DEFAULT_ADMIN_CONFIG = {
   PASSWORD: 'monitor2025!',
 };
 
-// 安全配置
+// 安全配置 - 增强验证
 function getSecurityConfig(env) {
+  // 验证关键安全配置
+  if (!env.JWT_SECRET || env.JWT_SECRET === 'default-jwt-secret-please-set-in-worker-variables') {
+    throw new Error('JWT_SECRET must be set in environment variables for security');
+  }
+
   return {
-    JWT_SECRET: env.JWT_SECRET || 'default-jwt-secret-please-set-in-worker-variables',
-    TOKEN_EXPIRY: 24 * 60 * 60 * 1000, // 24小时
+    JWT_SECRET: env.JWT_SECRET,
+    TOKEN_EXPIRY: 2 * 60 * 60 * 1000, // 2小时
     MAX_LOGIN_ATTEMPTS: 5,
     LOGIN_ATTEMPT_WINDOW: 15 * 60 * 1000, // 15分钟
     API_RATE_LIMIT: 60, // 每分钟60次
     MIN_PASSWORD_LENGTH: 8,
-    ALLOWED_ORIGINS: env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(',') : [],
+    ALLOWED_ORIGINS: env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) : [],
   };
 }
 
@@ -26,43 +31,281 @@ function getSecurityConfig(env) {
 const rateLimitStore = new Map();
 const loginAttemptStore = new Map();
 
-// ==================== 工具函数 ====================
+// ==================== 配置缓存系统 ====================
 
-// 路径参数验证
-function extractAndValidateServerId(path) {
-  const serverId = path.split('/').pop();
-  return serverId && /^[a-zA-Z0-9_-]{1,50}$/.test(serverId) ? serverId : null;
+class ConfigCache {
+  constructor() {
+    this.cache = new Map();
+    this.CACHE_TTL = {
+      TELEGRAM: 5 * 60 * 1000,    // 5分钟
+      MONITORING: 5 * 60 * 1000,  // 5分钟
+      SERVERS: 2 * 60 * 1000      // 2分钟
+    };
+  }
+
+  set(key, value, ttl) {
+    this.cache.set(key, {
+      value,
+      timestamp: Date.now(),
+      ttl
+    });
+  }
+
+  get(key) {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+
+    if (Date.now() - entry.timestamp > entry.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+
+    return entry.value;
+  }
+
+  async getTelegramConfig(db) {
+    const cached = this.get('telegram_config');
+    if (cached) return cached;
+
+    const config = await db.prepare(
+      'SELECT bot_token, chat_id, enable_notifications FROM telegram_config WHERE id = 1'
+    ).first();
+
+    if (config) {
+      this.set('telegram_config', config, this.CACHE_TTL.TELEGRAM);
+    }
+
+    return config;
+  }
+
+  async getMonitoringSettings(db) {
+    const cached = this.get('monitoring_settings');
+    if (cached) return cached;
+
+    const settings = await db.prepare(
+      'SELECT * FROM app_config WHERE key IN ("vps_report_interval", "site_check_interval")'
+    ).all();
+
+    if (settings?.results) {
+      this.set('monitoring_settings', settings.results, this.CACHE_TTL.MONITORING);
+      return settings.results;
+    }
+
+    return [];
+  }
+
+  async getServerList(db, isAdmin = false) {
+    const cacheKey = isAdmin ? 'servers_admin' : 'servers_public';
+    const cached = this.get(cacheKey);
+    if (cached) return cached;
+
+    let query = 'SELECT id, name, description FROM servers';
+    if (!isAdmin) {
+      query += ' WHERE is_public = 1';
+    }
+    query += ' ORDER BY sort_order ASC NULLS LAST, name ASC';
+
+    const { results } = await db.prepare(query).all();
+    const servers = results || [];
+
+    this.set(cacheKey, servers, this.CACHE_TTL.SERVERS);
+    return servers;
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+
+  clearKey(key) {
+    this.cache.delete(key);
+  }
 }
 
+// 全局配置缓存实例
+const configCache = new ConfigCache();
+
+// ==================== 定时任务优化 ====================
+
+// 任务执行计数器
+let taskCounter = 0;
+let dbInitialized = false;
+
+// ==================== 工具函数 ====================
+
+// SQL安全验证 - 防止注入攻击
+function validateSqlIdentifier(value, type) {
+  const whitelist = {
+    column: ['id', 'name', 'url', 'description', 'sort_order', 'is_public', 'last_checked', 'last_status', 'timestamp', 'cpu', 'memory', 'disk', 'network', 'uptime'],
+    table: ['servers', 'monitored_sites', 'metrics', 'site_status_history'],
+    order: ['ASC', 'DESC']
+  };
+
+  const allowed = whitelist[type];
+  if (!allowed || !allowed.includes(value)) {
+    throw new Error(`Invalid ${type}: ${value}`);
+  }
+  return value;
+}
+
+// 敏感信息脱敏
+function maskSensitive(value, type = 'key') {
+  if (!value || typeof value !== 'string') return value;
+  return type === 'key' && value.length > 8 ? value.substring(0, 8) + '***' : '***';
+}
+
+// 增强的令牌撤销机制 - 修复JWT缓存安全问题
+const revokedTokens = new Map(); // 改为Map存储撤销时间
+
+function revokeToken(token) {
+  revokedTokens.set(token, Date.now());
+  // 清理JWT缓存中的对应令牌
+  jwtCache.delete(token);
+
+  // 定期清理过期的撤销记录（24小时后清理）
+  if (Math.random() < 0.01) {
+    const expireTime = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [revokedToken, revokeTime] of revokedTokens.entries()) {
+      if (revokeTime < expireTime) {
+        revokedTokens.delete(revokedToken);
+      }
+    }
+  }
+}
+
+function isTokenRevoked(token) {
+  return revokedTokens.has(token);
+}
+
+// 安全的JSON解析 - 限制大小
+async function parseJsonSafely(request, maxSize = 1024 * 1024) {
+  const contentLength = request.headers.get('content-length');
+  if (contentLength && parseInt(contentLength) > maxSize) {
+    throw new Error('Request body too large');
+  }
+
+  const text = await request.text();
+  if (text.length > maxSize) {
+    throw new Error('Request body too large');
+  }
+
+  return JSON.parse(text);
+}
+
+// 增强的管理员认证 - 修复权限检查问题
+async function authenticateAdmin(request, env) {
+  const user = await authenticateRequest(request, env);
+  if (!user) return null;
+
+  // 验证用户确实存在于管理员表中且未被锁定
+  const adminUser = await env.DB.prepare(
+    'SELECT username, locked_until FROM admin_credentials WHERE username = ?'
+  ).bind(user.username).first();
+
+  if (!adminUser || (adminUser.locked_until && Date.now() < adminUser.locked_until)) {
+    return null;
+  }
+
+  return user;
+}
+
+// 严格的管理员权限检查装饰器
+function requireAdmin(handler) {
+  return async (request, env, corsHeaders, ...args) => {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+    return handler(request, env, corsHeaders, user, ...args);
+  };
+}
+
+// 路径参数验证
 function extractPathSegment(path, index) {
   const segments = path.split('/');
-  if (index >= segments.length) return null;
+
+  // 支持负数索引（从末尾开始）
+  if (index < 0) {
+    index = segments.length + index;
+  }
+
+  if (index < 0 || index >= segments.length) return null;
 
   const segment = segments[index];
   return segment && /^[a-zA-Z0-9_-]{1,50}$/.test(segment) ? segment : null;
 }
 
-// 输入验证
+// 提取服务器ID的便捷函数
+function extractAndValidateServerId(path) {
+  return extractPathSegment(path, -1);
+}
+
+// 增强的输入验证 - 修复SSRF漏洞
 function validateInput(input, type, maxLength = 255) {
   if (!input || typeof input !== 'string' || input.length > maxLength) {
     return false;
   }
 
+  const cleaned = input.trim();
+
   const validators = {
-    serverName: () => /^[\w\s\u4e00-\u9fa5-]{1,100}$/.test(input.trim()),
-    description: () => input.trim().length <= 500,
+    serverName: () => {
+      if (!/^[\w\s\u4e00-\u9fa5.-]{2,50}$/.test(cleaned)) return false;
+      const sqlKeywords = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'DROP', 'SCRIPT', 'UNION', 'OR', 'AND'];
+      return !sqlKeywords.some(keyword => cleaned.toUpperCase().includes(keyword));
+    },
+    description: () => {
+      if (cleaned.length > 500) return false;
+      return !/<[^>]*>|javascript:|on\w+\s*=|<script/i.test(cleaned);
+    },
     direction: () => ['up', 'down'].includes(input),
     url: () => {
       try {
         const url = new URL(input);
-        return ['http:', 'https:'].includes(url.protocol);
+        if (!['http:', 'https:'].includes(url.protocol)) return false;
+
+        // 增强的内网地址检查 - 修复SSRF
+        const hostname = url.hostname.toLowerCase();
+
+        // IPv4内网检查
+        if (hostname === 'localhost' || hostname === '0.0.0.0' ||
+            hostname.startsWith('127.') || hostname.startsWith('10.') ||
+            hostname.startsWith('192.168.') || hostname.startsWith('169.254.') ||
+            (hostname.startsWith('172.') &&
+             parseInt(hostname.split('.')[1]) >= 16 &&
+             parseInt(hostname.split('.')[1]) <= 31)) {
+          return false;
+        }
+
+        // IPv6内网检查 - 修复方括号处理
+        if (hostname.includes(':')) {
+          // 移除方括号（如果存在）
+          const cleanHostname = hostname.replace(/^\[|\]$/g, '');
+          if (cleanHostname === '::1' || cleanHostname.startsWith('fc') ||
+              cleanHostname.startsWith('fd') || cleanHostname.startsWith('fe80')) {
+            return false;
+          }
+        }
+
+        // 域名黑名单检查
+        const blockedDomains = ['internal', 'local', 'intranet', 'corp'];
+        if (blockedDomains.some(domain => hostname.includes(domain))) {
+          return false;
+        }
+
+        // 端口限制 - 只允许标准HTTP/HTTPS端口
+        const port = url.port;
+        if (port && !['80', '443', '8080', '8443'].includes(port)) {
+          return false;
+        }
+
+        return input.length <= 2048;
       } catch {
         return false;
       }
     }
   };
 
-  return validators[type] ? validators[type]() : input.trim().length > 0;
+  return validators[type] ? validators[type]() : cleaned.length > 0;
 }
 
 // ==================== 统一响应处理工具 ====================
@@ -94,6 +337,8 @@ function createSuccessResponse(data, corsHeaders = {}) {
 
 // ==================== 统一验证工具 ====================
 
+// 获取Telegram配置（已移至ConfigCache类）
+
 // 服务器认证验证
 async function validateServerAuth(path, request, env) {
   const serverId = extractAndValidateServerId(path);
@@ -124,24 +369,20 @@ async function validateServerAuth(path, request, env) {
 // ==================== 统一数据库错误处理 ====================
 
 function handleDbError(error, corsHeaders, operation = 'database operation') {
-  console.error(`数据库操作错误 [${operation}]:`, error);
-
   if (error.message.includes('no such table')) {
     return createErrorResponse(
       'Database table missing',
       '数据库表不存在，请重试',
       503,
-      corsHeaders,
-      '如果问题持续存在，请联系管理员'
+      corsHeaders
     );
   }
 
   return createErrorResponse(
     'Internal server error',
-    `${operation}失败: ${error.message}`,
+    '系统暂时不可用，请稍后重试',
     500,
-    corsHeaders,
-    '请稍后重试，如果问题持续存在请联系管理员'
+    corsHeaders
   );
 }
 
@@ -176,7 +417,7 @@ async function getVpsReportInterval(env) {
       return interval;
     }
   } catch (error) {
-    console.warn("获取VPS上报间隔失败，使用默认值:", error);
+    // 静默处理错误，使用默认值
   }
 
   // 默认值也缓存
@@ -193,96 +434,46 @@ function clearVpsIntervalCache() {
 
 // ==================== VPS数据验证工具 ====================
 
-// 验证JSON对象结构
-function validateJsonObject(obj, fieldName) {
-  if (!obj || typeof obj !== 'object') {
-    console.warn(`${fieldName}字段不是有效的对象:`, obj);
-    return false;
+// VPS数据默认值配置
+const VPS_DATA_DEFAULTS = {
+  cpu: { usage_percent: 0, load_avg: [0, 0, 0] },
+  memory: { total: 0, used: 0, free: 0, usage_percent: 0 },
+  disk: { total: 0, used: 0, free: 0, usage_percent: 0 },
+  network: { upload_speed: 0, download_speed: 0, total_upload: 0, total_download: 0 }
+};
+
+// 简化的VPS数据验证和转换
+function validateAndFixVpsField(data, field) {
+  if (!data || typeof data !== 'object') return VPS_DATA_DEFAULTS[field];
+
+  // 转换字符串数字为数字
+  const converted = {};
+  for (const [key, value] of Object.entries(data)) {
+    converted[key] = typeof value === 'string' ? (parseFloat(value) || 0) : (value || 0);
   }
-  return true;
+
+  return converted;
 }
 
-// 验证VPS数据结构
-function validateVpsDataStructure(data, type) {
-  if (!validateJsonObject(data, type)) {
-    return false;
-  }
-
-  switch (type) {
-    case 'CPU':
-      return typeof data.usage_percent === 'number' &&
-             Array.isArray(data.load_avg) &&
-             data.load_avg.length === 3;
-    case '内存':
-    case '磁盘':
-      return typeof data.total === 'number' &&
-             typeof data.used === 'number' &&
-             typeof data.free === 'number' &&
-             typeof data.usage_percent === 'number';
-    case '网络':
-      return typeof data.upload_speed === 'number' &&
-             typeof data.download_speed === 'number' &&
-             typeof data.total_upload === 'number' &&
-             typeof data.total_download === 'number';
-    default:
-      return true;
-  }
-}
-
-// 验证和修复VPS上报数据
+// 简化的VPS数据验证
 function validateAndFixVpsData(reportData) {
-  const requiredFields = ['timestamp', 'cpu', 'memory', 'disk', 'network'];
+  const requiredFields = ['timestamp', 'cpu', 'memory', 'disk', 'network', 'uptime'];
 
   // 检查必需字段
   for (const field of requiredFields) {
     if (!reportData[field]) {
-      return {
-        error: 'Invalid data format',
-        message: `缺少必需字段: ${field}`,
-        details: `上报数据必须包含以下字段: ${requiredFields.join(', ')}, uptime`,
-        received_fields: Object.keys(reportData)
-      };
+      return { error: 'Invalid data format', message: `缺少字段: ${field}` };
     }
   }
 
-  if (typeof reportData.uptime === 'undefined') {
-    return {
-      error: 'Invalid data format',
-      message: '缺少uptime字段',
-      details: 'uptime字段是必需的，用于记录系统运行时间（秒）',
-      received_fields: Object.keys(reportData)
-    };
-  }
+  // 修复数据类型
+  ['cpu', 'memory', 'disk', 'network'].forEach(field => {
+    reportData[field] = validateAndFixVpsField(reportData[field], field);
+  });
 
-  // 验证和修复数据结构
-  if (!validateVpsDataStructure(reportData.cpu, 'CPU')) {
-    console.warn('CPU数据结构无效，使用默认值:', reportData.cpu);
-    reportData.cpu = { usage_percent: 0, load_avg: [0, 0, 0] };
-  }
-  if (!validateVpsDataStructure(reportData.memory, '内存')) {
-    console.warn('内存数据结构无效，使用默认值:', reportData.memory);
-    reportData.memory = { total: 0, used: 0, free: 0, usage_percent: 0 };
-  }
-  if (!validateVpsDataStructure(reportData.disk, '磁盘')) {
-    console.warn('磁盘数据结构无效，使用默认值:', reportData.disk);
-    reportData.disk = { total: 0, used: 0, free: 0, usage_percent: 0 };
-  }
-  if (!validateVpsDataStructure(reportData.network, '网络')) {
-    console.warn('网络数据结构无效，使用默认值:', reportData.network);
-    reportData.network = { upload_speed: 0, download_speed: 0, total_upload: 0, total_download: 0 };
-  }
-
-  // 验证时间戳
-  if (!Number.isInteger(reportData.timestamp) || reportData.timestamp <= 0) {
-    console.warn('时间戳无效，使用当前时间:', reportData.timestamp);
-    reportData.timestamp = Math.floor(Date.now() / 1000);
-  }
-
-  // 验证uptime
-  if (!Number.isInteger(reportData.uptime) || reportData.uptime < 0) {
-    console.warn('运行时间无效，设置为0:', reportData.uptime);
-    reportData.uptime = 0;
-  }
+  // 修复时间戳和uptime
+  reportData.timestamp = parseInt(reportData.timestamp) || Math.floor(Date.now() / 1000);
+  reportData.uptime = parseInt(reportData.uptime) || 0;
 
   return { success: true, data: reportData };
 }
@@ -290,16 +481,46 @@ function validateAndFixVpsData(reportData) {
 // ==================== 密码处理 ====================
 
 async function hashPassword(password) {
+  // 生成16字节随机盐值
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  // 组合密码和盐值，进行1000次迭代（平衡安全性和性能）
   const encoder = new TextEncoder();
-  const data = encoder.encode(password);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  let hash = encoder.encode(password + saltHex);
+
+  for (let i = 0; i < 1000; i++) {
+    hash = new Uint8Array(await crypto.subtle.digest('SHA-256', hash));
+  }
+
+  const hashHex = Array.from(hash).map(b => b.toString(16).padStart(2, '0')).join('');
+  return `${saltHex}$${hashHex}`;
 }
 
 async function verifyPassword(password, hashedPassword) {
-  const hashedInput = await hashPassword(password);
-  return hashedInput === hashedPassword;
+  // 兼容新旧哈希格式
+  if (hashedPassword.includes('$')) {
+    // 新格式：salt$hash
+    const [saltHex, expectedHash] = hashedPassword.split('$');
+
+    const encoder = new TextEncoder();
+    let hash = encoder.encode(password + saltHex);
+
+    for (let i = 0; i < 1000; i++) {
+      hash = new Uint8Array(await crypto.subtle.digest('SHA-256', hash));
+    }
+
+    const computedHash = Array.from(hash).map(b => b.toString(16).padStart(2, '0')).join('');
+    return computedHash === expectedHash;
+  } else {
+    // 旧格式：纯SHA-256（向后兼容）
+    const encoder = new TextEncoder();
+    const data = encoder.encode(password);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const computedHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return computedHash === hashedPassword;
+  }
 }
 
 // ==================== JWT处理 ====================
@@ -352,8 +573,14 @@ async function createJWT(payload, env) {
   return data + '.' + encodedSignature;
 }
 
-// 带缓存的JWT验证函数
+// 安全的JWT验证函数 - 修复缓存安全问题
 async function verifyJWTCached(token, env) {
+  // 首先检查令牌是否被撤销
+  if (isTokenRevoked(token)) {
+    jwtCache.delete(token);
+    return null;
+  }
+
   // 检查缓存
   const cached = jwtCache.get(token);
   if (cached && Date.now() - cached.timestamp < JWT_CACHE_TTL) {
@@ -362,14 +589,19 @@ async function verifyJWTCached(token, env) {
       jwtCache.delete(token);
       return null;
     }
+    // 再次检查撤销状态（防止缓存期间被撤销）
+    if (isTokenRevoked(token)) {
+      jwtCache.delete(token);
+      return null;
+    }
     return cached.payload;
   }
 
   // 缓存未命中，执行实际验证
   const payload = await verifyJWT(token, env);
-  if (payload) {
+  if (payload && !isTokenRevoked(token)) {
     // 定期清理缓存
-    if (Math.random() < 0.01) { // 1%的概率触发清理
+    if (Math.random() < 0.01) {
       cleanupJWTCache();
     }
 
@@ -386,6 +618,9 @@ async function verifyJWTCached(token, env) {
 // 原始JWT验证函数（不使用缓存）
 async function verifyJWT(token, env) {
   try {
+    // 检查令牌是否被撤销
+    if (isTokenRevoked(token)) return null;
+
     const config = getSecurityConfig(env);
     const [encodedHeader, encodedPayload, encodedSignature] = token.split('.');
     if (!encodedHeader || !encodedPayload || !encodedSignature) return null;
@@ -416,7 +651,6 @@ async function verifyJWT(token, env) {
 
     return payload;
   } catch (error) {
-    console.error('JWT verification error:', error);
     return null;
   }
 }
@@ -555,20 +789,20 @@ const D1_SCHEMAS = {
       key TEXT PRIMARY KEY,
       value TEXT
     );
-    INSERT OR IGNORE INTO app_config (key, value) VALUES ('vps_report_interval_seconds', '60');`
+    INSERT OR IGNORE INTO app_config (key, value) VALUES ('vps_report_interval_seconds', '60');
+    INSERT OR IGNORE INTO app_config (key, value) VALUES ('custom_background_enabled', 'false');
+    INSERT OR IGNORE INTO app_config (key, value) VALUES ('custom_background_url', '');
+    INSERT OR IGNORE INTO app_config (key, value) VALUES ('page_opacity', '80');`
 };
 
 // ==================== 数据库初始化 ====================
 
 async function ensureTablesExist(db, env) {
-  console.log("初始化数据库表...");
-
   try {
     const createTableStatements = Object.values(D1_SCHEMAS).map(sql => db.prepare(sql));
     await db.batch(createTableStatements);
-    console.log("✅ 数据库表创建成功");
   } catch (error) {
-    console.error("数据库表创建失败:", error);
+    // 静默处理数据库创建错误
   }
 
   await createDefaultAdmin(db, env);
@@ -576,8 +810,6 @@ async function ensureTablesExist(db, env) {
 }
 
 async function applySchemaAlterations(db) {
-  console.log("应用数据库结构更新...");
-
   const alterStatements = [
     "ALTER TABLE monitored_sites ADD COLUMN last_notified_down_at INTEGER DEFAULT NULL",
     "ALTER TABLE servers ADD COLUMN last_notified_down_at INTEGER DEFAULT NULL",
@@ -597,9 +829,7 @@ async function applySchemaAlterations(db) {
     try {
       await db.exec(alterSql);
     } catch (e) {
-      if (!e.message?.includes("duplicate column name") && !e.message?.includes("already exists")) {
-        console.error('数据库结构更新错误:', e.message);
-      }
+      // 静默处理重复列错误
     }
   }
 }
@@ -610,8 +840,6 @@ async function isUsingDefaultPassword(username, password) {
 
 async function createDefaultAdmin(db, env) {
   try {
-    console.log("检查管理员账户...");
-
     const adminExists = await db.prepare(
       "SELECT username FROM admin_credentials WHERE username = ?"
     ).bind(DEFAULT_ADMIN_CONFIG.USERNAME).first();
@@ -624,14 +852,8 @@ async function createDefaultAdmin(db, env) {
         INSERT INTO admin_credentials (username, password_hash, created_at, failed_attempts, must_change_password)
         VALUES (?, ?, ?, 0, 0)
       `).bind(DEFAULT_ADMIN_CONFIG.USERNAME, adminPasswordHash, now).run();
-
-      console.log('✅ 已创建默认管理员账户:', DEFAULT_ADMIN_CONFIG.USERNAME);
-      console.log('✅ 默认密码:', DEFAULT_ADMIN_CONFIG.PASSWORD);
-    } else {
-      console.log('✅ 管理员账户已存在:', DEFAULT_ADMIN_CONFIG.USERNAME);
     }
   } catch (error) {
-    console.error("创建管理员账户失败:", error);
     if (!error.message.includes('no such table')) {
       throw error;
     }
@@ -680,25 +902,38 @@ function getSecureCorsHeaders(origin, env) {
   const config = getSecurityConfig(env);
   const allowedOrigins = config.ALLOWED_ORIGINS;
 
-  let allowedOrigin = 'null';
-  if (allowedOrigins.length === 0) {
-    allowedOrigin = origin || '*';
-  } else if (allowedOrigins.includes('*')) {
-    allowedOrigin = '*';
-  } else if (origin && allowedOrigins.includes(origin)) {
-    allowedOrigin = origin;
+  let allowedOrigin = 'null';  // 默认拒绝所有跨域请求
+
+  // 只有明确配置了允许的域名才允许跨域
+  if (allowedOrigins.length > 0 && origin) {
+    // 精确匹配
+    if (allowedOrigins.includes(origin)) {
+      allowedOrigin = origin;
+    } else {
+      // 子域名匹配 (*.example.com)
+      for (const allowed of allowedOrigins) {
+        if (allowed.startsWith('*.')) {
+          const domain = allowed.substring(2);
+          if (origin === domain || origin.endsWith(`.${domain}`)) {
+            allowedOrigin = origin;
+            break;
+          }
+        }
+      }
+    }
   }
 
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
-    'Access-Control-Allow-Credentials': allowedOrigin !== '*' ? 'true' : 'false',
+    'Access-Control-Allow-Credentials': allowedOrigin !== 'null' ? 'true' : 'false',
+    'Access-Control-Max-Age': '86400',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'X-XSS-Protection': '1; mode=block',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; font-src 'self' https://cdn.jsdelivr.net;"
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' https://cdn.jsdelivr.net; img-src 'self' data: https:; font-src 'self' https://cdn.jsdelivr.net; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';"
   };
 }
 
@@ -718,7 +953,7 @@ async function handleAuthRoutes(path, method, request, env, corsHeaders, clientI
         );
       }
 
-      const { username, password } = await request.json();
+      const { username, password } = await parseJsonSafely(request);
       if (!username || !password) {
         recordLoginAttempt(clientIP);
         return createErrorResponse(
@@ -790,7 +1025,6 @@ async function handleAuthRoutes(path, method, request, env, corsHeaders, clientI
       }, corsHeaders);
 
     } catch (error) {
-      console.error("登录API错误:", error);
       return handleDbError(error, corsHeaders, '登录');
     }
   }
@@ -820,7 +1054,6 @@ async function handleAuthRoutes(path, method, request, env, corsHeaders, clientI
       }, 200, corsHeaders);
 
     } catch (error) {
-      console.error("认证状态检查错误:", error);
       return createApiResponse({ authenticated: false }, 200, corsHeaders);
     }
   }
@@ -833,7 +1066,7 @@ async function handleAuthRoutes(path, method, request, env, corsHeaders, clientI
         return createErrorResponse('Unauthorized', '需要登录', 401, corsHeaders);
       }
 
-      const { current_password, new_password } = await request.json();
+      const { current_password, new_password } = await parseJsonSafely(request);
       if (!current_password || !new_password) {
         return createErrorResponse(
           'Missing fields',
@@ -871,10 +1104,19 @@ async function handleAuthRoutes(path, method, request, env, corsHeaders, clientI
         'UPDATE admin_credentials SET password_hash = ?, password_changed_at = ?, must_change_password = 0 WHERE username = ?'
       ).bind(newPasswordHash, Date.now(), user.username).run();
 
-      return createSuccessResponse({ message: '密码修改成功' }, corsHeaders);
+      // 撤销当前令牌，强制重新登录
+      const authHeader = request.headers.get('Authorization');
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const currentToken = authHeader.substring(7);
+        revokeToken(currentToken);
+      }
+
+      return createSuccessResponse({
+        message: '密码修改成功，请重新登录',
+        requireReauth: true
+      }, corsHeaders);
 
     } catch (error) {
-      console.error("修改密码错误:", error);
       return handleDbError(error, corsHeaders, '修改密码');
     }
   }
@@ -890,24 +1132,18 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
       const user = await authenticateRequestOptional(request, env);
       const isAdmin = user !== null;
 
-      let query = 'SELECT id, name, description FROM servers';
-      if (!isAdmin) {
-        query += ' WHERE is_public = 1';
-      }
-      query += ' ORDER BY sort_order ASC NULLS LAST, name ASC';
-
-      const { results } = await env.DB.prepare(query).all();
-      return createApiResponse({ servers: results || [] }, 200, corsHeaders);
+      // 使用缓存机制获取服务器列表
+      const servers = await configCache.getServerList(env.DB, isAdmin);
+      return createApiResponse({ servers }, 200, corsHeaders);
 
     } catch (error) {
-      console.error("获取服务器列表错误:", error);
       return handleDbError(error, corsHeaders, '获取服务器列表');
     }
   }
 
   // 管理员获取服务器列表（包含详细信息）
   if (path === '/api/admin/servers' && method === 'GET') {
-    const user = await authenticateRequest(request, env);
+    const user = await authenticateAdmin(request, env);
     if (!user) {
       return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
     }
@@ -921,23 +1157,32 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
         ORDER BY s.sort_order ASC NULLS LAST, s.name ASC
       `).all();
 
-      return createApiResponse({ servers: results || [] }, 200, corsHeaders);
+      // 检查是否需要完整密钥（用于查看密钥和复制脚本功能）
+      const url = new URL(request.url);
+      const showFullKey = url.searchParams.get('full_key') === 'true';
+
+      // 根据参数决定是否脱敏API密钥
+      const servers = (results || []).map(server => ({
+        ...server,
+        api_key: showFullKey ? server.api_key : maskSensitive(server.api_key)
+      }));
+
+      return createApiResponse({ servers }, 200, corsHeaders);
 
     } catch (error) {
-      console.error("获取管理员服务器列表错误:", error);
-      return handleDbError(error, corsHeaders, '获取管理员服务器列表');
+            return handleDbError(error, corsHeaders, '获取管理员服务器列表');
     }
   }
 
   // 添加服务器（管理员）
   if (path === '/api/admin/servers' && method === 'POST') {
-    const user = await authenticateRequest(request, env);
+    const user = await authenticateAdmin(request, env);
     if (!user) {
       return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
     }
 
     try {
-      const { name, description } = await request.json();
+      const { name, description } = await parseJsonSafely(request);
       if (!validateInput(name, 'serverName')) {
         return createErrorResponse(
           'Invalid server name',
@@ -948,7 +1193,8 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
       }
 
       const serverId = Math.random().toString(36).substring(2, 8);
-      const apiKey = crypto.randomUUID();
+      // 生成32字节强随机API密钥
+      const apiKey = Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('');
       const now = Math.floor(Date.now() / 1000);
 
       await env.DB.prepare(`
@@ -956,25 +1202,28 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
         VALUES (?, ?, ?, ?, ?, 0, 1)
       `).bind(serverId, name, description || '', apiKey, now).run();
 
+      // 清除服务器列表缓存
+      configCache.clearKey('servers_admin');
+      configCache.clearKey('servers_public');
+
       return createSuccessResponse({
         server: {
           id: serverId,
           name,
           description: description || '',
-          api_key: apiKey,
+          api_key: maskSensitive(apiKey),
           created_at: now
         }
       }, corsHeaders);
 
     } catch (error) {
-      console.error("添加服务器错误:", error);
-      return handleDbError(error, corsHeaders, '添加服务器');
+            return handleDbError(error, corsHeaders, '添加服务器');
     }
   }
 
-  // 更新服务器（管理员）
+  // 更新服务器（管理员） - 修复权限检查
   if (path.match(/\/api\/admin\/servers\/[^\/]+$/) && method === 'PUT') {
-    const user = await authenticateRequest(request, env);
+    const user = await authenticateAdmin(request, env);
     if (!user) {
       return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
     }
@@ -1008,6 +1257,10 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
         return createErrorResponse('Server not found', '服务器不存在', 404, corsHeaders);
       }
 
+      // 清除服务器列表缓存
+      configCache.clearKey('servers_admin');
+      configCache.clearKey('servers_public');
+
       return createSuccessResponse({
         id: serverId,
         name,
@@ -1016,14 +1269,13 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
       }, corsHeaders);
 
     } catch (error) {
-      console.error("更新服务器错误:", error);
-      return handleDbError(error, corsHeaders, '更新服务器');
+            return handleDbError(error, corsHeaders, '更新服务器');
     }
   }
 
   // 删除服务器（管理员）
   if (path.match(/\/api\/admin\/servers\/[^\/]+$/) && method === 'DELETE') {
-    const user = await authenticateRequest(request, env);
+    const user = await authenticateAdmin(request, env);
     if (!user) {
       return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
     }
@@ -1039,6 +1291,18 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
         );
       }
 
+      // 危险操作需要确认
+      const url = new URL(request.url);
+      const confirmed = url.searchParams.get('confirm') === 'true';
+      if (!confirmed) {
+        return createErrorResponse(
+          'Confirmation required',
+          '删除操作需要确认，请添加 ?confirm=true 参数',
+          400,
+          corsHeaders
+        );
+      }
+
       const info = await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(serverId).run();
       if (info.changes === 0) {
         return createErrorResponse('Server not found', '服务器不存在', 404, corsHeaders);
@@ -1047,11 +1311,14 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
       // 同时删除相关的监控数据
       await env.DB.prepare('DELETE FROM metrics WHERE server_id = ?').bind(serverId).run();
 
+      // 清除服务器列表缓存
+      configCache.clearKey('servers_admin');
+      configCache.clearKey('servers_public');
+
       return createSuccessResponse({ message: '服务器已删除' }, corsHeaders);
 
     } catch (error) {
-      console.error("删除服务器错误:", error);
-      return handleDbError(error, corsHeaders, '删除服务器');
+            return handleDbError(error, corsHeaders, '删除服务器');
     }
   }
 
@@ -1059,7 +1326,7 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
 }
 
 // VPS监控路由处理器
-async function handleVpsRoutes(path, method, request, env, corsHeaders) {
+async function handleVpsRoutes(path, method, request, env, corsHeaders, ctx) {
   // VPS配置获取（使用API密钥认证）
   if (path.startsWith('/api/config/') && method === 'GET') {
     try {
@@ -1089,8 +1356,7 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders) {
       return createApiResponse(configData, 200, corsHeaders);
 
     } catch (error) {
-      console.error("配置获取API错误:", error);
-      return handleDbError(error, corsHeaders, '配置获取');
+            return handleDbError(error, corsHeaders, '配置获取');
     }
   }
 
@@ -1109,10 +1375,8 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders) {
       let reportData;
       try {
         const rawBody = await request.text();
-        console.log('收到的原始数据:', rawBody.substring(0, 200) + '...');
         reportData = JSON.parse(rawBody);
       } catch (parseError) {
-        console.error('JSON解析错误:', parseError.message);
         return createErrorResponse(
           'Invalid JSON format',
           `JSON解析失败: ${parseError.message}`,
@@ -1124,7 +1388,6 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders) {
 
       const validationResult = validateAndFixVpsData(reportData);
       if (!validationResult.success) {
-        console.error(`VPS数据验证失败:`, validationResult);
         return createErrorResponse(
           validationResult.error,
           validationResult.message,
@@ -1150,12 +1413,61 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders) {
         reportData.uptime
       ).run();
 
+      // VPS状态变化检测已移至前端
+
       const currentInterval = await getVpsReportInterval(env);
       return createSuccessResponse({ interval: currentInterval }, corsHeaders);
 
     } catch (error) {
-      console.error("数据上报API错误:", error);
-      return handleDbError(error, corsHeaders, '数据上报');
+            return handleDbError(error, corsHeaders, '数据上报');
+    }
+  }
+
+  // 批量VPS状态查询（公开，支持管理员和游客模式）
+  if (path === '/api/status/batch' && method === 'GET') {
+    try {
+      const user = await authenticateRequestOptional(request, env);
+      const isAdmin = user !== null;
+
+      // 使用JOIN查询一次性获取所有VPS状态
+      const { results } = await env.DB.prepare(`
+        SELECT s.id, s.name, s.description,
+               m.timestamp, m.cpu, m.memory, m.disk, m.network, m.uptime
+        FROM servers s
+        LEFT JOIN metrics m ON s.id = m.server_id
+        WHERE s.is_public = 1 OR ? = 1
+        ORDER BY s.sort_order ASC NULLS LAST, s.name ASC
+      `).bind(isAdmin ? 1 : 0).all();
+
+      // 处理数据格式，保持与单个查询API的兼容性
+      const servers = (results || []).map(row => {
+        const server = { id: row.id, name: row.name, description: row.description };
+        let metrics = null;
+
+        if (row.timestamp) {
+          metrics = {
+            timestamp: row.timestamp,
+            uptime: row.uptime
+          };
+
+          // 解析JSON字段
+          try {
+            if (row.cpu) metrics.cpu = JSON.parse(row.cpu);
+            if (row.memory) metrics.memory = JSON.parse(row.memory);
+            if (row.disk) metrics.disk = JSON.parse(row.disk);
+            if (row.network) metrics.network = JSON.parse(row.network);
+          } catch (parseError) {
+            // 静默处理JSON解析错误
+          }
+        }
+
+        return { server, metrics, error: false };
+      });
+
+      return createApiResponse({ servers }, 200, corsHeaders);
+
+    } catch (error) {
+            return handleDbError(error, corsHeaders, '批量VPS状态查询');
     }
   }
 
@@ -1192,19 +1504,63 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders) {
           if (metricsData.disk) metricsData.disk = JSON.parse(metricsData.disk);
           if (metricsData.network) metricsData.network = JSON.parse(metricsData.network);
         } catch (parseError) {
-          console.error("监控数据JSON解析错误:", parseError);
+          // 静默处理JSON解析错误
         }
       }
 
-      return createApiResponse({
+      // 返回完整的监控数据（保持前端兼容性）
+      const publicInfo = {
         server: serverData,
         metrics: metricsData || null,
         error: false
-      }, 200, corsHeaders);
+      };
+
+      return createApiResponse(publicInfo, 200, corsHeaders);
 
     } catch (error) {
-      console.error("VPS状态查询错误:", error);
-      return handleDbError(error, corsHeaders, 'VPS状态查询');
+            return handleDbError(error, corsHeaders, 'VPS状态查询');
+    }
+  }
+
+  // VPS状态变化通知API
+  if (path === '/api/notify/offline' && method === 'POST') {
+    try {
+      const { serverId, serverName } = await request.json();
+
+      // 检查是否已发送过离线通知
+      const server = await env.DB.prepare('SELECT last_notified_down_at FROM servers WHERE id = ?').bind(serverId).first();
+      if (server?.last_notified_down_at) {
+        return createApiResponse({ success: true, message: 'Already notified' }, 200, corsHeaders);
+      }
+
+      const message = `🔴 VPS故障: 服务器 *${serverName}* 已离线超过5分钟`;
+
+      // 记录离线时间并发送通知
+      await env.DB.prepare('UPDATE servers SET last_notified_down_at = ? WHERE id = ?')
+        .bind(Math.floor(Date.now() / 1000), serverId).run();
+      ctx.waitUntil(sendTelegramNotificationOptimized(env.DB, message, 'high'));
+
+      return createApiResponse({ success: true }, 200, corsHeaders);
+    } catch (error) {
+            return createErrorResponse('Notification failed', '通知发送失败', 500, corsHeaders);
+    }
+  }
+
+  if (path === '/api/notify/recovery' && method === 'POST') {
+    try {
+      const { serverId, serverName } = await request.json();
+      const message = `✅ VPS恢复: 服务器 *${serverName}* 已恢复在线`;
+
+      // 清除离线记录
+      await env.DB.prepare('UPDATE servers SET last_notified_down_at = NULL WHERE id = ?')
+        .bind(serverId).run();
+
+      // 发送通知
+      ctx.waitUntil(sendTelegramNotificationOptimized(env.DB, message, 'high'));
+
+      return createApiResponse({ success: true }, 200, corsHeaders);
+    } catch (error) {
+            return createErrorResponse('Notification failed', '通知发送失败', 500, corsHeaders);
     }
   }
 
@@ -1250,22 +1606,23 @@ async function handleApiRequest(request, env, ctx) {
     if (serverResult) return serverResult;
   }
 
+
+
   // VPS监控路由
-  if (path.startsWith('/api/config/') || path.startsWith('/api/report/') || path.startsWith('/api/status/')) {
-    const vpsResult = await handleVpsRoutes(path, method, request, env, corsHeaders);
+  if (path.startsWith('/api/config/') || path.startsWith('/api/report/') ||
+      path.startsWith('/api/status/') || path.startsWith('/api/notify/')) {
+    const vpsResult = await handleVpsRoutes(path, method, request, env, corsHeaders, ctx);
     if (vpsResult) return vpsResult;
   }
 
   // 数据库初始化API（无需认证）
   if (path === '/api/init-db' && ['POST', 'GET'].includes(method)) {
     try {
-      console.log("手动触发数据库初始化...");
       await ensureTablesExist(env.DB, env);
       return createSuccessResponse({
         message: '数据库初始化完成'
       }, corsHeaders);
     } catch (error) {
-      console.error("数据库初始化失败:", error);
       return createErrorResponse(
         'Database initialization failed',
         `数据库初始化失败: ${error.message}`,
@@ -1277,13 +1634,6 @@ async function handleApiRequest(request, env, ctx) {
 
 
 
-  
-
-
-
-
-
-  
 
 
 
@@ -1292,27 +1642,28 @@ async function handleApiRequest(request, env, ctx) {
 
 
 
-  
 
 
 
 
-  
+
+
+
+
+
+
+
+
+
 
 
   // ==================== 高级排序功能 ====================
 
-  // 批量服务器排序（管理员）
+  // 批量服务器排序（管理员） - 修复权限检查
   if (path === '/api/admin/servers/batch-reorder' && method === 'POST') {
-    const user = await authenticateRequest(request, env);
+    const user = await authenticateAdmin(request, env);
     if (!user) {
-      return new Response(JSON.stringify({
-        error: 'Unauthorized',
-        message: '需要管理员权限'
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
     }
 
     try {
@@ -1342,8 +1693,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("批量服务器排序错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -1353,17 +1703,11 @@ async function handleApiRequest(request, env, ctx) {
     }
   }
 
-  // 自动服务器排序（管理员）
+  // 自动服务器排序（管理员） - 修复权限检查
   if (path === '/api/admin/servers/auto-sort' && method === 'POST') {
-    const user = await authenticateRequest(request, env);
+    const user = await authenticateAdmin(request, env);
     if (!user) {
-      return new Response(JSON.stringify({
-        error: 'Unauthorized',
-        message: '需要管理员权限'
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
     }
 
     try {
@@ -1392,12 +1736,13 @@ async function handleApiRequest(request, env, ctx) {
         });
       }
 
-      // 获取所有服务器并排序
+      // 获取所有服务器并排序 - 安全验证
+      const safeOrder = validateSqlIdentifier(order.toUpperCase(), 'order');
       let orderClause = '';
       if (sortBy === 'name') {
-        orderClause = `ORDER BY name ${order.toUpperCase()}`;
+        orderClause = `ORDER BY name ${safeOrder}`;
       } else if (sortBy === 'status') {
-        orderClause = `ORDER BY (CASE WHEN m.timestamp IS NULL OR (strftime('%s', 'now') - m.timestamp) > 300 THEN 1 ELSE 0 END) ${order.toUpperCase()}, name ASC`;
+        orderClause = `ORDER BY (CASE WHEN m.timestamp IS NULL OR (strftime('%s', 'now') - m.timestamp) > 300 THEN 1 ELSE 0 END) ${safeOrder}, name ASC`;
       }
 
       const { results: servers } = await env.DB.prepare(`
@@ -1420,8 +1765,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("自动服务器排序错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -1486,8 +1830,7 @@ async function handleApiRequest(request, env, ctx) {
 
         // 处理排序值交换
         if (currentServer.sort_order === null || targetServer.sort_order === null) {
-          console.warn("检测到NULL排序值，重新分配所有排序");
-          const updateStmts = allServers.map((server, index) =>
+                    const updateStmts = allServers.map((server, index) =>
             env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(index, server.id)
           );
           await env.DB.batch(updateStmts);
@@ -1527,8 +1870,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("管理员服务器排序错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -1575,8 +1917,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("更新服务器显示状态错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -1615,17 +1956,14 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("管理员获取监控站点错误:", error);
-      if (error.message.includes('no such table')) {
-        console.warn("监控站点表不存在，尝试创建...");
-        try {
+            if (error.message.includes('no such table')) {
+                try {
           await env.DB.exec(D1_SCHEMAS.monitored_sites);
           return new Response(JSON.stringify({ sites: [] }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
           });
         } catch (createError) {
-          console.error("创建监控站点表失败:", createError);
-        }
+                  }
       }
       return new Response(JSON.stringify({
         error: 'Internal server error',
@@ -1651,7 +1989,7 @@ async function handleApiRequest(request, env, ctx) {
     }
 
     try {
-      const { url, name } = await request.json();
+      const { url, name } = await parseJsonSafely(request);
 
       if (!url || !isValidHttpUrl(url)) {
         return new Response(JSON.stringify({
@@ -1692,12 +2030,11 @@ async function handleApiRequest(request, env, ctx) {
       const newSiteForCheck = { id: siteId, url, name: name || '' };
       if (ctx?.waitUntil) {
         ctx.waitUntil(checkWebsiteStatus(newSiteForCheck, env.DB, ctx));
-        console.log(`已安排新站点立即健康检查: ${siteId} (${url})`);
+
       } else {
-        console.warn("ctx.waitUntil不可用，尝试直接调用检查");
-        checkWebsiteStatus(newSiteForCheck, env.DB, ctx).catch(e =>
-          console.error("直接站点检查错误:", e)
-        );
+        checkWebsiteStatus(newSiteForCheck, env.DB, ctx).catch(e => {
+          // 静默处理站点检查错误
+        });
       }
 
       return new Response(JSON.stringify({ site: siteData }), {
@@ -1705,9 +2042,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("管理员添加监控站点错误:", error);
-
-      if (error.message.includes('UNIQUE constraint failed')) {
+            if (error.message.includes('UNIQUE constraint failed')) {
         return new Response(JSON.stringify({
           error: 'URL already exists or ID conflict',
           message: '该URL已被监控或ID冲突'
@@ -1718,8 +2053,7 @@ async function handleApiRequest(request, env, ctx) {
       }
 
       if (error.message.includes('no such table')) {
-        console.warn("监控站点表不存在，尝试创建...");
-        try {
+                try {
           await env.DB.exec(D1_SCHEMAS.monitored_sites);
           return new Response(JSON.stringify({
             error: 'Database table created, please retry',
@@ -1729,8 +2063,7 @@ async function handleApiRequest(request, env, ctx) {
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
           });
         } catch (createError) {
-          console.error("创建监控站点表失败:", createError);
-        }
+                  }
       }
 
       return new Response(JSON.stringify({
@@ -1743,95 +2076,7 @@ async function handleApiRequest(request, env, ctx) {
     }
   }
 
-  // 更新监控站点（管理员）
-  if (path.match(/\/api\/admin\/sites\/[^\/]+$/) && method === 'PUT') {
-    try {
-      const siteId = extractAndValidateServerId(path);
-      if (!siteId) {
-        return new Response(JSON.stringify({
-          error: 'Invalid site ID',
-          message: '无效的站点ID格式'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
 
-      const { url, name } = await request.json();
-      const setClauses = [];
-      const bindings = [];
-
-      if (url !== undefined) {
-        if (!isValidHttpUrl(url)) {
-          return new Response(JSON.stringify({
-            error: 'Valid URL is required if provided'
-          }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders }
-          });
-        }
-        setClauses.push("url = ?");
-        bindings.push(url);
-      }
-
-      if (name !== undefined) {
-        setClauses.push("name = ?");
-        bindings.push(name || '');
-      }
-
-      if (setClauses.length === 0) {
-        return new Response(JSON.stringify({
-          error: 'No fields to update provided'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      bindings.push(siteId);
-      const info = await env.DB.prepare(
-        `UPDATE monitored_sites SET ${setClauses.join(', ')} WHERE id = ?`
-      ).bind(...bindings).run();
-
-      if (info.changes === 0) {
-        return new Response(JSON.stringify({
-          error: 'Site not found or no changes made'
-        }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      const updatedSite = await env.DB.prepare(`
-        SELECT id, url, name, added_at, last_checked, last_status, last_status_code,
-               last_response_time_ms, sort_order
-        FROM monitored_sites WHERE id = ?
-      `).bind(siteId).first();
-
-      return new Response(JSON.stringify({ site: updatedSite }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-
-    } catch (error) {
-      console.error("管理员更新监控站点错误:", error);
-      if (error.message.includes('UNIQUE constraint failed')) {
-        return new Response(JSON.stringify({
-          error: 'URL already exists for another site',
-          message: '该URL已被其他监控站点使用'
-        }), {
-          status: 409,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: error.message
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
-    }
-  }
 
   // 更新监控站点（管理员）
   if (path.match(/\/api\/admin\/sites\/[^\/]+$/) && method === 'PUT') {
@@ -1871,23 +2116,33 @@ async function handleApiRequest(request, env, ctx) {
       }, corsHeaders);
 
     } catch (error) {
-      console.error("更新监控站点错误:", error);
-      return handleDbError(error, corsHeaders, '更新监控站点');
+            return handleDbError(error, corsHeaders, '更新监控站点');
     }
   }
 
   // 删除监控站点（管理员）
   if (path.match(/\/api\/admin\/sites\/[^\/]+$/) && method === 'DELETE') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
     try {
       const siteId = extractAndValidateServerId(path);
       if (!siteId) {
-        return new Response(JSON.stringify({
-          error: 'Invalid site ID',
-          message: '无效的站点ID格式'
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
+        return createErrorResponse('Invalid site ID', '无效的站点ID格式', 400, corsHeaders);
+      }
+
+      // 危险操作需要确认
+      const url = new URL(request.url);
+      const confirmed = url.searchParams.get('confirm') === 'true';
+      if (!confirmed) {
+        return createErrorResponse(
+          'Confirmation required',
+          '删除操作需要确认，请添加 ?confirm=true 参数',
+          400,
+          corsHeaders
+        );
       }
 
       const info = await env.DB.prepare('DELETE FROM monitored_sites WHERE id = ?').bind(siteId).run();
@@ -1905,8 +2160,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("管理员删除监控站点错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -1956,8 +2210,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("批量网站排序错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -2006,10 +2259,13 @@ async function handleApiRequest(request, env, ctx) {
         });
       }
 
-      // 获取所有站点并排序
+      // 获取所有站点并排序 - 安全验证
+      const safeSortBy = validateSqlIdentifier(sortBy, 'column');
+      const safeOrder = validateSqlIdentifier(order.toUpperCase(), 'order');
+
       const { results: sites } = await env.DB.prepare(`
         SELECT id FROM monitored_sites
-        ORDER BY ${sortBy} ${order.toUpperCase()}
+        ORDER BY ${safeSortBy} ${safeOrder}
       `).all();
 
       // 批量更新排序
@@ -2026,8 +2282,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("自动网站排序错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -2091,8 +2346,7 @@ async function handleApiRequest(request, env, ctx) {
 
         // 处理排序值交换
         if (currentSite.sort_order === null || targetSite.sort_order === null) {
-          console.warn("检测到NULL排序值，重新分配所有站点排序");
-          const updateStmts = allSites.map((site, index) =>
+                    const updateStmts = allSites.map((site, index) =>
             env.DB.prepare('UPDATE monitored_sites SET sort_order = ? WHERE id = ?').bind(index, site.id)
           );
           await env.DB.batch(updateStmts);
@@ -2132,8 +2386,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("管理员网站排序错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -2180,8 +2433,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("更新网站显示状态错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -2228,7 +2480,6 @@ async function handleApiRequest(request, env, ctx) {
 
           site.history = historyResults || [];
         } catch (historyError) {
-          console.error(`获取站点 ${site.id} 历史数据错误:`, historyError);
           site.history = [];
         }
       }
@@ -2237,17 +2488,14 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("获取站点状态错误:", error);
-      if (error.message.includes('no such table')) {
-        console.warn("监控站点表不存在，尝试创建...");
-        try {
+            if (error.message.includes('no such table')) {
+                try {
           await env.DB.exec(D1_SCHEMAS.monitored_sites);
           return new Response(JSON.stringify({ sites: [] }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
           });
         } catch (createError) {
-          console.error("创建监控站点表失败:", createError);
-        }
+                  }
       }
       return new Response(JSON.stringify({
         error: 'Internal server error',
@@ -2264,31 +2512,14 @@ async function handleApiRequest(request, env, ctx) {
   // 获取VPS上报间隔（公开，优化版本）
   if (path === '/api/admin/settings/vps-report-interval' && method === 'GET') {
     try {
-      // 优化：减少数据库查询，快速返回默认值或缓存值
-      let interval = 60; // 默认值
-
-      try {
-        const result = await env.DB.prepare(
-          'SELECT value FROM app_config WHERE key = ?'
-        ).bind('vps_report_interval_seconds').first();
-
-        if (result && result.value) {
-          const parsedInterval = parseInt(result.value, 10);
-          if (!isNaN(parsedInterval) && parsedInterval > 0) {
-            interval = parsedInterval;
-          }
-        }
-      } catch (dbError) {
-        console.warn("数据库查询VPS间隔失败，使用默认值:", dbError);
-        // 继续使用默认值，不阻塞响应
-      }
+      // 使用统一的缓存查询函数
+      const interval = await getVpsReportInterval(env);
 
       return new Response(JSON.stringify({ interval }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("获取VPS上报间隔错误:", error);
-      // 任何错误都返回默认值，确保系统继续工作
+            // 任何错误都返回默认值，确保系统继续工作
       return new Response(JSON.stringify({ interval: 60 }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
@@ -2324,12 +2555,15 @@ async function handleApiRequest(request, env, ctx) {
         interval.toString()
       ).run();
 
+      // 清除相关缓存
+      configCache.clearKey('monitoring_settings');
+      vpsIntervalCache.value = null; // 清除VPS间隔缓存
+
       return new Response(JSON.stringify({ success: true, interval }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("更新VPS上报间隔错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -2356,9 +2590,7 @@ async function handleApiRequest(request, env, ctx) {
     }
 
     try {
-      const settings = await env.DB.prepare(
-        'SELECT bot_token, chat_id, enable_notifications FROM telegram_config WHERE id = 1'
-      ).first();
+      const settings = await configCache.getTelegramConfig(env.DB);
 
       return new Response(JSON.stringify(
         settings || { bot_token: null, chat_id: null, enable_notifications: 0 }
@@ -2366,8 +2598,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("获取Telegram设置错误:", error);
-      if (error.message.includes('no such table')) {
+            if (error.message.includes('no such table')) {
         try {
           await env.DB.exec(D1_SCHEMAS.telegram_config);
           return new Response(JSON.stringify({
@@ -2378,8 +2609,7 @@ async function handleApiRequest(request, env, ctx) {
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
           });
         } catch (createError) {
-          console.error("创建Telegram配置表失败:", createError);
-        }
+                  }
       }
       return new Response(JSON.stringify({
         error: 'Internal server error',
@@ -2413,16 +2643,18 @@ async function handleApiRequest(request, env, ctx) {
         UPDATE telegram_config SET bot_token = ?, chat_id = ?, enable_notifications = ?, updated_at = ? WHERE id = 1
       `).bind(bot_token || null, chat_id || null, enableNotifValue, updatedAt).run();
 
-      // 发送测试通知
+      // 清除缓存，确保下次获取最新配置
+      configCache.clearKey('telegram_config');
+
+      // 发送测试通知（高优先级，立即发送）
       if (enableNotifValue === 1 && bot_token && chat_id) {
         const testMessage = "✅ Telegram通知已在此监控面板激活。这是一条测试消息。";
         if (ctx?.waitUntil) {
-          ctx.waitUntil(sendTelegramNotification(env.DB, testMessage));
+          ctx.waitUntil(sendTelegramNotificationOptimized(env.DB, testMessage, 'high'));
         } else {
-          console.warn("ctx.waitUntil不可用，尝试直接发送测试通知");
-          sendTelegramNotification(env.DB, testMessage).catch(e =>
-            console.error("发送测试通知错误:", e)
-          );
+                    sendTelegramNotificationOptimized(env.DB, testMessage, 'high').catch(e => {
+            // 静默处理测试通知错误
+          });
         }
       }
 
@@ -2430,8 +2662,7 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("更新Telegram设置错误:", error);
-      return new Response(JSON.stringify({
+            return new Response(JSON.stringify({
         error: 'Internal server error',
         message: error.message
       }), {
@@ -2441,6 +2672,138 @@ async function handleApiRequest(request, env, ctx) {
     }
   }
 
+  // ==================== 背景设置API ====================
+
+  // 获取背景设置（公开API - 所有用户可访问）
+  if (path === '/api/background-settings' && method === 'GET') {
+    try {
+      // 查询三个背景配置项
+      const { results } = await env.DB.prepare(`
+        SELECT key, value FROM app_config
+        WHERE key IN ('custom_background_enabled', 'custom_background_url', 'page_opacity')
+      `).all();
+
+      // 转换为对象格式
+      const settings = {
+        enabled: false,
+        url: '',
+        opacity: 80
+      };
+
+      results.forEach(row => {
+        switch (row.key) {
+          case 'custom_background_enabled':
+            settings.enabled = row.value === 'true';
+            break;
+          case 'custom_background_url':
+            settings.url = row.value || '';
+            break;
+          case 'page_opacity':
+            settings.opacity = parseInt(row.value, 10) || 80;
+            break;
+        }
+      });
+
+      return new Response(JSON.stringify(settings), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+            return new Response(JSON.stringify({
+        enabled: false,
+        url: '',
+        opacity: 80
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
+
+
+
+  // 设置背景配置（管理员）
+  if (path === '/api/admin/background-settings' && method === 'POST') {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+      return new Response(JSON.stringify({
+        error: 'Unauthorized',
+        message: '需要管理员权限'
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+
+    try {
+      const { enabled, url, opacity } = await request.json();
+
+      // 验证输入参数
+      if (typeof enabled !== 'boolean') {
+        return new Response(JSON.stringify({
+          error: 'Invalid enabled value',
+          message: 'enabled必须是布尔值'
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      if (enabled && url) {
+        if (typeof url !== 'string' || !url.startsWith('https://')) {
+          return new Response(JSON.stringify({
+            error: 'Invalid URL format',
+            message: '背景图片URL必须以https://开头'
+          }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+      }
+
+      if (typeof opacity !== 'number' || opacity < 0 || opacity > 100) {
+        return new Response(JSON.stringify({
+          error: 'Invalid opacity value',
+          message: '透明度必须是0-100之间的数字'
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 更新配置到数据库
+      await env.DB.batch([
+        env.DB.prepare('REPLACE INTO app_config (key, value) VALUES (?, ?)').bind(
+          'custom_background_enabled',
+          enabled.toString()
+        ),
+        env.DB.prepare('REPLACE INTO app_config (key, value) VALUES (?, ?)').bind(
+          'custom_background_url',
+          url || ''
+        ),
+        env.DB.prepare('REPLACE INTO app_config (key, value) VALUES (?, ?)').bind(
+          'page_opacity',
+          opacity.toString()
+        )
+      ]);
+
+      // 清除监控设置缓存（背景设置也在app_config表中）
+      configCache.clearKey('monitoring_settings');
+
+      return new Response(JSON.stringify({
+        success: true,
+        settings: { enabled, url: url || '', opacity }
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+            return new Response(JSON.stringify({
+        error: 'Internal server error',
+        message: error.message
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
 
 
 
@@ -2463,17 +2826,14 @@ async function handleApiRequest(request, env, ctx) {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
-      console.error("获取站点历史错误:", error);
-      if (error.message.includes('no such table')) {
-        console.warn("站点状态历史表不存在，返回空列表");
-        try {
+            if (error.message.includes('no such table')) {
+                try {
           await env.DB.exec(D1_SCHEMAS.site_status_history);
           return new Response(JSON.stringify({ history: [] }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
           });
         } catch (createError) {
-          console.error("创建站点状态历史表失败:", createError);
-        }
+                  }
       }
       return new Response(JSON.stringify({
         error: 'Internal server error',
@@ -2496,39 +2856,11 @@ async function handleApiRequest(request, env, ctx) {
 
 // --- Scheduled Task for Website Monitoring ---
 
-// ==================== Telegram通知 ====================
+// ==================== Telegram通知（已移至优化版本） ====================
 
-async function sendTelegramNotification(db, message) {
-  try {
-    const config = await db.prepare(
-      'SELECT bot_token, chat_id, enable_notifications FROM telegram_config WHERE id = 1'
-    ).first();
+// 旧的单服务器状态检查函数已移除，改为前端状态变化检测
 
-    if (!config?.enable_notifications || !config.bot_token || !config.chat_id) {
-      console.log("Telegram通知未启用或配置不完整");
-      return;
-    }
-
-    const response = await fetch(`https://api.telegram.org/bot${config.bot_token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: config.chat_id,
-        text: message,
-        parse_mode: 'Markdown'
-      })
-    });
-
-    if (response.ok) {
-      console.log("Telegram通知发送成功");
-    } else {
-      const errorData = await response.json();
-      console.error(`Telegram通知发送失败: ${response.status}`, errorData);
-    }
-  } catch (error) {
-    console.error("Telegram通知发送错误:", error);
-  }
-}
+// 旧的VPS离线检查函数已移除，改为前端状态变化检测 + 定时提醒
 
 
 async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
@@ -2549,9 +2881,9 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
       previousStatus = siteDetailsResult.last_status || 'PENDING';
       siteLastNotifiedDownAt = siteDetailsResult.last_notified_down_at;
     }
-  } catch (e) {
-    console.error(`获取网站 ${id} 详情错误:`, e);
-  }
+  } catch (error) {
+        // 静默处理错误
+    }
   const NOTIFICATION_INTERVAL_SECONDS = 1 * 60 * 60; // 1 hour
 
 
@@ -2571,7 +2903,6 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
       newStatus = 'TIMEOUT';
     } else {
       newStatus = 'ERROR';
-      console.error(`检查网站 ${id} (${url}) 错误:`, error.message);
     }
   }
 
@@ -2584,27 +2915,23 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
     if (isFirstTimeDown) {
       // Site just went down
       const message = `🔴 网站故障: *${siteDisplayName}* 当前状态 ${newStatus.toLowerCase()} (状态码: ${newStatusCode || '无'}).\n网址: ${url}`;
-      ctx.waitUntil(sendTelegramNotification(db, message));
+      ctx.waitUntil(sendTelegramNotificationOptimized(db, message));
       newSiteLastNotifiedDownAt = checkTime;
-      console.log(`网站 ${siteDisplayName} 刚刚故障。已发送初始通知。last_notified_down_at 已更新。`);
+
     } else {
       // Site is still down, check if 1-hour interval has passed for resend
       const shouldResend = siteLastNotifiedDownAt === null || (checkTime - siteLastNotifiedDownAt > NOTIFICATION_INTERVAL_SECONDS);
       if (shouldResend) {
         const message = `🔴 网站持续故障: *${siteDisplayName}* 状态 ${newStatus.toLowerCase()} (状态码: ${newStatusCode || '无'}).\n网址: ${url}`;
-        ctx.waitUntil(sendTelegramNotification(db, message));
+        ctx.waitUntil(sendTelegramNotificationOptimized(db, message));
         newSiteLastNotifiedDownAt = checkTime;
-        console.log(`网站 ${siteDisplayName} 持续故障。已发送重复通知。last_notified_down_at 已更新。`);
-      } else {
-        console.log(`网站 ${siteDisplayName} 持续故障，但1小时通知间隔未到。`);
       }
     }
   } else if (newStatus === 'UP' && ['DOWN', 'TIMEOUT', 'ERROR'].includes(previousStatus)) {
     // Site just came back up
     const message = `✅ 网站恢复: *${siteDisplayName}* 已恢复在线!\n网址: ${url}`;
-    ctx.waitUntil(sendTelegramNotification(db, message));
+    ctx.waitUntil(sendTelegramNotificationOptimized(db, message));
     newSiteLastNotifiedDownAt = null; // Clear notification timestamp as site is up
-    console.log(`网站 ${siteDisplayName} 已恢复。已发送通知。last_notified_down_at 已清除。`);
   }
 
   // Update D1
@@ -2615,14 +2942,192 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
     const recordHistoryStmt = db.prepare(
       'INSERT INTO site_status_history (site_id, timestamp, status, status_code, response_time_ms) VALUES (?, ?, ?, ?, ?)'
     );
-    
+
     await db.batch([
       updateSiteStmt.bind(checkTime, newStatus, newStatusCode, newResponseTime, newSiteLastNotifiedDownAt, id),
       recordHistoryStmt.bind(id, checkTime, newStatus, newStatusCode, newResponseTime)
     ]);
-    console.log(`已检查网站 ${id} (${url}): ${newStatus} (${newStatusCode || '无'}), ${newResponseTime}ms。历史已记录。通知时间戳已更新。`);
   } catch (dbError) {
-    console.error(`更新网站 ${id} (${url}) 状态或记录历史到D1失败:`, dbError);
+    // 静默处理数据库更新错误
+  }
+}
+
+// ==================== 优化版本函数 ====================
+
+// 优化版网站状态检查 - 减少超时时间，使用缓存
+async function checkWebsiteStatusOptimized(site, db, ctx) {
+  const { id, url, name } = site;
+  const startTime = Date.now();
+  let newStatus = 'PENDING';
+  let newStatusCode = null;
+  let newResponseTime = null;
+
+  // 获取当前状态
+  let previousStatus = 'PENDING';
+  let siteLastNotifiedDownAt = null;
+
+  try {
+    const siteDetailsResult = await db.prepare(
+      'SELECT last_status, last_notified_down_at FROM monitored_sites WHERE id = ?'
+    ).bind(id).first();
+
+    if (siteDetailsResult) {
+      previousStatus = siteDetailsResult.last_status || 'PENDING';
+      siteLastNotifiedDownAt = siteDetailsResult.last_notified_down_at;
+    }
+  } catch (error) {
+        // 静默处理错误
+    }
+
+  const NOTIFICATION_INTERVAL_SECONDS = 1 * 60 * 60; // 1小时
+
+  try {
+    // 优化：超时时间从15秒减少到10秒
+    const response = await fetch(url, {
+      method: 'HEAD',
+      redirect: 'follow',
+      signal: AbortSignal.timeout(10000) // 10秒超时
+    });
+
+    newResponseTime = Date.now() - startTime;
+    newStatusCode = response.status;
+
+    if (response.ok || (response.status >= 300 && response.status < 500)) {
+      newStatus = 'UP';
+    } else {
+      newStatus = 'DOWN';
+    }
+  } catch (error) {
+    newResponseTime = Date.now() - startTime;
+    if (error.name === 'TimeoutError') {
+      newStatus = 'TIMEOUT';
+    } else {
+      newStatus = 'ERROR';
+    }
+  }
+
+  const checkTime = Math.floor(Date.now() / 1000);
+  const siteDisplayName = name || url;
+  let newSiteLastNotifiedDownAt = siteLastNotifiedDownAt;
+
+  // 通知逻辑保持不变
+  if (['DOWN', 'TIMEOUT', 'ERROR'].includes(newStatus)) {
+    const isFirstTimeDown = !['DOWN', 'TIMEOUT', 'ERROR'].includes(previousStatus);
+    if (isFirstTimeDown) {
+      const message = `🔴 网站故障: *${siteDisplayName}* 当前状态 ${newStatus.toLowerCase()} (状态码: ${newStatusCode || '无'}).\n网址: ${url}`;
+      ctx.waitUntil(sendTelegramNotificationOptimized(db, message));
+      newSiteLastNotifiedDownAt = checkTime;
+    } else {
+      const shouldResend = siteLastNotifiedDownAt === null || (checkTime - siteLastNotifiedDownAt > NOTIFICATION_INTERVAL_SECONDS);
+      if (shouldResend) {
+        const message = `🔴 网站持续故障: *${siteDisplayName}* 状态 ${newStatus.toLowerCase()} (状态码: ${newStatusCode || '无'}).\n网址: ${url}`;
+        ctx.waitUntil(sendTelegramNotificationOptimized(db, message));
+        newSiteLastNotifiedDownAt = checkTime;
+      }
+    }
+  } else if (newStatus === 'UP' && ['DOWN', 'TIMEOUT', 'ERROR'].includes(previousStatus)) {
+    const message = `✅ 网站恢复: *${siteDisplayName}* 已恢复在线!\n网址: ${url}`;
+    ctx.waitUntil(sendTelegramNotificationOptimized(db, message));
+    newSiteLastNotifiedDownAt = null;
+  }
+
+  // 批量更新数据库
+  try {
+    await db.batch([
+      db.prepare('UPDATE monitored_sites SET last_checked = ?, last_status = ?, last_status_code = ?, last_response_time_ms = ?, last_notified_down_at = ? WHERE id = ?')
+        .bind(checkTime, newStatus, newStatusCode, newResponseTime, newSiteLastNotifiedDownAt, id),
+      db.prepare('INSERT INTO site_status_history (site_id, timestamp, status, status_code, response_time_ms) VALUES (?, ?, ?, ?, ?)')
+        .bind(id, checkTime, newStatus, newStatusCode, newResponseTime)
+    ]);
+  } catch (dbError) {
+    // 静默处理数据库更新错误
+  }
+}
+
+// 简化版VPS离线提醒检查 - 只负责持续离线提醒
+async function checkVpsOfflineReminder(env, ctx) {
+  try {
+    const telegramConfig = await configCache.getTelegramConfig(env.DB);
+
+    if (!telegramConfig?.enable_notifications || !telegramConfig.bot_token || !telegramConfig.chat_id) {
+      return;
+    }
+
+    const currentTime = Math.floor(Date.now() / 1000);
+    const offlineThreshold = 5 * 60; // 5分钟
+    const reminderInterval = 60 * 60; // 1小时
+
+    // 查询持续离线的VPS（已有离线记录且仍然离线）
+    const { results: offlineServers } = await env.DB.prepare(`
+      SELECT s.id, s.name, s.last_notified_down_at, m.timestamp as last_report
+      FROM servers s
+      LEFT JOIN metrics m ON s.id = m.server_id
+      WHERE s.last_notified_down_at IS NOT NULL
+        AND (m.timestamp IS NULL OR m.timestamp < ?)
+        AND s.last_notified_down_at < ?
+    `).bind(currentTime - offlineThreshold, currentTime - reminderInterval).all();
+
+    for (const server of offlineServers) {
+      const serverDisplayName = server.name || server.id;
+      const offlineHours = Math.floor((currentTime - server.last_notified_down_at) / 3600);
+
+      const message = `🔴 VPS持续离线: 服务器 *${serverDisplayName}* 已离线${offlineHours}小时（每小时提醒）`;
+      ctx.waitUntil(sendTelegramNotificationOptimized(env.DB, message));
+
+      // 更新最后通知时间
+      ctx.waitUntil(env.DB.prepare('UPDATE servers SET last_notified_down_at = ? WHERE id = ?')
+        .bind(currentTime, server.id).run());
+    }
+
+  } catch (error) {
+    // 静默处理VPS离线提醒错误
+  }
+}
+
+// 简化版Telegram通知 - 直接发送
+async function sendTelegramNotificationOptimized(db, message, priority = 'normal') {
+  try {
+    const telegramConfig = await configCache.getTelegramConfig(db);
+
+    if (!telegramConfig?.enable_notifications || !telegramConfig.bot_token || !telegramConfig.chat_id) {
+      return;
+    }
+
+    const telegramUrl = `https://api.telegram.org/bot${telegramConfig.bot_token}/sendMessage`;
+    const payload = {
+      chat_id: telegramConfig.chat_id,
+      text: message,
+      parse_mode: 'Markdown'
+    };
+
+    const response = await fetch(telegramUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+  } catch (error) {
+    // 静默处理Telegram通知错误
+  }
+}
+
+// ==================== 数据库维护系统 ====================
+
+// 简洁的数据库维护函数
+async function performDatabaseMaintenance(db) {
+  const thirtyDaysAgo = Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+
+  try {
+    // 清理30天前的网站状态历史
+    const result = await db.prepare(
+      'DELETE FROM site_status_history WHERE timestamp < ?'
+    ).bind(thirtyDaysAgo).run();
+
+    // 清理JWT缓存
+    cleanupJWTCache();
+
+  } catch (error) {
+    // 静默处理数据库维护错误
   }
 }
 
@@ -2630,12 +3135,14 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
 
 export default {
   async fetch(request, env, ctx) {
-    // 初始化数据库表
-    try {
-      await ensureTablesExist(env.DB, env);
-    } catch (error) {
-      console.error("数据库初始化失败:", error);
-      // 继续执行，各个端点会处理缺失的表
+    // 优化：仅在必要时初始化数据库表
+    if (!dbInitialized) {
+      try {
+        await ensureTablesExist(env.DB, env);
+        dbInitialized = true;
+      } catch (error) {
+        // 静默处理数据库初始化失败
+      }
     }
 
     const url = new URL(request.url);
@@ -2656,26 +3163,29 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    console.log(`定时任务触发: ${event.cron} - 开始执行状态检查...`);
+    taskCounter++;
+
     ctx.waitUntil(
       (async () => {
         try {
-          // 确保数据库表存在
-          await ensureTablesExist(env.DB, env);
+          // 智能数据库初始化 - 仅在必要时执行
+          if (!dbInitialized || taskCounter % 10 === 1) {
+            await ensureTablesExist(env.DB, env);
+            dbInitialized = true;
+          }
 
           // ==================== 网站监控部分 ====================
-          console.log("开始定时网站检查...");
           const { results: sitesToCheck } = await env.DB.prepare(
             'SELECT id, url, name FROM monitored_sites'
           ).all();
 
           if (sitesToCheck?.length > 0) {
-            console.log(`发现 ${sitesToCheck.length} 个站点需要检查`);
+            // 限制并发数量为5个，优化资源使用
+            const siteConcurrencyLimit = 5;
             const sitePromises = [];
-            const siteConcurrencyLimit = 10;
 
             for (const site of sitesToCheck) {
-              sitePromises.push(checkWebsiteStatus(site, env.DB, ctx));
+              sitePromises.push(checkWebsiteStatusOptimized(site, env.DB, ctx));
               if (sitePromises.length >= siteConcurrencyLimit) {
                 await Promise.all(sitePromises);
                 sitePromises.length = 0;
@@ -2685,74 +3195,20 @@ export default {
             if (sitePromises.length > 0) {
               await Promise.all(sitePromises);
             }
-            console.log("网站状态检查完成");
-          } else {
-            console.log("未配置监控网站");
           }
 
-          // ==================== VPS监控部分 ====================
-          console.log("开始定时VPS状态检查...");
-          const telegramConfig = await env.DB.prepare(
-            'SELECT bot_token, chat_id, enable_notifications FROM telegram_config WHERE id = 1'
-          ).first();
+          // ==================== VPS离线提醒检查 ====================
+          // 每小时执行一次，发送持续离线提醒
+          await checkVpsOfflineReminder(env, ctx);
 
-          if (!telegramConfig?.enable_notifications || !telegramConfig.bot_token || !telegramConfig.chat_id) {
-            console.log("VPS的Telegram通知已禁用或未配置，跳过VPS检查");
-            return;
+          // ==================== 数据库维护检查 ====================
+          // 每天执行一次数据库维护
+          if (taskCounter % 1440 === 0) {
+            await performDatabaseMaintenance(env.DB);
           }
-
-          const { results: serversToCheck } = await env.DB.prepare(`
-            SELECT s.id, s.name, s.last_notified_down_at, m.timestamp as last_report
-            FROM servers s LEFT JOIN metrics m ON s.id = m.server_id
-          `).all();
-
-          if (!serversToCheck?.length) {
-            console.log("未找到用于VPS状态检查的服务器");
-            return;
-          }
-
-          console.log(`发现 ${serversToCheck.length} 台服务器需要VPS状态检查`);
-          const nowSeconds = Math.floor(Date.now() / 1000);
-          const staleThresholdSeconds = 5 * 60; // 5分钟
-          const NOTIFICATION_INTERVAL_SECONDS = 1 * 60 * 60; // 1小时
-
-          for (const server of serversToCheck) {
-            const isStale = !server.last_report || (nowSeconds - server.last_report > staleThresholdSeconds);
-            const serverDisplayName = server.name || server.id;
-            const lastReportTimeStr = server.last_report
-              ? new Date(server.last_report * 1000).toLocaleString('zh-CN')
-              : '从未';
-
-            if (isStale) {
-              // 服务器被认为离线/过期
-              const shouldSendNotification = server.last_notified_down_at === null ||
-                (nowSeconds - server.last_notified_down_at > NOTIFICATION_INTERVAL_SECONDS);
-
-              if (shouldSendNotification) {
-                const message = `🔴 VPS故障: 服务器 *${serverDisplayName}* 似乎已离线。最后报告: ${lastReportTimeStr}`;
-                ctx.waitUntil(sendTelegramNotification(env.DB, message));
-                ctx.waitUntil(env.DB.prepare('UPDATE servers SET last_notified_down_at = ? WHERE id = ?').bind(nowSeconds, server.id).run());
-                console.log(`VPS ${serverDisplayName} 状态过期，已发送通知`);
-              } else {
-                console.log(`VPS ${serverDisplayName} 状态过期，但1小时通知间隔未到`);
-              }
-            } else {
-              // 服务器正在报告（在线）
-              if (server.last_notified_down_at !== null) {
-                // 之前被通知为离线，现在已恢复
-                const message = `✅ VPS恢复: 服务器 *${serverDisplayName}* 已恢复在线并正在报告。当前报告: ${lastReportTimeStr}`;
-                ctx.waitUntil(sendTelegramNotification(env.DB, message));
-                ctx.waitUntil(env.DB.prepare('UPDATE servers SET last_notified_down_at = NULL WHERE id = ?').bind(server.id).run());
-                console.log(`VPS ${serverDisplayName} 已恢复，已发送通知`);
-              } else {
-                console.log(`VPS ${serverDisplayName} 在线并正在报告，无需通知`);
-              }
-            }
-          }
-          console.log("VPS状态检查完成");
 
         } catch (error) {
-          console.error("定时任务执行错误:", error);
+          // 静默处理定时任务错误
         }
       })()
     );
@@ -2785,24 +3241,15 @@ async function handleInstallScript(request, url, env) {
     if (D1_SCHEMAS?.app_config) {
       await env.DB.exec(D1_SCHEMAS.app_config);
     } else {
-      console.warn("D1_SCHEMAS.app_config未定义，跳过创建");
-    }
+          }
 
-    const result = await env.DB.prepare(
-      'SELECT value FROM app_config WHERE key = ?'
-    ).bind('vps_report_interval_seconds').first();
-
-    if (result?.value) {
-      const parsedInterval = parseInt(result.value, 10);
-      if (!isNaN(parsedInterval) && parsedInterval > 0) {
-        vpsReportInterval = parsedInterval.toString();
-      }
-    }
+    // 使用统一的缓存查询函数
+    const interval = await getVpsReportInterval(env);
+    vpsReportInterval = interval.toString();
   } catch (e) {
-    console.error("获取VPS上报间隔失败:", e);
-    // 使用默认值
+        // 使用默认值
   }
-  
+
   const script = `#!/bin/bash
 # VPS监控脚本 - 安装程序
 
@@ -2909,19 +3356,19 @@ get_network_usage() {
     echo "{\"upload_speed\":0,\"download_speed\":0,\"total_upload\":0,\"total_download\":0}"
     return
   fi
-  
+
   # 获取网络接口
   interface=$(ip route | grep default | awk '{print $5}')
-  
+
   # 获取网络速度（KB/s）
   network_speed=$(ifstat -i "$interface" 1 1 | tail -1)
   download_speed=$(echo "$network_speed" | awk '{print $1 * 1024}')
   upload_speed=$(echo "$network_speed" | awk '{print $2 * 1024}')
-  
+
   # 获取总流量
   rx_bytes=$(cat /proc/net/dev | grep "$interface" | awk '{print $2}')
   tx_bytes=$(cat /proc/net/dev | grep "$interface" | awk '{print $10}')
-  
+
   echo "{\"upload_speed\":$upload_speed,\"download_speed\":$download_speed,\"total_upload\":$tx_bytes,\"total_download\":$rx_bytes}"
 }
 
@@ -2932,19 +3379,19 @@ report_metrics() {
   memory=$(get_memory_usage)
   disk=$(get_disk_usage)
   network=$(get_network_usage)
-  
+
   data="{\"timestamp\":$timestamp,\"cpu\":$cpu,\"memory\":$memory,\"disk\":$disk,\"network\":$network}"
-  
+
   log "正在上报数据..."
   log "API密钥: $API_KEY"
   log "服务器ID: $SERVER_ID"
   log "Worker URL: $WORKER_URL"
-  
+
   response=$(curl -s -X POST "$WORKER_URL/api/report/$SERVER_ID" \
     -H "Content-Type: application/json" \
     -H "X-API-Key: $API_KEY" \
     -d "$data")
-  
+
   if [[ "$response" == *"success"* ]]; then
     log "数据上报成功"
   else
@@ -2955,7 +3402,7 @@ report_metrics() {
 # 安装依赖
 install_dependencies() {
   log "检查并安装依赖..."
-  
+
   # 检测包管理器
   if command -v apt-get &> /dev/null; then
     PKG_MANAGER="apt-get"
@@ -2965,11 +3412,11 @@ install_dependencies() {
     log "不支持的系统，无法自动安装依赖"
     return 1
   fi
-  
+
   # 安装依赖
   $PKG_MANAGER update -y
   $PKG_MANAGER install -y bc curl ifstat
-  
+
   log "依赖安装完成"
   return 0
 }
@@ -2977,10 +3424,10 @@ install_dependencies() {
 # 主函数
 main() {
   log "VPS监控脚本启动"
-  
+
   # 安装依赖
   install_dependencies
-  
+
   # 主循环
   while true; do
     report_metrics
@@ -3050,7 +3497,8 @@ function handleFrontendRequest(request, path) {
     '/css/style.css': () => new Response(getStyleCss(), { headers: { 'Content-Type': 'text/css' } }),
     '/js/main.js': () => new Response(getMainJs(), { headers: { 'Content-Type': 'application/javascript' } }),
     '/js/login.js': () => new Response(getLoginJs(), { headers: { 'Content-Type': 'application/javascript' } }),
-    '/js/admin.js': () => new Response(getAdminJs(), { headers: { 'Content-Type': 'application/javascript' } })
+    '/js/admin.js': () => new Response(getAdminJs(), { headers: { 'Content-Type': 'application/javascript' } }),
+    '/favicon.svg': () => new Response(getFaviconSvg(), { headers: { 'Content-Type': 'image/svg+xml' } })
   };
 
   const handler = routes[path];
@@ -3075,6 +3523,7 @@ function getIndexHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VPS监控面板</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <script>
         // 立即设置主题，避免闪烁
         (function() {
@@ -3082,8 +3531,8 @@ function getIndexHtml() {
             document.documentElement.setAttribute('data-bs-theme', theme);
         })();
     </script>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet" integrity="sha384-4LISF5TTJX/fLmGSxO53rV4miRxdg84mZsxmO8Rx5jGtp/LbrixFETvWa5a6sESd" crossorigin="anonymous">
     <link href="/css/style.css" rel="stylesheet">
     <style>
         .server-row {
@@ -3094,7 +3543,7 @@ function getIndexHtml() {
         }
         .server-details-row td {
             padding: 1rem;
-            background-color: #f8f9fa; /* Light background for details */
+            background-color: rgba(248, 249, 250, var(--page-opacity, 0.8)); /* Light background for details with transparency */
         }
         .server-details-content {
             display: grid;
@@ -3102,9 +3551,17 @@ function getIndexHtml() {
             gap: 1rem;
         }
         .detail-item {
-            background-color: #e9ecef;
+            background-color: rgba(233, 236, 239, var(--page-opacity, 0.8));
             padding: 0.75rem;
             border-radius: 0.25rem;
+            border: 1px solid rgba(0, 0, 0, 0.1);
+        }
+
+        /* 暗色主题下的详细信息项 */
+        [data-bs-theme="dark"] .detail-item {
+            background-color: rgba(52, 58, 64, var(--page-opacity, 0.8));
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
         }
         .detail-item strong {
             display: block;
@@ -3134,10 +3591,81 @@ function getIndexHtml() {
             /* font-weight: bold; is handled by inline style in JS */
         }
 
-        /* Center the "24h记录" (site table) and "上传" (server table) headers and their data cells */
-        .table > thead > tr > th:nth-child(6), /* Targets 6th header in both tables */
-        #siteStatusTableBody tr > td:nth-child(6), /* Targets 6th data cell in site status table */
-        #serverTableBody tr > td:nth-child(6) { /* Targets 6th data cell in server status table */
+        /* Center alignment for front-end monitoring tables */
+        /* Front-end server monitoring table headers and data */
+        .table > thead > tr > th:nth-child(1), /* 名称 */
+        .table > thead > tr > th:nth-child(2), /* 状态 */
+        .table > thead > tr > th:nth-child(3), /* CPU */
+        .table > thead > tr > th:nth-child(4), /* 内存 */
+        .table > thead > tr > th:nth-child(5), /* 硬盘 */
+        .table > thead > tr > th:nth-child(6), /* 上传 */
+        .table > thead > tr > th:nth-child(7), /* 下载 */
+        .table > thead > tr > th:nth-child(8), /* 总上传 */
+        .table > thead > tr > th:nth-child(9), /* 总下载 */
+        .table > thead > tr > th:nth-child(10), /* 运行时长 */
+        .table > thead > tr > th:nth-child(11), /* 最后更新 */
+        #serverTableBody tr > td:nth-child(1), /* 名称 */
+        #serverTableBody tr > td:nth-child(2), /* 状态 */
+        #serverTableBody tr > td:nth-child(3), /* CPU */
+        #serverTableBody tr > td:nth-child(4), /* 内存 */
+        #serverTableBody tr > td:nth-child(5), /* 硬盘 */
+        #serverTableBody tr > td:nth-child(6), /* 上传 */
+        #serverTableBody tr > td:nth-child(7), /* 下载 */
+        #serverTableBody tr > td:nth-child(8), /* 总上传 */
+        #serverTableBody tr > td:nth-child(9), /* 总下载 */
+        #serverTableBody tr > td:nth-child(10), /* 运行时长 */
+        #serverTableBody tr > td:nth-child(11) { /* 最后更新 */
+            text-align: center;
+        }
+
+        /* Front-end site monitoring table headers and data */
+        .table > thead > tr > th:nth-child(1), /* 名称 (site table) */
+        .table > thead > tr > th:nth-child(2), /* 状态 (site table) */
+        .table > thead > tr > th:nth-child(3), /* 状态码 (site table) */
+        .table > thead > tr > th:nth-child(4), /* 响应时间 (site table) */
+        .table > thead > tr > th:nth-child(5), /* 最后检查 (site table) */
+        .table > thead > tr > th:nth-child(6), /* 24h记录 (site table) */
+        #siteStatusTableBody tr > td:nth-child(1), /* 名称 */
+        #siteStatusTableBody tr > td:nth-child(2), /* 状态 */
+        #siteStatusTableBody tr > td:nth-child(3), /* 状态码 */
+        #siteStatusTableBody tr > td:nth-child(4), /* 响应时间 */
+        #siteStatusTableBody tr > td:nth-child(5), /* 最后检查 */
+        #siteStatusTableBody tr > td:nth-child(6) { /* 24h记录 */
+            text-align: center;
+        }
+
+        /* Backend admin tables - center align headers and data columns */
+        /* Admin server table headers */
+        .table thead tr th:nth-child(2), /* ID */
+        .table thead tr th:nth-child(3), /* 名称 */
+        .table thead tr th:nth-child(4), /* 描述 */
+        .table thead tr th:nth-child(5), /* 状态 */
+        .table thead tr th:nth-child(6), /* 最后更新 */
+        .table thead tr th:nth-child(9), /* 显示开关 */
+        /* Admin server table data */
+        #serverTableBody tr > td:nth-child(2), /* ID */
+        #serverTableBody tr > td:nth-child(3), /* 名称 */
+        #serverTableBody tr > td:nth-child(4), /* 描述 */
+        #serverTableBody tr > td:nth-child(5), /* 状态 */
+        #serverTableBody tr > td:nth-child(6), /* 最后更新 */
+        #serverTableBody tr > td:nth-child(9) { /* 显示开关 */
+            text-align: center;
+        }
+
+        /* Admin site table headers */
+        .table thead tr th:nth-child(2), /* 名称 */
+        .table thead tr th:nth-child(4), /* 状态 */
+        .table thead tr th:nth-child(5), /* 状态码 */
+        .table thead tr th:nth-child(6), /* 响应时间 */
+        .table thead tr th:nth-child(7), /* 最后检查 */
+        .table thead tr th:nth-child(8), /* 显示开关 */
+        /* Admin site table data */
+        #siteTableBody tr > td:nth-child(2), /* 名称 */
+        #siteTableBody tr > td:nth-child(4), /* 状态 */
+        #siteTableBody tr > td:nth-child(5), /* 状态码 */
+        #siteTableBody tr > td:nth-child(6), /* 响应时间 */
+        #siteTableBody tr > td:nth-child(7), /* 最后检查 */
+        #siteTableBody tr > td:nth-child(8) { /* 显示开关 */
             text-align: center;
         }
 
@@ -3170,12 +3698,13 @@ function getIndexHtml() {
             color: #ffffff; /* Ensure text in hovered rows is white */
         }
         [data-bs-theme="dark"] .server-details-row td {
-            background-color: #343a40; /* Darker details background */
+            background-color: rgba(33, 37, 41, var(--page-opacity, 0.8)); /* Darker details background with transparency */
             border-top: 1px solid #495057;
         }
         [data-bs-theme="dark"] .detail-item {
-            background-color: #495057; /* Darker detail item background */
-            color: #ffffff; /* White text for detail items */
+            background-color: rgba(52, 58, 64, var(--page-opacity, 0.8)); /* Darker detail item background with transparency */
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #e0e0e0; /* Consistent text color */
         }
         [data-bs-theme="dark"] .progress {
             background-color: #495057; /* Darker progress bar background */
@@ -3188,9 +3717,7 @@ function getIndexHtml() {
             background-color: #343a40 !important; /* Darker footer */
             border-top: 1px solid #495057;
         }
-        [data-bs-theme="dark"] .footer .text-muted {
-            color: #adb5bd !important; /* Lighter muted text */
-        }
+        /* 已移至统一的底部版权样式中 */
         [data-bs-theme="dark"] .alert-info {
             background-color: #17a2b8; /* Bootstrap info color, adjust if needed */
             color: #fff;
@@ -3239,9 +3766,9 @@ function getIndexHtml() {
         [data-bs-theme="dark"] .text-danger { /* Ensure custom text-danger is visible */
             color: #ff8888 !important;
         }
-        [data-bs-theme="dark"] .text-muted {
-             color: #adb5bd !important;
-        }
+        /* 通用text-muted主题适配 */
+        .text-muted { color: #212529 !important; }
+        [data-bs-theme="dark"] .text-muted { color: #ffffff !important; }
         [data-bs-theme="dark"] span[style*="color: #000"] { /* For inline styled black text */
             color: #ffffff !important; /* Change to white */
         }
@@ -3286,9 +3813,41 @@ function getIndexHtml() {
     </style>
 </head>
 <body>
+    <!-- Toast容器 -->
+    <div id="toastContainer" class="toast-container"></div>
+
     <nav class="navbar navbar-dark bg-primary">
         <div class="container">
-            <a class="navbar-brand" href="/">VPS监控面板</a>
+            <a class="navbar-brand" href="/">
+                <svg class="me-2" width="32" height="32" viewBox="0 0 32 32">
+                    <defs>
+                        <radialGradient id="navBg1" cx="0.3" cy="0.3">
+                            <stop offset="0%" stop-color="#fff" stop-opacity="0.9"/>
+                            <stop offset="100%" stop-color="#0277bd" stop-opacity="0.8"/>
+                        </radialGradient>
+                        <linearGradient id="navEcg1" x1="0%" x2="100%">
+                            <stop offset="0%" stop-color="#f08"/>
+                            <stop offset="50%" stop-color="#0f8"/>
+                            <stop offset="100%" stop-color="#80f"/>
+                        </linearGradient>
+                    </defs>
+                    <circle cx="16" cy="16" r="15" fill="url(#navBg1)" stroke="#0277bd" stroke-width="1.5"/>
+                    <circle cx="16" cy="16" r="13" fill="none" stroke="#fff" stroke-width="1" opacity="0.4"/>
+                    <line x1="4" y1="16" x2="28" y2="16" stroke="#b3e5fc" stroke-width="0.5" opacity="0.8"/>
+                    <path id="navP1" d="M4 16L8 16L9 15L10 17L11 14L12 18L13 10L14 22L15 16L28 16" fill="none" stroke="url(#navEcg1)" stroke-width="2.8"/>
+                    <path d="M4 16L8 16L9 15L10 17L11 14L12 18L13 10L14 22L15 16L28 16" fill="none" stroke="#fff" stroke-width="1.2" opacity="0.7"/>
+                    <circle r="1.5" fill="#fff">
+                        <animateMotion dur="2s" repeatCount="indefinite">
+                            <mpath href="#navP1"/>
+                        </animateMotion>
+                    </circle>
+                    <circle cx="16" cy="16" r="8" fill="none" stroke="#f08" stroke-width="0.5" opacity="0.6">
+                        <animate attributeName="r" values="8;12;8" dur="3s" repeatCount="indefinite"/>
+                        <animate attributeName="opacity" values="0.6;0;0.6" dur="3s" repeatCount="indefinite"/>
+                    </circle>
+                </svg>
+                VPS监控面板
+            </a>
             <div class="d-flex align-items-center">
                 <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2" title="GitHub Repository">
                     <i class="bi bi-github"></i>
@@ -3301,82 +3860,101 @@ function getIndexHtml() {
         </div>
     </nav>
 
+    <!-- 单一主卡片容器 -->
     <div class="container mt-4">
-        <div id="noServers" class="alert alert-info d-none">
-            暂无服务器数据，请先登录管理后台添加服务器。
-        </div>
+        <div class="card shadow-sm">
+            <div class="card-body">
+                <!-- 服务器监控部分 -->
+                <div class="mb-4">
+                    <h5 class="card-title mb-3">
+                        <i class="bi bi-server me-2"></i>服务器监控
+                    </h5>
 
-        <!-- 桌面端表格视图 -->
-        <div class="table-responsive">
-            <table class="table table-striped table-hover align-middle">
-                <thead>
-                    <tr>
-                        <th>名称</th>
-                        <th>状态</th>
-                        <th>CPU</th>
-                        <th>内存</th>
-                        <th>硬盘</th>
-                        <th>上传</th>
-                        <th>下载</th>
-                        <th>总上传</th>
-                        <th>总下载</th>
-                        <th>运行时长</th>
-                        <th>最后更新</th>
-                    </tr>
-                </thead>
-                <tbody id="serverTableBody">
-                    <tr>
-                        <td colspan="11" class="text-center">加载中...</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
+                    <div id="noServers" class="alert alert-info d-none">
+                        暂无服务器数据，请先登录管理后台添加服务器。
+                    </div>
 
-        <!-- 移动端卡片视图 -->
-        <div class="mobile-card-container" id="mobileServerContainer">
-            <div class="text-center p-3">
-                <div class="spinner-border text-primary" role="status">
-                    <span class="visually-hidden">加载中...</span>
+                    <!-- 桌面端表格视图 -->
+                    <div class="table-responsive">
+                        <table class="table table-striped table-hover align-middle">
+                            <thead>
+                                <tr>
+                                    <th>名称</th>
+                                    <th>状态</th>
+                                    <th>CPU</th>
+                                    <th>内存</th>
+                                    <th>硬盘</th>
+                                    <th>上传</th>
+                                    <th>下载</th>
+                                    <th>总上传</th>
+                                    <th>总下载</th>
+                                    <th>运行时长</th>
+                                    <th>最后更新</th>
+                                </tr>
+                            </thead>
+                            <tbody id="serverTableBody">
+                                <tr>
+                                    <td colspan="11" class="text-center">加载中...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- 移动端卡片视图 -->
+                    <div class="mobile-card-container" id="mobileServerContainer">
+                        <div class="text-center p-3">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">加载中...</span>
+                            </div>
+                            <div class="mt-2">加载服务器数据中...</div>
+                        </div>
+                    </div>
                 </div>
-                <div class="mt-2">加载服务器数据中...</div>
-            </div>
-        </div>
-    </div>
 
-    <!-- Website Status Section -->
-    <div class="container mt-5">
-        <h2>网站在线状态</h2>
-        <div id="noSites" class="alert alert-info d-none">
-            暂无监控网站数据。
-        </div>
-        <!-- 桌面端表格视图 -->
-        <div class="table-responsive">
-            <table class="table table-striped table-hover align-middle">
-                <thead>
-                    <tr>
-                        <th>名称</th>
-                        <th>状态</th>
-                        <th>状态码</th>
-                        <th>响应时间 (ms)</th>
-                        <th>最后检查</th>
-                        <th>24h记录</th>
-                    </tr>
-                </thead>
-                <tbody id="siteStatusTableBody">
-                    <tr>
-                        <td colspan="6" class="text-center">加载中...</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
+                <!-- 分隔线 -->
+                <hr class="my-4">
 
-        <!-- 移动端卡片视图 -->
-        <div class="mobile-card-container" id="mobileSiteContainer">
-            <div class="text-center p-3">
-                <div class="spinner-border text-primary" role="status">
-                    <span class="visually-hidden">加载中...</span>
+                <!-- 网站监控部分 -->
+                <div>
+                    <h5 class="card-title mb-3">
+                        <i class="bi bi-globe me-2"></i>网站在线状态
+                    </h5>
+
+                    <div id="noSites" class="alert alert-info d-none">
+                        暂无监控网站数据。
+                    </div>
+
+                    <!-- 桌面端表格视图 -->
+                    <div class="table-responsive">
+                        <table class="table table-striped table-hover align-middle">
+                            <thead>
+                                <tr>
+                                    <th>名称</th>
+                                    <th>状态</th>
+                                    <th>状态码</th>
+                                    <th>响应时间 (ms)</th>
+                                    <th>最后检查</th>
+                                    <th>24h记录</th>
+                                </tr>
+                            </thead>
+                            <tbody id="siteStatusTableBody">
+                                <tr>
+                                    <td colspan="6" class="text-center">加载中...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- 移动端卡片视图 -->
+                    <div class="mobile-card-container" id="mobileSiteContainer">
+                        <div class="text-center p-3">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">加载中...</span>
+                            </div>
+                            <div class="mt-2">加载网站数据中...</div>
+                        </div>
+                    </div>
                 </div>
-                <div class="mt-2">加载网站数据中...</div>
             </div>
         </div>
     </div>
@@ -3393,16 +3971,16 @@ function getIndexHtml() {
         </tr>
     </template>
 
-    <footer class="footer mt-5 py-3 bg-light">
+    <footer class="footer fixed-bottom py-2 bg-light border-top">
         <div class="container text-center">
-            <span class="text-muted">VPS监控面板 &copy; 2025</span>
+            <span class="text-muted small">VPS监控面板 &copy; 2025</span>
             <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
-                <i class="bi bi-github fs-5"></i>
+                <i class="bi bi-github"></i>
             </a>
         </div>
     </footer>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
     <script src="/js/main.js"></script>
 </body>
 </html>`;
@@ -3415,6 +3993,7 @@ function getLoginHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>登录 - VPS监控面板</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <script>
         // 立即设置主题，避免闪烁
         (function() {
@@ -3422,8 +4001,8 @@ function getLoginHtml() {
             document.documentElement.setAttribute('data-bs-theme', theme);
         })();
     </script>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet" integrity="sha384-4LISF5TTJX/fLmGSxO53rV4miRxdg84mZsxmO8Rx5jGtp/LbrixFETvWa5a6sESd" crossorigin="anonymous">
     <link href="/css/style.css" rel="stylesheet">
     <style>
         .server-row {
@@ -3434,7 +4013,12 @@ function getLoginHtml() {
         }
         .server-details-row td {
             padding: 1rem;
-            background-color: #f8f9fa; /* Light background for details */
+            background-color: rgba(248, 249, 250, var(--page-opacity, 0.8)); /* Light background for details with transparency */
+        }
+
+        /* 暗色主题下的服务器详细信息行 */
+        [data-bs-theme="dark"] .server-details-row td {
+            background-color: rgba(33, 37, 41, var(--page-opacity, 0.8));
         }
         .server-details-content {
             display: grid;
@@ -3442,9 +4026,17 @@ function getLoginHtml() {
             gap: 1rem;
         }
         .detail-item {
-            background-color: #e9ecef;
+            background-color: rgba(233, 236, 239, var(--page-opacity, 0.8));
             padding: 0.75rem;
             border-radius: 0.25rem;
+            border: 1px solid rgba(0, 0, 0, 0.1);
+        }
+
+        /* 暗色主题下的详细信息项 */
+        [data-bs-theme="dark"] .detail-item {
+            background-color: rgba(52, 58, 64, var(--page-opacity, 0.8));
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
         }
         .detail-item strong {
             display: block;
@@ -3510,12 +4102,13 @@ function getLoginHtml() {
             color: #ffffff; /* Ensure text in hovered rows is white */
         }
         [data-bs-theme="dark"] .server-details-row td {
-            background-color: #343a40; /* Darker details background */
+            background-color: rgba(33, 37, 41, var(--page-opacity, 0.8)); /* Darker details background with transparency */
             border-top: 1px solid #495057;
         }
         [data-bs-theme="dark"] .detail-item {
-            background-color: #495057; /* Darker detail item background */
-            color: #ffffff; /* White text for detail items */
+            background-color: rgba(52, 58, 64, var(--page-opacity, 0.8)); /* Darker detail item background with transparency */
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #e0e0e0; /* Consistent text color */
         }
         [data-bs-theme="dark"] .progress {
             background-color: #495057; /* Darker progress bar background */
@@ -3528,9 +4121,7 @@ function getLoginHtml() {
             background-color: #343a40 !important; /* Darker footer */
             border-top: 1px solid #495057;
         }
-        [data-bs-theme="dark"] .footer .text-muted {
-            color: #adb5bd !important; /* Lighter muted text */
-        }
+        /* 已移至统一的底部版权样式中 */
         [data-bs-theme="dark"] .alert-info {
             background-color: #17a2b8; /* Bootstrap info color, adjust if needed */
             color: #fff;
@@ -3579,18 +4170,48 @@ function getLoginHtml() {
         [data-bs-theme="dark"] .text-danger { /* Ensure custom text-danger is visible */
             color: #ff8888 !important;
         }
-        [data-bs-theme="dark"] .text-muted {
-             color: #adb5bd !important;
-        }
+        /* 已移至统一的通用text-muted样式中 */
         [data-bs-theme="dark"] span[style*="color: #000"] { /* For inline styled black text */
             color: #ffffff !important; /* Change to white */
         }
     </style>
 </head>
 <body>
+    <!-- Toast容器 -->
+    <div id="toastContainer" class="toast-container"></div>
+
     <nav class="navbar navbar-dark bg-primary">
         <div class="container">
-            <a class="navbar-brand" href="/">VPS监控面板</a>
+            <a class="navbar-brand" href="/">
+                <svg class="me-2" width="32" height="32" viewBox="0 0 32 32">
+                    <defs>
+                        <radialGradient id="navBg2" cx="0.3" cy="0.3">
+                            <stop offset="0%" stop-color="#fff" stop-opacity="0.9"/>
+                            <stop offset="100%" stop-color="#0277bd" stop-opacity="0.8"/>
+                        </radialGradient>
+                        <linearGradient id="navEcg2" x1="0%" x2="100%">
+                            <stop offset="0%" stop-color="#f08"/>
+                            <stop offset="50%" stop-color="#0f8"/>
+                            <stop offset="100%" stop-color="#80f"/>
+                        </linearGradient>
+                    </defs>
+                    <circle cx="16" cy="16" r="15" fill="url(#navBg2)" stroke="#0277bd" stroke-width="1.5"/>
+                    <circle cx="16" cy="16" r="13" fill="none" stroke="#fff" stroke-width="1" opacity="0.4"/>
+                    <line x1="4" y1="16" x2="28" y2="16" stroke="#b3e5fc" stroke-width="0.5" opacity="0.8"/>
+                    <path id="navP2" d="M4 16L8 16L9 15L10 17L11 14L12 18L13 10L14 22L15 16L28 16" fill="none" stroke="url(#navEcg2)" stroke-width="2.8"/>
+                    <path d="M4 16L8 16L9 15L10 17L11 14L12 18L13 10L14 22L15 16L28 16" fill="none" stroke="#fff" stroke-width="1.2" opacity="0.7"/>
+                    <circle r="1.5" fill="#fff">
+                        <animateMotion dur="2s" repeatCount="indefinite">
+                            <mpath href="#navP2"/>
+                        </animateMotion>
+                    </circle>
+                    <circle cx="16" cy="16" r="8" fill="none" stroke="#f08" stroke-width="0.5" opacity="0.6">
+                        <animate attributeName="r" values="8;12;8" dur="3s" repeatCount="indefinite"/>
+                        <animate attributeName="opacity" values="0.6;0;0.6" dur="3s" repeatCount="indefinite"/>
+                    </circle>
+                </svg>
+                VPS监控面板
+            </a>
             <div class="d-flex align-items-center">
                 <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
                     <i class="bi bi-moon-stars-fill"></i>
@@ -3608,7 +4229,7 @@ function getLoginHtml() {
                         <h4 class="card-title mb-0">管理员登录</h4>
                     </div>
                     <div class="card-body">
-                        <div id="loginAlert" class="alert alert-danger d-none"></div>
+
                         <form id="loginForm">
                             <div class="mb-3">
                                 <label for="username" class="form-label">用户名</label>
@@ -3631,16 +4252,16 @@ function getLoginHtml() {
         </div>
     </div>
 
-    <footer class="footer mt-5 py-3 bg-light">
+    <footer class="footer fixed-bottom py-2 bg-light border-top">
         <div class="container text-center">
-            <span class="text-muted">VPS监控面板 &copy; 2025</span>
+            <span class="text-muted small">VPS监控面板 &copy; 2025</span>
             <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
-                <i class="bi bi-github fs-5"></i>
+                <i class="bi bi-github"></i>
             </a>
         </div>
     </footer>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
     <script src="/js/login.js"></script>
 </body>
 </html>`;
@@ -3653,6 +4274,7 @@ function getAdminHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>管理后台 - VPS监控面板</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <script>
         // 立即设置主题，避免闪烁
         (function() {
@@ -3660,14 +4282,46 @@ function getAdminHtml() {
             document.documentElement.setAttribute('data-bs-theme', theme);
         })();
     </script>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet" integrity="sha384-4LISF5TTJX/fLmGSxO53rV4miRxdg84mZsxmO8Rx5jGtp/LbrixFETvWa5a6sESd" crossorigin="anonymous">
     <link href="/css/style.css" rel="stylesheet">
 </head>
 <body>
+    <!-- Toast容器 -->
+    <div id="toastContainer" class="toast-container"></div>
+
     <nav class="navbar navbar-dark bg-primary">
         <div class="container">
-            <a class="navbar-brand" href="/">VPS监控面板</a>
+            <a class="navbar-brand" href="/">
+                <svg class="me-2" width="32" height="32" viewBox="0 0 32 32">
+                    <defs>
+                        <radialGradient id="navBg3" cx="0.3" cy="0.3">
+                            <stop offset="0%" stop-color="#fff" stop-opacity="0.9"/>
+                            <stop offset="100%" stop-color="#0277bd" stop-opacity="0.8"/>
+                        </radialGradient>
+                        <linearGradient id="navEcg3" x1="0%" x2="100%">
+                            <stop offset="0%" stop-color="#f08"/>
+                            <stop offset="50%" stop-color="#0f8"/>
+                            <stop offset="100%" stop-color="#80f"/>
+                        </linearGradient>
+                    </defs>
+                    <circle cx="16" cy="16" r="15" fill="url(#navBg3)" stroke="#0277bd" stroke-width="1.5"/>
+                    <circle cx="16" cy="16" r="13" fill="none" stroke="#fff" stroke-width="1" opacity="0.4"/>
+                    <line x1="4" y1="16" x2="28" y2="16" stroke="#b3e5fc" stroke-width="0.5" opacity="0.8"/>
+                    <path id="navP3" d="M4 16L8 16L9 15L10 17L11 14L12 18L13 10L14 22L15 16L28 16" fill="none" stroke="url(#navEcg3)" stroke-width="2.8"/>
+                    <path d="M4 16L8 16L9 15L10 17L11 14L12 18L13 10L14 22L15 16L28 16" fill="none" stroke="#fff" stroke-width="1.2" opacity="0.7"/>
+                    <circle r="1.5" fill="#fff">
+                        <animateMotion dur="2s" repeatCount="indefinite">
+                            <mpath href="#navP3"/>
+                        </animateMotion>
+                    </circle>
+                    <circle cx="16" cy="16" r="8" fill="none" stroke="#f08" stroke-width="0.5" opacity="0.6">
+                        <animate attributeName="r" values="8;12;8" dur="3s" repeatCount="indefinite"/>
+                        <animate attributeName="opacity" values="0.6;0;0.6" dur="3s" repeatCount="indefinite"/>
+                    </circle>
+                </svg>
+                VPS监控面板
+            </a>
             <div class="d-flex align-items-center flex-wrap">
                 <a class="nav-link text-light me-2" href="/" style="white-space: nowrap;">返回首页</a>
 
@@ -3704,186 +4358,224 @@ function getAdminHtml() {
         </div>
     </nav>
 
+    <!-- 单一主管理卡片容器 -->
     <div class="container mt-4">
-        <div class="admin-header-row mb-4"> <!-- 优化的标题行容器 -->
-            <div class="admin-header-title">
-                <h2 class="mb-0">服务器管理</h2>
-            </div>
-            <div class="admin-header-content">
-                <!-- VPS Data Update Frequency Form -->
-                <form id="globalSettingsFormPartial" class="admin-settings-form">
-                    <div class="settings-group">
-                        <label for="vpsReportInterval" class="form-label">VPS数据更新频率 (秒):</label>
-                        <div class="input-group">
-                            <input type="number" class="form-control form-control-sm" id="vpsReportInterval" placeholder="例如: 60" min="1" style="width: 100px;">
-                            <button type="button" id="saveVpsReportIntervalBtn" class="btn btn-info btn-sm">保存频率</button>
-                        </div>
-                    </div>
-                </form>
-
-                <!-- Action Buttons Group -->
-                <div class="admin-actions-group">
-                    <!-- Server Auto Sort Dropdown -->
-                    <div class="dropdown me-2">
-                        <button class="btn btn-outline-secondary dropdown-toggle" type="button" id="serverAutoSortDropdown" data-bs-toggle="dropdown" aria-expanded="false">
-                            <i class="bi bi-sort-alpha-down"></i> 自动排序
-                        </button>
-                        <ul class="dropdown-menu" aria-labelledby="serverAutoSortDropdown">
-                            <li><a class="dropdown-item active" href="#" onclick="autoSortServers('custom')">自定义排序</a></li>
-                            <li><a class="dropdown-item" href="#" onclick="autoSortServers('name')">按名称排序</a></li>
-                            <li><a class="dropdown-item" href="#" onclick="autoSortServers('status')">按状态排序</a></li>
-                        </ul>
-                    </div>
-
-                    <!-- Add Server Button -->
-                    <button id="addServerBtn" class="btn btn-primary">
-                        <i class="bi bi-plus-circle"></i> 添加服务器
-                    </button>
-                </div>
-            </div>
-        </div>
-        <!-- Removed globalSettingsAlert as serverAlert will be used -->
-        <div id="serverAlert" class="alert d-none"></div>
-        <div class="card">
+        <div class="card shadow-sm">
             <div class="card-body">
-                <!-- 桌面端表格视图 -->
-                <div class="table-responsive">
-                    <table class="table table-striped table-hover">
-                        <thead>
-                            <tr>
-                                <th>排序</th>
-                                <th>ID</th>
-                                <th>名称</th>
-                                <th>描述</th>
-                                <th>状态</th>
-                                <th>最后更新</th>
-                                <th>API密钥</th>
-                                <th>VPS脚本</th>
-                                <th>显示 <i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="是否对游客展示此服务器"></i></th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="serverTableBody">
-                            <tr>
-                                <td colspan="10" class="text-center">加载中...</td>
-                            </tr>
-                        </tbody>
-                    </table>
+                <!-- 服务器管理部分 -->
+                <div class="mb-4">
+                    <div class="admin-header-row mb-3">
+                        <div class="admin-header-title">
+                            <h5 class="card-title mb-0">
+                                <i class="bi bi-server me-2"></i>服务器管理
+                            </h5>
+                        </div>
+                        <div class="admin-header-content">
+                            <!-- VPS Data Update Frequency Form -->
+                            <form id="globalSettingsFormPartial" class="admin-settings-form">
+                                <div class="settings-group">
+                                    <label for="vpsReportInterval" class="form-label">VPS数据更新频率 (秒):</label>
+                                    <div class="input-group">
+                                        <input type="number" class="form-control form-control-sm" id="vpsReportInterval" placeholder="例如: 60" min="1" style="width: 100px;">
+                                        <button type="button" id="saveVpsReportIntervalBtn" class="btn btn-info btn-sm">保存频率</button>
+                                    </div>
+                                </div>
+                            </form>
+
+                            <!-- Action Buttons Group -->
+                            <div class="admin-actions-group">
+                                <!-- Server Auto Sort Dropdown -->
+                                <div class="dropdown me-2">
+                                    <button class="btn btn-outline-secondary dropdown-toggle" type="button" id="serverAutoSortDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                                        <i class="bi bi-sort-alpha-down"></i> 自动排序
+                                    </button>
+                                    <ul class="dropdown-menu" aria-labelledby="serverAutoSortDropdown">
+                                        <li><a class="dropdown-item active" href="#" onclick="autoSortServers('custom')">自定义排序</a></li>
+                                        <li><a class="dropdown-item" href="#" onclick="autoSortServers('name')">按名称排序</a></li>
+                                        <li><a class="dropdown-item" href="#" onclick="autoSortServers('status')">按状态排序</a></li>
+                                    </ul>
+                                </div>
+
+                                <!-- Add Server Button -->
+                                <button id="addServerBtn" class="btn btn-primary">
+                                    <i class="bi bi-plus-circle"></i> 添加服务器
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+
+
+                    <!-- 桌面端表格视图 -->
+                    <div class="table-responsive">
+                        <table class="table table-striped table-hover">
+                            <thead>
+                                <tr>
+                                    <th>排序</th>
+                                    <th>ID</th>
+                                    <th>名称</th>
+                                    <th>描述</th>
+                                    <th>状态</th>
+                                    <th>最后更新</th>
+                                    <th>API密钥</th>
+                                    <th>VPS脚本</th>
+                                    <th>显示 <i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="是否对游客展示此服务器"></i></th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="serverTableBody">
+                                <tr>
+                                    <td colspan="10" class="text-center">加载中...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- 移动端卡片视图 -->
+                    <div class="mobile-card-container" id="mobileAdminServerContainer">
+                        <div class="text-center p-3">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">加载中...</span>
+                            </div>
+                            <div class="mt-2">加载服务器数据中...</div>
+                        </div>
+                    </div>
                 </div>
 
-                <!-- 移动端卡片视图 -->
-                <div class="mobile-card-container" id="mobileAdminServerContainer">
-                    <div class="text-center p-3">
-                        <div class="spinner-border text-primary" role="status">
-                            <span class="visually-hidden">加载中...</span>
+                <!-- 分隔线 -->
+                <hr class="my-4">
+
+                <!-- 网站监控管理部分 -->
+                <div>
+                    <div class="admin-header-row mb-3">
+                        <div class="admin-header-title">
+                            <h5 class="card-title mb-0">
+                                <i class="bi bi-globe me-2"></i>网站监控管理
+                            </h5>
                         </div>
-                        <div class="mt-2">加载服务器数据中...</div>
+                        <div class="admin-header-content">
+                            <!-- Action Buttons Group - 桌面端隐藏，移动端显示居中按钮 -->
+                            <div class="admin-actions-group desktop-only">
+                                <!-- Site Auto Sort Dropdown -->
+                                <div class="dropdown me-2">
+                                    <button class="btn btn-outline-secondary dropdown-toggle" type="button" id="siteAutoSortDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                                        <i class="bi bi-sort-alpha-down"></i> 自动排序
+                                    </button>
+                                    <ul class="dropdown-menu" aria-labelledby="siteAutoSortDropdown">
+                                        <li><a class="dropdown-item active" href="#" onclick="autoSortSites('custom')">自定义排序</a></li>
+                                        <li><a class="dropdown-item" href="#" onclick="autoSortSites('name')">按名称排序</a></li>
+                                        <li><a class="dropdown-item" href="#" onclick="autoSortSites('url')">按URL排序</a></li>
+                                        <li><a class="dropdown-item" href="#" onclick="autoSortSites('status')">按状态排序</a></li>
+                                    </ul>
+                                </div>
+
+                                <button id="addSiteBtn" class="btn btn-success">
+                                    <i class="bi bi-plus-circle"></i> 添加监控网站
+                                </button>
+                            </div>
+                        </div>
                     </div>
+
+
+                    <!-- 桌面端表格视图 -->
+                    <div class="table-responsive">
+                        <table class="table table-striped table-hover">
+                            <thead>
+                                <tr>
+                                    <th>排序</th>
+                                    <th>名称</th>
+                                    <th>URL</th>
+                                    <th>状态</th>
+                                    <th>状态码</th>
+                                    <th>响应时间 (ms)</th>
+                                    <th>最后检查</th>
+                                    <th>显示 <i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="是否对游客展示此网站"></i></th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="siteTableBody">
+                                <tr>
+                                    <td colspan="9" class="text-center">加载中...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- 移动端卡片视图 -->
+                    <div class="mobile-card-container" id="mobileAdminSiteContainer">
+                        <div class="text-center p-3">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">加载中...</span>
+                            </div>
+                            <div class="mt-2">加载网站数据中...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 分隔线 -->
+                <hr class="my-4">
+
+                <!-- Telegram 通知设置部分 -->
+                <div>
+                    <h5 class="card-title mb-3">
+                        <i class="bi bi-telegram me-2"></i>Telegram 通知设置
+                    </h5>
+
+
+
+                    <form id="telegramSettingsForm">
+                        <div class="mb-3">
+                            <label for="telegramBotToken" class="form-label">Bot Token</label>
+                            <input type="text" class="form-control" id="telegramBotToken" placeholder="请输入 Telegram Bot Token">
+                        </div>
+                        <div class="mb-3">
+                            <label for="telegramChatId" class="form-label">Chat ID</label>
+                            <input type="text" class="form-control" id="telegramChatId" placeholder="请输入接收通知的 Chat ID">
+                        </div>
+                        <div class="form-check mb-3">
+                            <input class="form-check-input" type="checkbox" id="enableTelegramNotifications">
+                            <label class="form-check-label" for="enableTelegramNotifications">
+                                启用通知
+                            </label>
+                        </div>
+                        <button type="button" id="saveTelegramSettingsBtn" class="btn btn-info">保存Telegram设置</button>
+                    </form>
+                </div>
+
+                <!-- 分隔线 -->
+                <hr class="my-4">
+
+                <!-- 背景设置部分 -->
+                <div>
+                    <h5 class="card-title mb-3">
+                        <i class="bi bi-image me-2"></i>背景设置
+                    </h5>
+
+
+
+                    <form id="backgroundSettingsForm">
+                        <div class="form-check mb-3">
+                            <input class="form-check-input" type="checkbox" id="enableCustomBackground">
+                            <label class="form-check-label" for="enableCustomBackground">
+                                启用自定义背景
+                            </label>
+                        </div>
+                        <div class="mb-3">
+                            <label for="backgroundImageUrl" class="form-label">背景图片URL</label>
+                            <input type="url" class="form-control" id="backgroundImageUrl" placeholder="请输入背景图片URL (必须以https://开头)">
+                            <div class="form-text">建议使用高质量图片，支持JPG、PNG格式</div>
+                        </div>
+                        <div class="mb-3">
+                            <label for="pageOpacity" class="form-label">页面透明度: <span id="opacityValue">80</span>%</label>
+                            <input type="range" class="form-range" id="pageOpacity" min="0" max="100" value="80" step="1">
+                            <div class="form-text">调整页面元素的透明度，数值越小越透明</div>
+                        </div>
+                        <button type="button" id="saveBackgroundSettingsBtn" class="btn btn-info">保存背景设置</button>
+                    </form>
                 </div>
             </div>
         </div>
     </div>
-
-    <!-- Website Monitoring Section -->
-    <div class="container mt-5">
-        <div class="admin-header-row mb-4"> <!-- 优化的标题行容器 -->
-            <div class="admin-header-title">
-                <h2 class="mb-0">网站监控管理</h2>
-            </div>
-            <div class="admin-header-content">
-                <!-- Action Buttons Group -->
-                <div class="admin-actions-group">
-                    <!-- Site Auto Sort Dropdown -->
-                    <div class="dropdown me-2">
-                        <button class="btn btn-outline-secondary dropdown-toggle" type="button" id="siteAutoSortDropdown" data-bs-toggle="dropdown" aria-expanded="false">
-                            <i class="bi bi-sort-alpha-down"></i> 自动排序
-                        </button>
-                        <ul class="dropdown-menu" aria-labelledby="siteAutoSortDropdown">
-                            <li><a class="dropdown-item active" href="#" onclick="autoSortSites('custom')">自定义排序</a></li>
-                            <li><a class="dropdown-item" href="#" onclick="autoSortSites('name')">按名称排序</a></li>
-                            <li><a class="dropdown-item" href="#" onclick="autoSortSites('url')">按URL排序</a></li>
-                            <li><a class="dropdown-item" href="#" onclick="autoSortSites('status')">按状态排序</a></li>
-                        </ul>
-                    </div>
-
-                    <button id="addSiteBtn" class="btn btn-success">
-                        <i class="bi bi-plus-circle"></i> 添加监控网站
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <div id="siteAlert" class="alert d-none"></div>
-
-        <div class="card">
-            <div class="card-body">
-                <!-- 桌面端表格视图 -->
-                <div class="table-responsive">
-                    <table class="table table-striped table-hover">
-                        <thead>
-                            <tr>
-                                <th>排序</th>
-                                <th>名称</th>
-                                <th>URL</th>
-                                <th>状态</th>
-                                <th>状态码</th>
-                                <th>响应时间 (ms)</th>
-                                <th>最后检查</th>
-                                <th>显示 <i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="是否对游客展示此网站"></i></th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="siteTableBody">
-                            <tr>
-                                <td colspan="9" class="text-center">加载中...</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-
-                <!-- 移动端卡片视图 -->
-                <div class="mobile-card-container" id="mobileAdminSiteContainer">
-                    <div class="text-center p-3">
-                        <div class="spinner-border text-primary" role="status">
-                            <span class="visually-hidden">加载中...</span>
-                        </div>
-                        <div class="mt-2">加载网站数据中...</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-    <!-- End Website Monitoring Section -->
-
-    <!-- Telegram Notification Settings Section -->
-    <div class="container mt-5">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <h2>Telegram 通知设置</h2>
-        </div>
-        <div id="telegramSettingsAlert" class="alert d-none"></div>
-        <div class="card">
-            <div class="card-body">
-                <form id="telegramSettingsForm">
-                    <div class="mb-3">
-                        <label for="telegramBotToken" class="form-label">Bot Token</label>
-                        <input type="text" class="form-control" id="telegramBotToken" placeholder="请输入 Telegram Bot Token">
-                    </div>
-                    <div class="mb-3">
-                        <label for="telegramChatId" class="form-label">Chat ID</label>
-                        <input type="text" class="form-control" id="telegramChatId" placeholder="请输入接收通知的 Chat ID">
-                    </div>
-                    <div class="form-check mb-3">
-                        <input class="form-check-input" type="checkbox" id="enableTelegramNotifications">
-                        <label class="form-check-label" for="enableTelegramNotifications">
-                            启用通知
-                        </label>
-                    </div>
-                    <button type="button" id="saveTelegramSettingsBtn" class="btn btn-info">保存Telegram设置</button>
-                </form>
-            </div>
-        </div>
-    </div>
-    <!-- End Telegram Notification Settings Section -->
 
     <!-- Global Settings Section (Now integrated above Server Management List) -->
     <!-- The form is now part of the header for Server Management -->
@@ -4029,7 +4721,7 @@ function getAdminHtml() {
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body">
-                    <div id="passwordAlert" class="alert d-none"></div>
+
                     <form id="passwordForm">
                         <div class="mb-3">
                             <label for="currentPassword" class="form-label">当前密码</label>
@@ -4053,19 +4745,49 @@ function getAdminHtml() {
         </div>
     </div>
 
-    <footer class="footer mt-5 py-3 bg-light">
+    <footer class="footer fixed-bottom py-2 bg-light border-top">
         <div class="container text-center">
-            <span class="text-muted">VPS监控面板 &copy; 2025</span>
+            <span class="text-muted small">VPS监控面板 &copy; 2025</span>
             <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
-                <i class="bi bi-github fs-5"></i>
+                <i class="bi bi-github"></i>
             </a>
         </div>
     </footer>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
     <script src="/js/admin.js"></script>
 </body>
 </html>`;
+}
+
+function getFaviconSvg() {
+  return `<svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="0.3" cy="0.3">
+      <stop offset="0%" stop-color="#fff" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#0277bd" stop-opacity="0.8"/>
+    </radialGradient>
+    <linearGradient id="ecg" x1="0%" x2="100%">
+      <stop offset="0%" stop-color="#f08"/>
+      <stop offset="50%" stop-color="#0f8"/>
+      <stop offset="100%" stop-color="#80f"/>
+    </linearGradient>
+  </defs>
+  <circle cx="16" cy="16" r="15" fill="url(#bg)" stroke="#0277bd" stroke-width="1.5"/>
+  <circle cx="16" cy="16" r="13" fill="none" stroke="#fff" stroke-width="1" opacity="0.4"/>
+  <line x1="4" y1="16" x2="28" y2="16" stroke="#b3e5fc" stroke-width="0.5" opacity="0.8"/>
+  <path id="p" d="M4 16L8 16L9 15L10 17L11 14L12 18L13 10L14 22L15 16L28 16" fill="none" stroke="url(#ecg)" stroke-width="2.8"/>
+  <path d="M4 16L8 16L9 15L10 17L11 14L12 18L13 10L14 22L15 16L28 16" fill="none" stroke="#fff" stroke-width="1.2" opacity="0.7"/>
+  <circle r="1.5" fill="#fff">
+    <animateMotion dur="2s" repeatCount="indefinite">
+      <mpath href="#p"/>
+    </animateMotion>
+  </circle>
+  <circle cx="16" cy="16" r="8" fill="none" stroke="#f08" stroke-width="0.5" opacity="0.6">
+    <animate attributeName="r" values="8;12;8" dur="3s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.6;0;0.6" dur="3s" repeatCount="indefinite"/>
+  </circle>
+</svg>`;
 }
 
 function getStyleCss() {
@@ -4171,10 +4893,19 @@ body {
         margin: 0;
     }
 
-    /* 移动端导航栏下拉菜单优化 */
-    .navbar .dropdown-menu {
+    /* 移动端导航栏下拉菜单优化 - 精简版 */
+    .dropdown-menu {
         font-size: 0.875rem;
         min-width: 150px;
+        z-index: 10000 !important; /* 统一使用最高层级 */
+        position: absolute !important; /* 使用absolute定位确保正确显示 */
+        /* 移除position: fixed，让Bootstrap自动处理定位 */
+    }
+
+    /* 确保导航栏有合适的层级但不创建层叠上下文 */
+    .navbar {
+        position: relative;
+        z-index: 1000; /* 给导航栏一个中等层级 */
     }
 
     .navbar .dropdown-item {
@@ -4190,7 +4921,7 @@ body {
     .admin-header-row {
         display: flex;
         flex-direction: column;
-        gap: 1rem;
+        gap: 0.75rem; /* 减少移动端间隔 */
     }
 
     .admin-header-title h2 {
@@ -4201,7 +4932,7 @@ body {
     .admin-header-content {
         display: flex;
         flex-direction: column;
-        gap: 0.75rem;
+        gap: 0.5rem; /* 减少移动端间隔 */
     }
 
     .admin-settings-form {
@@ -4277,7 +5008,7 @@ body {
         justify-content: space-between;
         align-items: flex-start;
         flex-wrap: wrap;
-        gap: 1rem;
+        gap: 0.75rem; /* 减少桌面端间隔 */
     }
 
     .admin-header-title {
@@ -4318,9 +5049,100 @@ body {
     }
 }
 
+/* 单一卡片布局样式 */
+.card.shadow-sm {
+    border: none;
+    box-shadow: 0 0.125rem 0.5rem rgba(0, 0, 0, 0.1) !important;
+}
+
+.card-title {
+    color: var(--bs-primary);
+    font-weight: 600;
+}
+
+.card-title i {
+    color: var(--bs-primary);
+}
+
+/* 分隔线样式 */
+hr.my-4 {
+    border-color: var(--bs-border-color-translucent);
+    opacity: 0.5;
+}
+
+/* 暗色主题下的单一卡片样式 */
+[data-bs-theme="dark"] .card.shadow-sm {
+    background-color: var(--bs-dark);
+    box-shadow: 0 0.125rem 0.5rem rgba(0, 0, 0, 0.3) !important;
+}
+
+[data-bs-theme="dark"] .card-title {
+    color: #86b7fe;
+}
+
+[data-bs-theme="dark"] .card-title i {
+    color: #86b7fe;
+}
+
+/* VPS监控面板标题 - 蓝色加粗 */
+.navbar-brand {
+    color: var(--bs-primary) !important;
+    font-weight: 600 !important;
+}
+[data-bs-theme="dark"] .navbar-brand {
+    color: #86b7fe !important;
+}
+
+/* 导航栏主题跟随 - 精简版 */
+[data-bs-theme="light"] .navbar { background-color: #f8f9fa !important; }
+[data-bs-theme="dark"] .navbar { background-color: #212529 !important; }
+
+/* 导航栏文字主题跟随 */
+[data-bs-theme="light"] .navbar .nav-link, [data-bs-theme="light"] .navbar a { color: #212529 !important; }
+[data-bs-theme="dark"] .navbar .nav-link, [data-bs-theme="dark"] .navbar a { color: #ffffff !important; }
+
+/* 导航栏按钮主题跟随 */
+[data-bs-theme="light"] .navbar .btn-outline-light { border-color: #212529 !important; color: #212529 !important; }
+[data-bs-theme="dark"] .navbar .btn-outline-light { border-color: #ffffff !important; color: #ffffff !important; }
+
+/* 导航栏图标主题跟随 */
+[data-bs-theme="light"] .navbar i { color: #212529 !important; }
+[data-bs-theme="dark"] .navbar i { color: #ffffff !important; }
+
+/* 底部版权信息 - 主题跟随调大 */
+.footer .text-muted { font-size: 0.95rem !important; font-weight: 500; }
+.footer a.text-muted { font-size: 1.1rem !important; }
+.footer .text-muted { color: #212529 !important; }
+[data-bs-theme="dark"] .footer .text-muted { color: #ffffff !important; }
+
+[data-bs-theme="dark"] hr.my-4 {
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+/* 固定底部页脚样式 */
+body {
+    padding-bottom: 60px; /* 为固定页脚留出空间 */
+}
+
+.footer.fixed-bottom {
+    height: 35px;
+    background-color: var(--bs-light) !important;
+    border-top: 1px solid var(--bs-border-color);
+    display: flex;
+    align-items: center;
+}
+
+/* 暗色主题下的页脚 */
+[data-bs-theme="dark"] .footer.fixed-bottom {
+    background-color: var(--bs-dark) !important;
+    border-top-color: var(--bs-border-color);
+}
+
 /* 移动端卡片样式 */
 .mobile-card-container {
     display: none; /* 默认隐藏，通过媒体查询控制 */
+    position: relative;
+    z-index: 0; /* 降低容器层级，确保下拉菜单在上方 */
 }
 
 .mobile-server-card, .mobile-site-card {
@@ -4331,12 +5153,13 @@ body {
     box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
     overflow: hidden;
     transition: box-shadow 0.15s ease-in-out, transform 0.15s ease-in-out;
+    position: relative;
+    z-index: 0; /* 降低卡片层级，确保下拉菜单在上方 */
 }
 
 @media (max-width: 768px) {
     .mobile-server-card:hover, .mobile-site-card:hover {
         box-shadow: 0 0.25rem 0.5rem rgba(0, 0, 0, 0.1);
-        transform: translateY(-1px);
     }
 }
 
@@ -4347,6 +5170,8 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    position: relative;
+    z-index: 0; /* 降低卡片头部层级，确保下拉菜单在上方 */
 }
 
 .mobile-card-header-left {
@@ -4501,15 +5326,20 @@ body {
 
 /* 移动端历史记录条优化 */
 @media (max-width: 768px) {
-    .history-bar-container {
+    .mobile-history-container .history-bar-container {
         height: 1.5rem;
         border-radius: 0.25rem;
         overflow: hidden;
+        display: flex;
+        width: 100%;
+        gap: 1px;
     }
 
-    .history-bar {
-        min-width: 2px;
-        border-radius: 0;
+    .mobile-history-container .history-bar {
+        flex: 1;
+        min-width: 0;
+        border-radius: 1px;
+        height: 100%;
     }
 }
 
@@ -4546,11 +5376,10 @@ body {
     /* 移动端触摸反馈 */
     .mobile-card-header:active {
         background-color: var(--bs-card-cap-bg, rgba(0,0,0,.08)) !important;
-        transform: scale(0.98);
     }
 
     .mobile-card-body .btn:active {
-        transform: scale(0.95);
+        opacity: 0.8;
     }
 
     /* 移动端容器标题优化 */
@@ -4581,6 +5410,8 @@ body {
     .admin-actions-group .dropdown-toggle {
         min-width: auto;
     }
+
+
 
     /* 移动端卡片间距优化 */
     .mobile-server-card, .mobile-site-card {
@@ -4679,7 +5510,7 @@ body {
              background-color: rgba(255, 255, 255, 0.05); /* 深色模式下的条纹 */
              color: #e0e0e0;
         }
-        
+
         .table-hover > tbody > tr:hover > * {
             background-color: rgba(255, 255, 255, 0.075); /* 深色模式下的悬停 */
             color: #f0f0f0;
@@ -4694,7 +5525,7 @@ body {
         .modal-header {
             border-bottom-color: #333;
         }
-        
+
         .modal-footer {
             border-top-color: #333;
         }
@@ -4711,7 +5542,7 @@ body {
             border-color: #555;
             box-shadow: 0 0 0 0.25rem rgba(100, 100, 100, 0.25);
         }
-        
+
         .btn-outline-secondary {
              color: #adb5bd;
              border-color: #6c757d;
@@ -4917,7 +5748,7 @@ body {
             background-color: rgba(220, 53, 69, 0.85) !important; /* Darker semi-transparent danger */
             border-color: rgba(187, 45, 59, 0.85) !important;
         }
-        
+
         [data-bs-theme="dark"] #serverAlert.alert-warning,
         [data-bs-theme="dark"] #siteAlert.alert-warning,
         [data-bs-theme="dark"] #telegramSettingsAlert.alert-warning {
@@ -4964,6 +5795,524 @@ body {
     border-bottom: 3px solid #0d6efd !important;
     background-color: rgba(13, 110, 253, 0.2) !important;
 }
+
+/* ==================== 自定义背景和透明度控制系统 ==================== */
+
+/* CSS变量定义 */
+:root {
+    --custom-background-url: '';
+    --page-opacity: 0.8;
+    --text-contrast-light: rgba(0, 0, 0, 0.87);
+    --text-contrast-dark: rgba(255, 255, 255, 0.87);
+    --background-overlay-light: rgba(255, 255, 255, 0.9);
+    --background-overlay-dark: rgba(18, 18, 18, 0.9);
+}
+
+/* 背景图片显示 */
+body.custom-background-enabled::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-image: var(--custom-background-url);
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    z-index: -1;
+    opacity: 1;
+}
+
+/* 启用自定义背景时的页面元素透明度调整 */
+body.custom-background-enabled .navbar {
+    background-color: rgba(248, 249, 250, var(--page-opacity)) !important;
+    /* 移除导航栏的backdrop-filter，避免影响下拉菜单层级 */
+    /* backdrop-filter: blur(10px); */
+    /* -webkit-backdrop-filter: blur(10px); */
+}
+
+body.custom-background-enabled .card {
+    background-color: rgba(255, 255, 255, var(--page-opacity)) !important;
+    /* 移除大卡片的backdrop-filter，避免创建层叠上下文影响下拉菜单 */
+    /* backdrop-filter: blur(5px); */
+    /* -webkit-backdrop-filter: blur(5px); */
+    border: 1px solid rgba(0, 0, 0, 0.125);
+}
+
+body.custom-background-enabled .card-header {
+    background-color: rgba(0, 0, 0, calc(0.03 * var(--page-opacity))) !important;
+    border-bottom: 1px solid rgba(0, 0, 0, calc(0.125 * var(--page-opacity)));
+}
+
+body.custom-background-enabled .modal-content {
+    background-color: rgba(255, 255, 255, var(--page-opacity)) !important;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+body.custom-background-enabled .footer {
+    background-color: rgba(248, 249, 250, var(--page-opacity)) !important;
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+}
+
+/* 表格透明度调整 - 避免与卡片背景叠加 */
+body.custom-background-enabled .table {
+    background-color: transparent !important;
+}
+
+body.custom-background-enabled .table th {
+    background-color: transparent !important;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
+
+body.custom-background-enabled .table td {
+    background-color: transparent !important;
+}
+
+/* 输入框完全透明化 - 方案A */
+body.custom-background-enabled .form-control {
+    background-color: transparent !important;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    border: 1px solid rgba(0, 0, 0, 0.15) !important;
+}
+
+body.custom-background-enabled .form-control:focus {
+    background-color: transparent !important;
+    border: 1px solid rgba(13, 110, 253, 0.6) !important;
+    box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.15) !important;
+}
+
+/* 按钮透明度调整 */
+body.custom-background-enabled .btn {
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+}
+
+/* 滑块完全透明化 - 完整重置 */
+body.custom-background-enabled .form-range {
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    background: transparent !important;
+    outline: none !important;
+}
+
+/* WebKit浏览器 (Chrome, Safari) */
+body.custom-background-enabled .form-range::-webkit-slider-track {
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    background: transparent !important;
+    border: 1px solid rgba(0, 0, 0, 0.15) !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+    box-shadow: none !important;
+    outline: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+
+body.custom-background-enabled .form-range::-webkit-slider-runnable-track {
+    -webkit-appearance: none !important;
+    background: transparent !important;
+    border: 1px solid rgba(0, 0, 0, 0.15) !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+    box-shadow: none !important;
+}
+
+/* Firefox */
+body.custom-background-enabled .form-range::-moz-range-track {
+    background: transparent !important;
+    border: 1px solid rgba(0, 0, 0, 0.15) !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+
+body.custom-background-enabled .form-range::-moz-range-progress {
+    background: transparent !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+}
+
+/* 滑块按钮 - 垂直居中对齐 */
+body.custom-background-enabled .form-range::-webkit-slider-thumb {
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    background-color: rgba(13, 110, 253, 0.8) !important;
+    border: 1px solid rgba(0, 0, 0, 0.1) !important;
+    width: 20px !important;
+    height: 20px !important;
+    border-radius: 50% !important;
+    cursor: pointer !important;
+    margin-top: -7px !important;
+    box-sizing: border-box !important;
+}
+
+body.custom-background-enabled .form-range::-moz-range-thumb {
+    background-color: rgba(13, 110, 253, 0.8) !important;
+    border: 1px solid rgba(0, 0, 0, 0.1) !important;
+    width: 20px !important;
+    height: 20px !important;
+    border-radius: 50% !important;
+    cursor: pointer !important;
+    box-shadow: none !important;
+    margin-top: -8px !important;
+    box-sizing: border-box !important;
+}
+
+/* 下拉菜单透明度调整 - 确保最高层级显示 */
+body.custom-background-enabled .dropdown-menu {
+    background-color: rgba(255, 255, 255, var(--page-opacity)) !important;
+    /* 移除backdrop-filter避免创建层叠上下文，确保z-index正常工作 */
+    /* backdrop-filter: blur(5px); */
+    /* -webkit-backdrop-filter: blur(5px); */
+}
+
+/* 移动端卡片透明度调整 - 移除backdrop-filter避免创建层叠上下文 */
+body.custom-background-enabled .mobile-server-card,
+body.custom-background-enabled .mobile-site-card {
+    background-color: rgba(255, 255, 255, var(--page-opacity)) !important;
+    /* backdrop-filter: blur(5px); 注释掉以避免创建层叠上下文遮挡下拉菜单 */
+    /* -webkit-backdrop-filter: blur(5px); */
+}
+
+body.custom-background-enabled .mobile-card-header {
+    background-color: rgba(0, 0, 0, calc(0.03 * var(--page-opacity))) !important;
+}
+
+/* 表格条纹和悬停效果 - 轻微背景色，不叠加透明度 */
+body.custom-background-enabled .table-striped > tbody > tr:nth-of-type(odd) > * {
+    background-color: rgba(0, 0, 0, 0.02) !important;
+}
+
+body.custom-background-enabled .table-hover > tbody > tr:hover > * {
+    background-color: rgba(0, 0, 0, 0.04) !important;
+}
+
+/* 暗色主题下的自定义背景样式 */
+[data-bs-theme="dark"] body.custom-background-enabled .navbar {
+    background-color: rgba(30, 30, 30, var(--page-opacity)) !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .card {
+    background-color: rgba(30, 30, 30, var(--page-opacity)) !important;
+    border-color: rgba(51, 51, 51, var(--page-opacity));
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .card-header {
+    background-color: rgba(42, 42, 42, var(--page-opacity)) !important;
+    border-bottom-color: rgba(51, 51, 51, var(--page-opacity));
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .modal-content {
+    background-color: rgba(30, 30, 30, var(--page-opacity)) !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .footer {
+    background-color: rgba(30, 30, 30, var(--page-opacity)) !important;
+}
+
+/* 暗色主题下的表格透明度调整 - 避免与卡片背景叠加 */
+[data-bs-theme="dark"] body.custom-background-enabled .table {
+    background-color: transparent !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .table th {
+    background-color: transparent !important;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .table td {
+    background-color: transparent !important;
+}
+
+/* 暗色主题下的输入框完全透明化 - 方案A */
+[data-bs-theme="dark"] body.custom-background-enabled .form-control {
+    background-color: transparent !important;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+    color: rgba(255, 255, 255, 0.9) !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .form-control:focus {
+    background-color: transparent !important;
+    border: 1px solid rgba(13, 110, 253, 0.6) !important;
+    box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.15) !important;
+}
+
+/* 暗色主题下的下拉菜单透明度调整 - 移除backdrop-filter */
+[data-bs-theme="dark"] body.custom-background-enabled .dropdown-menu {
+    background-color: rgba(30, 30, 30, var(--page-opacity)) !important;
+    /* 移除backdrop-filter避免创建层叠上下文，确保z-index正常工作 */
+    /* backdrop-filter: blur(5px); */
+    /* -webkit-backdrop-filter: blur(5px); */
+}
+
+/* 暗色主题下的滑块完全透明化 - 完整重置 */
+[data-bs-theme="dark"] body.custom-background-enabled .form-range {
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    background: transparent !important;
+    outline: none !important;
+}
+
+/* WebKit浏览器 (Chrome, Safari) - 暗色主题 */
+[data-bs-theme="dark"] body.custom-background-enabled .form-range::-webkit-slider-track {
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    background: transparent !important;
+    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .form-range::-webkit-slider-runnable-track {
+    -webkit-appearance: none !important;
+    background: transparent !important;
+    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+    box-shadow: none !important;
+}
+
+/* Firefox - 暗色主题 */
+[data-bs-theme="dark"] body.custom-background-enabled .form-range::-moz-range-track {
+    background: transparent !important;
+    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .form-range::-moz-range-progress {
+    background: transparent !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+}
+
+/* 滑块按钮 - 暗色主题 - 垂直居中对齐 */
+[data-bs-theme="dark"] body.custom-background-enabled .form-range::-webkit-slider-thumb {
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    background-color: rgba(13, 110, 253, 0.9) !important;
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    width: 20px !important;
+    height: 20px !important;
+    border-radius: 50% !important;
+    cursor: pointer !important;
+    margin-top: -7px !important;
+    box-sizing: border-box !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .form-range::-moz-range-thumb {
+    background-color: rgba(13, 110, 253, 0.9) !important;
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    width: 20px !important;
+    height: 20px !important;
+    border-radius: 50% !important;
+    cursor: pointer !important;
+    box-shadow: none !important;
+    margin-top: -8px !important;
+    box-sizing: border-box !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .mobile-server-card,
+[data-bs-theme="dark"] body.custom-background-enabled .mobile-site-card {
+    background-color: rgba(33, 37, 41, var(--page-opacity)) !important;
+    border-color: rgba(73, 80, 87, var(--page-opacity));
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .mobile-card-header {
+    background-color: rgba(255, 255, 255, calc(0.05 * var(--page-opacity))) !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .table-striped > tbody > tr:nth-of-type(odd) > * {
+    background-color: rgba(255, 255, 255, 0.03) !important;
+}
+
+[data-bs-theme="dark"] body.custom-background-enabled .table-hover > tbody > tr:hover > * {
+    background-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+
+
+
+
+/* 警告框透明度调整 */
+body.custom-background-enabled #serverAlert,
+body.custom-background-enabled #siteAlert,
+body.custom-background-enabled #telegramSettingsAlert,
+body.custom-background-enabled #backgroundSettingsAlert {
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.3);
+}
+
+/* ==================== 文字描边渲染系统 ==================== */
+
+/* 文字加粗系统 - 精简版 */
+p, div, span:not(.badge), td, th, .btn, button, a:not(.navbar-brand),
+.form-control, .form-select, .form-check-label, input, textarea,
+.card-header, .card-title, .card-body, .modal-content, .modal-title, .dropdown-menu,
+.progress span, .alert, .breadcrumb, .list-group-item {
+    font-weight: 500;
+}
+
+/* 统一Toast弹窗系统 */
+.toast-container {
+    position: fixed;
+    top: 15%;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10000; /* 确保在所有元素之上，包括模态框 */
+    pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.unified-toast {
+    pointer-events: auto;
+    min-width: 120px;
+    max-width: 90vw;
+    padding: 16px 50px 16px 24px;
+    margin-bottom: 12px;
+    border-radius: 12px;
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    font-weight: 500;
+    font-size: 15px;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    animation: toastIn 0.3s ease;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+.unified-toast.hiding {
+    animation: toastOut 0.3s ease;
+    opacity: 0;
+}
+
+.unified-toast.success {
+    background: linear-gradient(135deg,
+        rgba(34, 197, 94, calc(0.7 * var(--page-opacity, 0.8))),
+        rgba(22, 163, 74, calc(0.7 * var(--page-opacity, 0.8))));
+    color: white;
+    border-color: rgba(34, 197, 94, calc(0.4 * var(--page-opacity, 0.8)));
+}
+
+.unified-toast.danger {
+    background: linear-gradient(135deg,
+        rgba(239, 68, 68, calc(0.7 * var(--page-opacity, 0.8))),
+        rgba(220, 38, 38, calc(0.7 * var(--page-opacity, 0.8))));
+    color: white;
+    border-color: rgba(239, 68, 68, calc(0.4 * var(--page-opacity, 0.8)));
+}
+
+.unified-toast.warning {
+    background: linear-gradient(135deg,
+        rgba(245, 158, 11, calc(0.7 * var(--page-opacity, 0.8))),
+        rgba(217, 119, 6, calc(0.7 * var(--page-opacity, 0.8))));
+    color: white;
+    border-color: rgba(245, 158, 11, calc(0.4 * var(--page-opacity, 0.8)));
+}
+
+.unified-toast.info {
+    background: linear-gradient(135deg,
+        rgba(59, 130, 246, calc(0.7 * var(--page-opacity, 0.8))),
+        rgba(37, 99, 235, calc(0.7 * var(--page-opacity, 0.8))));
+    color: white;
+    border-color: rgba(59, 130, 246, calc(0.4 * var(--page-opacity, 0.8)));
+}
+
+.toast-icon {
+    margin-right: 8px;
+    font-size: 16px;
+    flex-shrink: 0;
+}
+
+.toast-content {
+    flex: 1;
+    line-height: 1.4;
+}
+
+.toast-close {
+    position: absolute;
+    top: 50%;
+    right: 12px;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 50%;
+    width: 28px;
+    height: 28px;
+}
+
+.toast-close:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.toast-progress {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 0 0 12px 12px;
+    animation: progressBar 5s linear;
+}
+
+@keyframes toastIn {
+    from { opacity: 0; transform: translateY(-20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes toastOut {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+@keyframes progressBar {
+    from { width: 100%; }
+    to { width: 0%; }
+}
+
+[data-bs-theme="dark"] .unified-toast {
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* 自定义导航栏高度 */
+.navbar {
+    --bs-navbar-padding-y: 0.375rem;
+    min-height: 50px;
+    height: 50px;
+}
+
+.navbar-brand {
+    padding-top: 0.3125rem;
+    padding-bottom: 0.3125rem;
+    line-height: 1.25;
+}
+
+
 `;
 }
 
@@ -4974,6 +6323,7 @@ function getMainJs() {
 let vpsUpdateInterval = null;
 let siteUpdateInterval = null;
 let serverDataCache = {}; // Cache server data to avoid re-fetching for details
+let vpsStatusCache = {}; // 用于跟踪VPS状态变化
 const DEFAULT_VPS_REFRESH_INTERVAL_MS = 60000; // Default to 60 seconds for VPS data if backend setting fails
 const DEFAULT_SITE_REFRESH_INTERVAL_MS = 60000; // Default to 60 seconds for Site data
 
@@ -4987,6 +6337,69 @@ function getAuthHeaders() {
         headers['Authorization'] = 'Bearer ' + token;
     }
     return headers;
+}
+
+// ==================== VPS状态变化检测 ====================
+
+// 检测VPS状态变化并发送通知
+async function checkVpsStatusChanges(allStatuses) {
+    for (const data of allStatuses) {
+        const serverId = data.server.id;
+        const serverName = data.server.name;
+        const currentStatus = determineVpsStatus(data);
+        const previousStatus = vpsStatusCache[serverId];
+
+        // 首次加载或状态变化时检测
+        if (previousStatus === undefined || previousStatus !== currentStatus) {
+                        if (currentStatus === 'offline') {
+                await notifyVpsOffline(serverId, serverName);
+            } else if (currentStatus === 'online' && previousStatus === 'offline') {
+                await notifyVpsRecovery(serverId, serverName);
+            }
+        }
+
+        vpsStatusCache[serverId] = currentStatus;
+    }
+}
+
+// 判断VPS状态
+function determineVpsStatus(data) {
+    if (data.error) return 'error';
+    if (!data.metrics) return 'unknown';
+
+    const now = new Date();
+    const lastReportTime = new Date(data.metrics.timestamp * 1000);
+    const diffMinutes = (now - lastReportTime) / (1000 * 60);
+
+    return diffMinutes <= 5 ? 'online' : 'offline';
+}
+
+// 发送VPS离线通知
+async function notifyVpsOffline(serverId, serverName) {
+    try {
+        // 使用完整URL
+        const baseUrl = window.location.origin;
+        await fetch(baseUrl + '/api/notify/offline', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ serverId, serverName })
+        });
+            } catch (error) {
+            }
+}
+
+// 发送VPS恢复通知
+async function notifyVpsRecovery(serverId, serverName) {
+    try {
+        // 使用完整URL
+        const baseUrl = window.location.origin;
+        await fetch(baseUrl + '/api/notify/recovery', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ serverId, serverName })
+        });
+            } catch (error) {
+            }
 }
 
 // 统一API请求函数（用于需要认证的请求）
@@ -5015,8 +6428,7 @@ async function apiRequest(url, options = {}) {
 
         return await response.json();
     } catch (error) {
-        console.error(\`API请求错误 [\${url}]:\`, error);
-        throw error;
+                throw error;
     }
 }
 
@@ -5037,8 +6449,7 @@ async function publicApiRequest(url, options = {}) {
 
         return await response.json();
     } catch (error) {
-        console.error(\`公开API请求错误 [\${url}]:\`, error);
-        throw error;
+                throw error;
     }
 }
 
@@ -5055,8 +6466,7 @@ function showError(message, containerId = null) {
 
 // 显示成功消息
 function showSuccess(message, containerId = null) {
-    console.log('成功:', message);
-    if (containerId) {
+        if (containerId) {
         const container = document.getElementById(containerId);
         if (container) {
             container.innerHTML = \`<div class="alert alert-success">\${message}</div>\`;
@@ -5066,73 +6476,58 @@ function showSuccess(message, containerId = null) {
 
 // Function to fetch VPS refresh interval and start periodic VPS data updates
 async function initializeVpsDataUpdates() {
-    console.log('initializeVpsDataUpdates() called');
-    let vpsRefreshIntervalMs = DEFAULT_VPS_REFRESH_INTERVAL_MS;
+        let vpsRefreshIntervalMs = DEFAULT_VPS_REFRESH_INTERVAL_MS;
 
     try {
-        console.log('Fetching VPS refresh interval from API...');
-        const data = await publicApiRequest('/api/admin/settings/vps-report-interval');
-        console.log('API response data:', data);
-
-        if (data && typeof data.interval === 'number' && data.interval > 0) {
+                const data = await publicApiRequest('/api/admin/settings/vps-report-interval');
+                if (data && typeof data.interval === 'number' && data.interval > 0) {
             vpsRefreshIntervalMs = data.interval * 1000; // Convert seconds to milliseconds
-            console.log(\`Using backend-defined VPS refresh interval: \${data.interval}s (\${vpsRefreshIntervalMs}ms)\`);
-        } else {
-            console.warn('Invalid VPS interval from backend, using default:', data);
+                    } else {
+            // 使用默认值
         }
     } catch (error) {
-        console.error('Error fetching VPS refresh interval, using default:', error);
-    }
+            }
 
     // Clear existing interval if any
     if (vpsUpdateInterval) {
-        console.log('Clearing existing VPS update interval');
-        clearInterval(vpsUpdateInterval);
+                clearInterval(vpsUpdateInterval);
     }
 
-    // Set up new periodic updates for VPS data ONLY
-    console.log('Setting up new VPS update interval with', vpsRefreshIntervalMs, 'ms');
-    vpsUpdateInterval = setInterval(() => {
-        console.log('VPS data refresh triggered by interval');
-        loadAllServerStatuses();
+    // VPS数据跟随后台设置频率刷新
+        vpsUpdateInterval = setInterval(() => {
+                loadAllServerStatuses();
     }, vpsRefreshIntervalMs);
 
-    console.log(\`VPS data will refresh every \${vpsRefreshIntervalMs / 1000} seconds. Interval ID: \${vpsUpdateInterval}\`);
-}
+    }
 
-// Function to start periodic site status updates
+// 优化：网站状态每小时刷新一次
 function initializeSiteDataUpdates() {
-    const siteRefreshIntervalMs = DEFAULT_SITE_REFRESH_INTERVAL_MS; // Using a fixed interval for sites
-
-    // Clear existing interval if any
+    const hourlyRefreshInterval = 60 * 60 * 1000; // 1小时
+        // 清除任何现有的自动刷新间隔
     if (siteUpdateInterval) {
         clearInterval(siteUpdateInterval);
     }
 
-    // Set up new periodic updates for site statuses ONLY
+    // 设置每小时刷新一次
     siteUpdateInterval = setInterval(() => {
-        loadAllSiteStatuses();
-    }, siteRefreshIntervalMs);
+                loadAllSiteStatuses();
+    }, hourlyRefreshInterval);
 
-    console.log(\`Site status data will refresh every \${siteRefreshIntervalMs / 1000} seconds.\`);
-}
+    }
+
+// 移除手动刷新按钮相关代码，改为自动刷新
 
 // Execute after the page loads (only for main page)
 document.addEventListener('DOMContentLoaded', function() {
-    console.log('DOMContentLoaded event fired');
-
-    // Check if we're on the main page by looking for the server table
+        // Check if we're on the main page by looking for the server table
     const serverTableBody = document.getElementById('serverTableBody');
     if (!serverTableBody) {
         // Not on the main page, only initialize theme
-        console.log('Not on main page, only initializing theme');
-        initializeTheme();
+                initializeTheme();
         return;
     }
 
-    console.log('On main page, initializing all features');
-
-    // Initialize theme
+        // Initialize theme
     initializeTheme();
 
     // Load initial data
@@ -5140,10 +6535,8 @@ document.addEventListener('DOMContentLoaded', function() {
     loadAllSiteStatuses();
 
     // Initialize periodic updates separately
-    console.log('Initializing VPS data updates...');
-    initializeVpsDataUpdates();
-    console.log('Initializing site data updates...');
-    initializeSiteDataUpdates();
+        initializeVpsDataUpdates();
+        initializeSiteDataUpdates();
 
     // Add click event listener to the table body for row expansion
     serverTableBody.addEventListener('click', handleRowClick);
@@ -5153,7 +6546,7 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // --- Theme Management ---
-const THEME_KEY = 'themePreference';
+const THEME_KEY = 'vps-monitor-theme';
 const LIGHT_THEME = 'light';
 const DARK_THEME = 'dark';
 
@@ -5213,8 +6606,7 @@ async function updateAdminLink() {
             localStorage.removeItem('auth_token'); // Clean up invalid token
         }
     } catch (error) {
-        console.error('Error checking auth status for navbar link:', error);
-        // Network error, assume not logged in
+                // Network error, assume not logged in
         adminLink.textContent = '管理员登录';
         adminLink.href = '/login.html';
     }
@@ -5304,25 +6696,22 @@ function populateDetailsRow(serverId, detailsRow) {
 
 // Load all server statuses
 async function loadAllServerStatuses() {
-    console.log('loadAllServerStatuses() called at', new Date().toLocaleTimeString());
-    try {
-        // 1. Get server list (with optional authentication for admin users)
-        let serversData;
         try {
-            serversData = await publicApiRequest('/api/servers');
+        // 使用批量API一次性获取所有VPS状态
+        let batchData;
+        try {
+            batchData = await publicApiRequest('/api/status/batch');
         } catch (error) {
-            // 如果获取服务器列表失败，可能是数据库未初始化，尝试初始化
-            console.log('服务器列表获取失败，尝试初始化数据库...');
-            await publicApiRequest('/api/init-db');
-            serversData = await publicApiRequest('/api/servers');
+            // 如果批量API失败，可能是数据库未初始化，尝试初始化
+                        await publicApiRequest('/api/init-db');
+            batchData = await publicApiRequest('/api/status/batch');
         }
-        const servers = serversData.servers || [];
-        console.log('Found', servers.length, 'servers');
 
-        const noServersAlert = document.getElementById('noServers');
+        const allStatuses = batchData.servers || [];
+                const noServersAlert = document.getElementById('noServers');
         const serverTableBody = document.getElementById('serverTableBody');
 
-        if (servers.length === 0) {
+        if (allStatuses.length === 0) {
             noServersAlert.classList.remove('d-none');
             serverTableBody.innerHTML = '<tr><td colspan="11" class="text-center">No server data available. Please log in to the admin panel to add servers.</td></tr>';
             // Remove any existing detail rows if the server list becomes empty
@@ -5334,33 +6723,23 @@ async function loadAllServerStatuses() {
             noServersAlert.classList.add('d-none');
         }
 
-        // 2. Fetch status for all servers in parallel
-        const statusPromises = servers.map(server =>
-            publicApiRequest(\`/api/status/\${server.id}\`)
-                .then(data => data)
-                .catch(() => ({ server: server, metrics: null, error: true }))
-        );
-
-        const allStatuses = await Promise.all(statusPromises);
-
         // Update the serverDataCache with the latest data
         allStatuses.forEach(data => {
              serverDataCache[data.server.id] = data;
         });
 
+        // 检测VPS状态变化并发送通知
+        await checkVpsStatusChanges(allStatuses);
+
         // 3. Render the table using DOM manipulation
         renderServerTable(allStatuses);
 
     } catch (error) {
-        console.error('Error loading server statuses:', error);
-        const serverTableBody = document.getElementById('serverTableBody');
+                const serverTableBody = document.getElementById('serverTableBody');
         serverTableBody.innerHTML = '<tr><td colspan="11" class="text-center text-danger">Failed to load server data. Please refresh the page.</td></tr>';
         removeAllDetailRows();
         // 同时更新移动端卡片容器显示错误状态
-        const mobileContainer = document.getElementById('mobileServerContainer');
-        if (mobileContainer) {
-            mobileContainer.innerHTML = '<div class="text-center p-3 text-danger">加载服务器数据失败，请刷新页面重试。</div>';
-        }
+        showToast('danger', '加载服务器数据失败，请刷新页面重试');
     }
 }
 
@@ -5406,15 +6785,6 @@ function getServerStatusBadge(status) {
         return { class: 'bg-secondary', text: '未知' };
     }
 }
-
-function formatBytes(bytes) {
-    if (typeof bytes !== 'number' || isNaN(bytes)) return '-';
-    if (bytes < 1024) return \`\${bytes.toFixed(1)} B\`;
-    if (bytes < 1024 * 1024) return \`\${(bytes / 1024).toFixed(1)} KB\`;
-    if (bytes < 1024 * 1024 * 1024) return \`\${(bytes / (1024 * 1024)).toFixed(1)} MB\`;
-    return \`\${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB\`;
-}
-
 
 
 // 移动端服务器卡片渲染函数
@@ -5472,8 +6842,11 @@ function renderMobileServerCards(allStatuses) {
         const cardHeader = document.createElement('div');
         cardHeader.className = 'mobile-card-header';
         cardHeader.innerHTML = \`
-            <h6 class="mobile-card-title">\${serverName || '未命名服务器'}</h6>
-            <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+            <div style="flex: 1;"></div>
+            <h6 class="mobile-card-title text-center" style="flex: 1;">\${serverName || '未命名服务器'}</h6>
+            <div style="flex: 1; display: flex; justify-content: flex-end;">
+                <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+            </div>
         \`;
 
         // 卡片主体 - 显示所有信息
@@ -5554,8 +6927,7 @@ function renderMobileServerCards(allStatuses) {
         const lastUpdateRow = document.createElement('div');
         lastUpdateRow.className = 'mobile-card-row';
         lastUpdateRow.innerHTML = \`
-            <span class="mobile-card-label">最后更新</span>
-            <span class="mobile-card-value">\${lastUpdate}</span>
+            <span class="mobile-card-label">最后更新: \${lastUpdate}</span>
         \`;
         cardBody.appendChild(lastUpdateRow);
 
@@ -5599,8 +6971,11 @@ function renderMobileSiteCards(sites) {
         const cardHeader = document.createElement('div');
         cardHeader.className = 'mobile-card-header';
         cardHeader.innerHTML = \`
-            <h6 class="mobile-card-title">\${site.name || '未命名网站'}</h6>
-            <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+            <div style="flex: 1;"></div>
+            <h6 class="mobile-card-title text-center" style="flex: 1;">\${site.name || '未命名网站'}</h6>
+            <div style="flex: 1; display: flex; justify-content: flex-end;">
+                <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+            </div>
         \`;
 
         // 卡片主体
@@ -5629,8 +7004,7 @@ function renderMobileSiteCards(sites) {
         const lastCheckRow = document.createElement('div');
         lastCheckRow.className = 'mobile-card-row';
         lastCheckRow.innerHTML = \`
-            <span class="mobile-card-label">最后检查</span>
-            <span class="mobile-card-value">\${lastCheckTime}</span>
+            <span class="mobile-card-label">最后检查: \${lastCheckTime}</span>
         \`;
         cardBody.appendChild(lastCheckRow);
 
@@ -5742,7 +7116,7 @@ function renderServerTable(allStatuses) {
         const detailsRowElement = detailsTemplate.content.cloneNode(true).querySelector('tr');
         // The template has d-none by default. We will remove it if needed.
         // Set a unique attribute for easier selection if needed, though direct reference is used here.
-        // detailsRowElement.setAttribute('data-detail-for', serverId); 
+        // detailsRowElement.setAttribute('data-detail-for', serverId);
 
         tableBody.appendChild(mainRow);
         tableBody.appendChild(detailsRowElement);
@@ -5811,7 +7185,7 @@ function formatUptime(totalSeconds) {
     if (minutes > 0 || (days === 0 && hours === 0)) { // Show minutes if it's the only unit or if other units are zero
         uptimeString += \`\${minutes}分钟\`;
     }
-    
+
     return uptimeString.trim() || '0分钟'; // Default to 0 minutes if string is empty
 }
 
@@ -5826,8 +7200,7 @@ async function loadAllSiteStatuses() {
             data = await publicApiRequest('/api/sites/status');
         } catch (error) {
             // 如果获取网站状态失败，可能是数据库未初始化，尝试初始化
-            console.log('网站状态获取失败，尝试初始化数据库...');
-            await publicApiRequest('/api/init-db');
+                        await publicApiRequest('/api/init-db');
             data = await publicApiRequest('/api/sites/status');
         }
         const sites = data.sites || [];
@@ -5848,14 +7221,10 @@ async function loadAllSiteStatuses() {
         renderSiteStatusTable(sites);
 
     } catch (error) {
-        console.error('Error loading website statuses:', error);
-        const siteStatusTableBody = document.getElementById('siteStatusTableBody');
+                const siteStatusTableBody = document.getElementById('siteStatusTableBody');
         siteStatusTableBody.innerHTML = '<tr><td colspan="6" class="text-center text-danger">Failed to load website status data. Please refresh the page.</td></tr>'; // Colspan updated
-        // 同时更新移动端卡片容器显示错误状态
-        const mobileContainer = document.getElementById('mobileSiteContainer');
-        if (mobileContainer) {
-            mobileContainer.innerHTML = '<div class="text-center p-3 text-danger">加载网站数据失败，请刷新页面重试。</div>';
-        }
+        // 显示错误通知
+        showToast('danger', '加载网站数据失败，请刷新页面重试');
     }
 }
 
@@ -5944,6 +7313,121 @@ function getSiteStatusBadge(status) {
         default: return { class: 'bg-secondary', text: '未知' };
     }
 }
+
+// ==================== 全局背景设置功能 ====================
+
+// 全局背景设置加载函数
+async function loadGlobalBackgroundSettings() {
+    try {
+        // 检查localStorage缓存（无痕模式兼容）
+        const cacheKey = 'background-settings-cache';
+        let cached = null;
+        let settings = null;
+
+        try {
+            cached = localStorage.getItem(cacheKey);
+        } catch (storageError) {
+                    }
+
+        if (cached) {
+            try {
+                const cachedData = JSON.parse(cached);
+                const now = Date.now();
+                const cacheAge = now - cachedData.timestamp;
+                const CACHE_DURATION = 5 * 60 * 1000; // 5分钟缓存
+
+                if (cacheAge < CACHE_DURATION) {
+                    settings = cachedData;
+                                    }
+            } catch (parseError) {
+                            }
+        }
+
+        // 缓存过期或不存在，从API获取
+        if (!settings) {
+            try {
+                const response = await fetch('/api/background-settings');
+                if (response.ok) {
+                    const apiSettings = await response.json();
+                    settings = {
+                        enabled: apiSettings.enabled,
+                        url: apiSettings.url,
+                        opacity: apiSettings.opacity,
+                        timestamp: Date.now()
+                    };
+
+                    // 尝试更新缓存（无痕模式可能失败，但不影响功能）
+                    try {
+                        localStorage.setItem(cacheKey, JSON.stringify(settings));
+                                            } catch (storageError) {
+                                            }
+                } else {
+                                        settings = { enabled: false, url: '', opacity: 80 };
+                }
+            } catch (error) {
+                                settings = { enabled: false, url: '', opacity: 80 };
+            }
+        }
+
+        // 应用背景设置
+        applyGlobalBackgroundSettings(settings.enabled, settings.url, settings.opacity);
+
+    } catch (error) {
+            }
+}
+
+// 应用全局背景设置
+function applyGlobalBackgroundSettings(enabled, url, opacity) {
+    const body = document.body;
+
+    if (enabled && url) {
+        // 验证URL格式
+        if (!url.startsWith('https://')) {
+                        return;
+        }
+
+        // 预加载图片，确保加载成功
+        const img = new Image();
+        img.onload = function() {
+            // 图片加载成功，应用背景
+            body.style.setProperty('--custom-background-url', \`url(\${url})\`);
+            body.style.setProperty('--page-opacity', opacity / 100);
+            body.classList.add('custom-background-enabled');
+
+
+
+                    };
+        img.onerror = function() {
+            // 图片加载失败，不应用背景
+            body.classList.remove('custom-background-enabled');
+            body.classList.remove('low-contrast', 'medium-contrast', 'high-contrast');
+        };
+        img.src = url;
+    } else {
+        // 移除背景设置
+        body.style.removeProperty('--custom-background-url');
+        body.style.removeProperty('--page-opacity');
+        body.classList.remove('custom-background-enabled');
+            }
+}
+
+
+
+// 页面加载时初始化背景设置
+document.addEventListener('DOMContentLoaded', function() {
+    loadGlobalBackgroundSettings();
+});
+
+// 监听storage事件，实现跨页面设置同步
+window.addEventListener('storage', function(e) {
+    if (e.key === 'background-settings-cache' && e.newValue) {
+        try {
+            const newSettings = JSON.parse(e.newValue);
+            applyGlobalBackgroundSettings(newSettings.enabled, newSettings.url, newSettings.opacity);
+                    } catch (error) {
+                    }
+    }
+});
 `;
 }
 
@@ -5951,31 +7435,10 @@ function getLoginJs() {
   return `// login.js - 登录页面的JavaScript逻辑
 
 // ==================== 统一API请求工具 ====================
-
-// 统一API请求函数
-async function apiRequest(url, options = {}) {
-    const defaultOptions = {
-        headers: { 'Content-Type': 'application/json' },
-        ...options
-    };
-
-    try {
-        const response = await fetch(url, defaultOptions);
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || \`请求失败 (\${response.status})\`);
-        }
-
-        return await response.json();
-    } catch (error) {
-        console.error(\`API请求错误 [\${url}]:\`, error);
-        throw error;
-    }
-}
+// 注意：此处的apiRequest函数已移至主要位置，避免重复定义
 
 // --- Theme Management (copied from main.js) ---
-const THEME_KEY = 'themePreference';
+const THEME_KEY = 'vps-monitor-theme';
 const LIGHT_THEME = 'light';
 const DARK_THEME = 'dark';
 
@@ -5995,7 +7458,6 @@ function initializeTheme() {
 }
 
 function applyTheme(theme) {
-    document.title = \`Admin Panel - Theme: \${theme.toUpperCase()}\`; // Diagnostic line
     document.documentElement.setAttribute('data-bs-theme', theme);
     const themeTogglerIcon = document.querySelector('#themeToggler i');
     if (themeTogglerIcon) {
@@ -6030,7 +7492,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
         // 验证输入
         if (!username || !password) {
-            showLoginError('请输入用户名和密码');
+            showToast('warning', '请输入用户名和密码');
             return;
         }
 
@@ -6044,6 +7506,48 @@ document.addEventListener('DOMContentLoaded', function() {
     // 检查是否已登录
     checkLoginStatus();
 });
+
+// ==================== 统一API请求工具 ====================
+
+// 获取认证头
+function getAuthHeaders() {
+    const token = localStorage.getItem('auth_token');
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) {
+        headers['Authorization'] = 'Bearer ' + token;
+    }
+    return headers;
+}
+
+// 统一API请求函数
+async function apiRequest(url, options = {}) {
+    const defaultOptions = {
+        headers: getAuthHeaders(),
+        ...options
+    };
+
+    try {
+        const response = await fetch(url, defaultOptions);
+
+        // 处理认证失败
+        if (response.status === 401) {
+            localStorage.removeItem('auth_token');
+            if (window.location.pathname !== '/login.html') {
+                window.location.href = 'login.html';
+            }
+            throw new Error('认证失败，请重新登录');
+        }
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || \`请求失败 (\${response.status})\`);
+        }
+
+        return await response.json();
+    } catch (error) {
+                throw error;
+    }
+}
 
 // 加载默认凭据信息（本地显示，无需API调用）
 function loadDefaultCredentials() {
@@ -6062,17 +7566,14 @@ async function checkLoginStatus() {
             return;
         }
 
-        const data = await apiRequest('/api/auth/status', {
-            headers: { 'Authorization': 'Bearer ' + token }
-        });
+        const data = await apiRequest('/api/auth/status');
 
         if (data.authenticated) {
             // 已登录，重定向到管理后台
             window.location.href = 'admin.html';
         }
     } catch (error) {
-        console.error('检查登录状态错误:', error);
-    }
+            }
 }
 
 // 登录函数
@@ -6085,11 +7586,19 @@ async function login(username, password) {
         submitBtn.disabled = true;
         submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 登录中...';
 
-        // 发送登录请求
-        const data = await apiRequest('/api/auth/login', {
+        // 发送登录请求（不需要认证头）
+        const response = await fetch('/api/auth/login', {
             method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, password })
         });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || \`登录失败 (\${response.status})\`);
+        }
+
+        const data = await response.json();
 
         // 恢复按钮状态
         submitBtn.disabled = false;
@@ -6102,29 +7611,132 @@ async function login(username, password) {
         window.location.href = 'admin.html';
 
     } catch (error) {
-        console.error('登录错误:', error);
-
-        // 恢复按钮状态
+                // 恢复按钮状态
         const loginForm = document.getElementById('loginForm');
         const submitBtn = loginForm.querySelector('button[type="submit"]');
         submitBtn.disabled = false;
         submitBtn.innerHTML = '登录';
 
-        showLoginError(error.message || '登录请求失败，请稍后重试');
+        showToast('danger', error.message || '登录请求失败，请稍后重试');
     }
 }
 
-// 显示登录错误
-function showLoginError(message) {
-    const loginAlert = document.getElementById('loginAlert');
-    loginAlert.textContent = message;
-    loginAlert.classList.remove('d-none');
-    
-    // 5秒后自动隐藏错误信息
-    setTimeout(() => {
-        loginAlert.classList.add('d-none');
-    }, 5000);
-}`;
+
+
+// ==================== 全局背景设置功能 ====================
+
+// 全局背景设置加载函数（登录页面版本）
+async function loadGlobalBackgroundSettings() {
+    try {
+        // 检查localStorage缓存（无痕模式兼容）
+        const cacheKey = 'background-settings-cache';
+        let cached = null;
+        let settings = null;
+
+        try {
+            cached = localStorage.getItem(cacheKey);
+        } catch (storageError) {
+                    }
+
+        if (cached) {
+            try {
+                const cachedData = JSON.parse(cached);
+                const now = Date.now();
+                const cacheAge = now - cachedData.timestamp;
+                const CACHE_DURATION = 5 * 60 * 1000; // 5分钟缓存
+
+                if (cacheAge < CACHE_DURATION) {
+                    settings = cachedData;
+                                    }
+            } catch (parseError) {
+                            }
+        }
+
+        // 缓存过期或不存在，从API获取
+        if (!settings) {
+            try {
+                const response = await fetch('/api/background-settings');
+                if (response.ok) {
+                    const apiSettings = await response.json();
+                    settings = {
+                        enabled: apiSettings.enabled,
+                        url: apiSettings.url,
+                        opacity: apiSettings.opacity,
+                        timestamp: Date.now()
+                    };
+
+                    // 尝试更新缓存（无痕模式可能失败，但不影响功能）
+                    try {
+                        localStorage.setItem(cacheKey, JSON.stringify(settings));
+                                            } catch (storageError) {
+                                            }
+                } else {
+                                        settings = { enabled: false, url: '', opacity: 80 };
+                }
+            } catch (error) {
+                                settings = { enabled: false, url: '', opacity: 80 };
+            }
+        }
+
+        // 应用背景设置
+        applyGlobalBackgroundSettings(settings.enabled, settings.url, settings.opacity);
+
+    } catch (error) {
+            }
+}
+
+// 应用全局背景设置
+function applyGlobalBackgroundSettings(enabled, url, opacity) {
+    const body = document.body;
+
+    if (enabled && url) {
+        // 验证URL格式
+        if (!url.startsWith('https://')) {
+                        return;
+        }
+
+        // 预加载图片，确保加载成功
+        const img = new Image();
+        img.onload = function() {
+            // 图片加载成功，应用背景
+            body.style.setProperty('--custom-background-url', \`url(\${url})\`);
+            body.style.setProperty('--page-opacity', opacity / 100);
+            body.classList.add('custom-background-enabled');
+
+
+
+                    };
+        img.onerror = function() {
+            // 图片加载失败，不应用背景
+            body.classList.remove('custom-background-enabled');
+        };
+        img.src = url;
+    } else {
+        // 移除背景设置
+        body.style.removeProperty('--custom-background-url');
+        body.style.removeProperty('--page-opacity');
+        body.classList.remove('custom-background-enabled');
+            }
+}
+
+
+
+// 页面加载时初始化背景设置
+document.addEventListener('DOMContentLoaded', function() {
+    loadGlobalBackgroundSettings();
+});
+
+// 监听storage事件，实现跨页面设置同步
+window.addEventListener('storage', function(e) {
+    if (e.key === 'background-settings-cache' && e.newValue) {
+        try {
+            const newSettings = JSON.parse(e.newValue);
+            applyGlobalBackgroundSettings(newSettings.enabled, newSettings.url, newSettings.opacity);
+                    } catch (error) {
+                    }
+    }
+});
+`;
 }
 // Helper functions for updating server/site settings are no longer needed for frequent notifications
 // as that feature is removed.
@@ -6168,8 +7780,7 @@ async function apiRequest(url, options = {}) {
 
         return await response.json();
     } catch (error) {
-        console.error(\`API请求错误 [\${url}]:\`, error);
-        throw error;
+                throw error;
     }
 }
 
@@ -6179,45 +7790,35 @@ const DEFAULT_VPS_REFRESH_INTERVAL_MS = 60000; // Default to 60 seconds for VPS 
 
 // Function to fetch VPS refresh interval and start periodic VPS data updates
 async function initializeVpsDataUpdates() {
-    console.log('initializeVpsDataUpdates() called in admin page');
-    let vpsRefreshIntervalMs = DEFAULT_VPS_REFRESH_INTERVAL_MS;
+        let vpsRefreshIntervalMs = DEFAULT_VPS_REFRESH_INTERVAL_MS;
 
     try {
-        console.log('Fetching VPS refresh interval from API...');
-        const data = await apiRequest('/api/admin/settings/vps-report-interval');
-        console.log('API response data:', data);
-
-        if (data && typeof data.interval === 'number' && data.interval > 0) {
+                const data = await apiRequest('/api/admin/settings/vps-report-interval');
+                if (data && typeof data.interval === 'number' && data.interval > 0) {
             vpsRefreshIntervalMs = data.interval * 1000; // Convert seconds to milliseconds
-            console.log(\`Using backend-defined VPS refresh interval: \${data.interval}s (\${vpsRefreshIntervalMs}ms)\`);
-        } else {
-            console.warn('Invalid VPS interval from backend, using default:', data);
+                    } else {
+            // 使用默认值
         }
     } catch (error) {
-        console.error('Error fetching VPS refresh interval, using default:', error);
-    }
+            }
 
     // Clear existing interval if any
     if (vpsUpdateInterval) {
-        console.log('Clearing existing VPS update interval');
-        clearInterval(vpsUpdateInterval);
+                clearInterval(vpsUpdateInterval);
     }
 
     // Set up new periodic updates for VPS data ONLY
-    console.log('Setting up new VPS update interval with', vpsRefreshIntervalMs, 'ms');
-    vpsUpdateInterval = setInterval(() => {
-        console.log('VPS data refresh triggered by interval in admin page');
-        // Reload server list to get updated data
+        vpsUpdateInterval = setInterval(() => {
+                // Reload server list to get updated data
         if (typeof loadServerList === 'function') {
             loadServerList();
         }
     }, vpsRefreshIntervalMs);
 
-    console.log(\`VPS data will refresh every \${vpsRefreshIntervalMs / 1000} seconds. Interval ID: \${vpsUpdateInterval}\`);
-}
+    }
 
 // --- Theme Management (copied from main.js) ---
-const THEME_KEY = 'themePreference';
+const THEME_KEY = 'vps-monitor-theme';
 const LIGHT_THEME = 'light';
 const DARK_THEME = 'dark';
 
@@ -6257,8 +7858,7 @@ function applyTheme(theme) {
 function cleanupStuckToggles() {
     const stuckToggles = document.querySelectorAll('[data-updating="true"]');
     if (stuckToggles.length > 0) {
-        console.log('清理', stuckToggles.length, '个卡住的开关');
-        stuckToggles.forEach(toggle => {
+                stuckToggles.forEach(toggle => {
             toggle.disabled = false;
             delete toggle.dataset.updating;
             toggle.style.opacity = '1';
@@ -6298,6 +7898,8 @@ document.addEventListener('DOMContentLoaded', async function() {
     loadSiteList();
     // 加载Telegram设置
     loadTelegramSettings();
+    // 加载背景设置
+    loadBackgroundSettings();
     // 加载全局设置 (VPS Report Interval) - will use serverAlert for notifications
     loadGlobalSettings();
 
@@ -6307,9 +7909,9 @@ document.addEventListener('DOMContentLoaded', async function() {
     // 检查是否使用默认密码
     checkDefaultPasswordUsage();
 
-    // 启动定期状态清理，每30秒检查一次卡住的开关（优化后减少频率）
-    setInterval(cleanupStuckToggles, 30000);
-});
+    // 优化：停止自动清理以节省配额
+    // setInterval(cleanupStuckToggles, 30000);
+    });
 
 // 检查登录状态
 async function checkLoginStatus() {
@@ -6328,8 +7930,7 @@ async function checkLoginStatus() {
             window.location.href = 'login.html';
         }
     } catch (error) {
-        console.error('检查登录状态错误:', error);
-        window.location.href = 'login.html';
+                window.location.href = 'login.html';
     }
 }
 
@@ -6338,40 +7939,30 @@ async function checkDefaultPasswordUsage() {
     try {
         // 从localStorage获取是否显示过默认密码提醒
         const hasShownDefaultPasswordWarning = localStorage.getItem('hasShownDefaultPasswordWarning');
-        console.log('hasShownDefaultPasswordWarning:', hasShownDefaultPasswordWarning);
+
         if (hasShownDefaultPasswordWarning === 'true') {
             return; // 已经显示过提醒，不再显示
         }
 
         // 检查当前用户登录状态和默认密码使用情况
         const token = localStorage.getItem('auth_token');
-        console.log('检查token:', token ? '存在' : '不存在');
-        if (token) {
+                if (token) {
             try {
                 const statusData = await apiRequest('/api/auth/status');
-                console.log('状态数据:', statusData);
                 if (statusData.authenticated && statusData.user && statusData.user.usingDefaultPassword) {
-                    console.log('检测到使用默认密码，显示提醒');
-                    // 显示默认密码提醒，5秒自动消失
-                    showAlert('warning',
-                        '<i class="bi bi-exclamation-triangle-fill"></i> ' +
-                        '<strong>安全提醒：</strong>您正在使用默认密码登录。' +
-                        '<br>为了您的账户安全，建议尽快修改密码。' +
-                        '<br><small>点击右上角的"修改密码"按钮来更改密码。</small>'
-                    , 'serverAlert', 5000); // 5秒自动隐藏
+                    // 显示默认密码提醒
+                    showToast('warning',
+                        '安全提醒：您正在使用默认密码登录。为了您的账户安全，建议尽快修改密码。点击右上角的"修改密码"按钮来更改密码。',
+                        { duration: 10000 }); // 10秒显示
 
                     // 标记已显示过提醒
                     localStorage.setItem('hasShownDefaultPasswordWarning', 'true');
-                } else {
-                    console.log('未检测到使用默认密码');
                 }
             } catch (error) {
-                console.error('检查默认密码使用情况错误:', error);
-            }
+                            }
         }
     } catch (error) {
-        console.error('检查默认密码使用情况错误:', error);
-    }
+            }
 }
 
 // 初始化事件监听
@@ -6380,7 +7971,7 @@ function initEventListeners() {
     document.getElementById('addServerBtn').addEventListener('click', function() {
         showServerModal();
     });
-    
+
     // 保存服务器按钮
     document.getElementById('saveServerBtn').addEventListener('click', function() {
         saveServer();
@@ -6393,15 +7984,14 @@ function initEventListeners() {
             buttonElement.innerHTML = '<i class="bi bi-check-lg"></i>'; // Using a larger check icon
             buttonElement.classList.add('btn-success');
             buttonElement.classList.remove('btn-outline-secondary');
-            
+
             setTimeout(() => {
                 buttonElement.innerHTML = originalHtml;
                 buttonElement.classList.remove('btn-success');
                 buttonElement.classList.add('btn-outline-secondary');
             }, 2000);
         }).catch(err => {
-            console.error('Failed to copy text: ', err);
-            // Optionally, show an error message to the user
+            // 静默处理复制失败
             const originalHtml = buttonElement.innerHTML;
             buttonElement.innerHTML = '<i class="bi bi-x-lg"></i>'; // Error icon
             buttonElement.classList.add('btn-danger');
@@ -6413,7 +8003,7 @@ function initEventListeners() {
             }, 2000);
         });
     }
-    
+
     // 复制API密钥按钮
     document.getElementById('copyApiKeyBtn').addEventListener('click', function() {
         const apiKeyInput = document.getElementById('apiKey');
@@ -6431,14 +8021,14 @@ function initEventListeners() {
         const workerUrlInput = document.getElementById('workerUrlDisplay');
         copyToClipboard(workerUrlInput.value, this);
     });
-    
+
     // 确认删除按钮
     document.getElementById('confirmDeleteBtn').addEventListener('click', function() {
         if (currentServerId) {
             deleteServer(currentServerId);
         }
     });
-    
+
     // 修改密码按钮（移动端）
     document.getElementById('changePasswordBtn').addEventListener('click', function() {
         showPasswordModal();
@@ -6448,12 +8038,12 @@ function initEventListeners() {
     document.getElementById('changePasswordBtnDesktop').addEventListener('click', function() {
         showPasswordModal();
     });
-    
+
     // 保存密码按钮
     document.getElementById('savePasswordBtn').addEventListener('click', function() {
         changePassword();
     });
-    
+
     // 退出登录按钮
     document.getElementById('logoutBtn').addEventListener('click', function() {
         logout();
@@ -6477,6 +8067,34 @@ function initEventListeners() {
     // 保存Telegram设置按钮
     document.getElementById('saveTelegramSettingsBtn').addEventListener('click', function() {
         saveTelegramSettings();
+    });
+
+    // Background Settings Event Listeners
+    document.getElementById('saveBackgroundSettingsBtn').addEventListener('click', function() {
+        saveBackgroundSettings();
+    });
+
+    // 透明度滑块实时预览
+    document.getElementById('pageOpacity').addEventListener('input', function() {
+        updateOpacityPreview();
+    });
+
+    // 背景开关变化时的预览
+    document.getElementById('enableCustomBackground').addEventListener('change', function() {
+        const enabled = this.checked;
+        const url = document.getElementById('backgroundImageUrl').value.trim();
+        const opacity = parseInt(document.getElementById('pageOpacity').value, 10);
+        applyBackgroundSettings(enabled, url, opacity, false);
+    });
+
+    // URL输入框变化时的预览
+    document.getElementById('backgroundImageUrl').addEventListener('input', function() {
+        const enabled = document.getElementById('enableCustomBackground').checked;
+        const url = this.value.trim();
+        const opacity = parseInt(document.getElementById('pageOpacity').value, 10);
+        if (enabled) {
+            applyBackgroundSettings(enabled, url, opacity, false);
+        }
     });
 
     // Global Settings Event Listener
@@ -6504,16 +8122,6 @@ function initEventListeners() {
     }, 100);
 }
 
-// 获取认证头
-function getAuthHeaders() {
-    const token = localStorage.getItem('auth_token');
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) {
-        headers['Authorization'] = 'Bearer ' + token;
-    }
-    return headers;
-}
-
 // --- Server Management Functions ---
 
 // 加载服务器列表
@@ -6525,8 +8133,7 @@ async function loadServerList() {
         // 简化逻辑：直接渲染，智能状态显示会处理更新中的按钮
         renderServerTable(serverList);
     } catch (error) {
-        console.error('加载服务器列表错误:', error);
-        showAlert('danger', '加载服务器列表失败，请刷新页面重试。', 'serverAlert');
+                showToast('danger', '加载服务器列表失败，请刷新页面重试');
     }
 }
 
@@ -6626,7 +8233,7 @@ function renderServerTable(servers) {
 
     // 初始化拖拽排序
     initializeServerDragSort();
-    
+
     // 添加事件监听
     document.querySelectorAll('.view-key-btn').forEach(btn => {
         btn.addEventListener('click', function() {
@@ -6634,14 +8241,14 @@ function renderServerTable(servers) {
             viewApiKey(serverId);
         });
     });
-    
+
     document.querySelectorAll('.edit-server-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const serverId = this.getAttribute('data-id');
             editServer(serverId);
         });
     });
-    
+
     document.querySelectorAll('.delete-server-btn').forEach(btn => {
         btn.addEventListener('click', function() {
             const serverId = this.getAttribute('data-id');
@@ -6679,9 +8286,7 @@ function renderServerTable(servers) {
             const targetState = this.checked; // 点击后的状态就是目标状态
             const originalState = !this.checked; // 原始状态是目标状态的相反
 
-            console.log('用户点击开关，服务器:', serverId, '原始状态:', originalState, '目标状态:', targetState);
-
-            // 立即设置为加载状态
+                        // 立即设置为加载状态
             this.disabled = true;
             this.style.opacity = '0.6';
             this.dataset.updating = 'true';
@@ -6814,11 +8419,10 @@ async function performServerDragSort(draggedServerId, targetServerId, insertBefo
 
         // 重新加载服务器列表
         await loadServerList();
-        showAlert('success', '服务器排序已更新', 'serverAlert');
+        showToast('success', '服务器排序已更新');
 
     } catch (error) {
-        console.error('拖拽排序错误:', error);
-        showAlert('danger', '拖拽排序失败: ' + error.message, 'serverAlert');
+                showToast('danger', '拖拽排序失败: ' + error.message);
         // 重新加载以恢复原始状态
         loadServerList();
     }
@@ -6832,8 +8436,10 @@ async function copyVpsInstallScript(serverId, serverName, buttonElement) {
     buttonElement.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 生成中...';
 
     try {
-        // 直接从本地缓存的服务器列表中获取API密钥，避免API调用
-        const server = serverList.find(s => s.id === serverId);
+        // 获取包含完整API密钥的服务器信息
+        const response = await apiRequest('/api/admin/servers?full_key=true');
+        const server = response.servers.find(s => s.id === serverId);
+
         if (!server || !server.api_key) {
             throw new Error('未找到服务器或API密钥，请刷新页面重试');
         }
@@ -6852,11 +8458,10 @@ async function copyVpsInstallScript(serverId, serverName, buttonElement) {
         buttonElement.classList.remove('btn-outline-info');
         buttonElement.classList.add('btn-success');
 
-        showAlert('success', '服务器 "' + serverName + '" 的安装脚本已复制到剪贴板。', 'serverAlert');
+        showToast('success', '服务器 "' + serverName + '" 的安装脚本已复制到剪贴板');
 
     } catch (error) {
-        console.error('复制VPS安装脚本错误:', error);
-        showAlert('danger', '复制脚本失败: ' + error.message, 'serverAlert');
+                showToast('danger', '复制脚本失败: ' + error.message);
         buttonElement.innerHTML = '<i class="bi bi-x-lg"></i> 复制失败';
         buttonElement.classList.remove('btn-outline-info');
         buttonElement.classList.add('btn-danger');
@@ -6873,18 +8478,14 @@ async function copyVpsInstallScript(serverId, serverName, buttonElement) {
 // 更新服务器显示状态
 async function updateServerVisibility(serverId, isPublic, originalState, toggleElement) {
     const startTime = Date.now();
-    console.log('API请求开始：服务器', serverId, '从', originalState, '切换到', isPublic, '时间:', new Date().toISOString());
-
-    try {
+        try {
         const data = await apiRequest('/api/admin/servers/' + serverId + '/visibility', {
             method: 'POST',
             body: JSON.stringify({ is_public: isPublic })
         });
 
         const requestTime = Date.now() - startTime;
-        console.log('API成功：服务器', serverId, '最终状态', isPublic);
-
-        // 更新本地数据
+                // 更新本地数据
         const serverIndex = serverList.findIndex(s => s.id === serverId);
         if (serverIndex !== -1) {
             serverList[serverIndex].is_public = isPublic;
@@ -6894,19 +8495,17 @@ async function updateServerVisibility(serverId, isPublic, originalState, toggleE
         function restoreButtonState(retryCount = 0) {
             const currentToggle = document.querySelector('.server-visibility-toggle[data-server-id="' + serverId + '"]');
             if (currentToggle) {
-                console.log('API成功，恢复按钮状态：', serverId, '目标状态:', isPublic, '重试次数:', retryCount);
-                currentToggle.checked = isPublic;
+                                currentToggle.checked = isPublic;
                 currentToggle.style.opacity = '1';
                 currentToggle.disabled = false;
                 delete currentToggle.dataset.updating;
 
                 // 直接显示成功提醒
-                showAlert('success', '服务器显示状态已' + (isPublic ? '开启' : '关闭'), 'serverAlert');
+                showToast('success', '服务器显示状态已' + (isPublic ? '开启' : '关闭'));
             } else if (retryCount < 3) {
-                console.log('按钮元素未找到，100ms后重试：', serverId, '重试次数:', retryCount);
-                setTimeout(() => restoreButtonState(retryCount + 1), 100);
+                                setTimeout(() => restoreButtonState(retryCount + 1), 100);
             } else {
-                console.error('API成功但多次重试后仍找不到按钮元素：', serverId);
+                // 静默处理按钮元素未找到
             }
         }
 
@@ -6914,9 +8513,7 @@ async function updateServerVisibility(serverId, isPublic, originalState, toggleE
         restoreButtonState();
 
     } catch (error) {
-        console.error('API失败：服务器', serverId, '错误:', error);
-
-        // 失败时恢复原始状态
+                // 失败时恢复原始状态
         const currentToggle = document.querySelector('.server-visibility-toggle[data-server-id="' + serverId + '"]');
         if (currentToggle) {
             currentToggle.checked = originalState;
@@ -6925,10 +8522,10 @@ async function updateServerVisibility(serverId, isPublic, originalState, toggleE
             delete currentToggle.dataset.updating;
 
             // 直接显示错误提醒，不需要等待状态变化
-            showAlert('danger', '更新显示状态失败: ' + error.message, 'serverAlert');
+            showToast('danger', '更新显示状态失败: ' + error.message);
         } else {
             // 如果找不到开关元素，立即显示错误
-            showAlert('danger', '更新显示状态失败: ' + error.message, 'serverAlert');
+            showToast('danger', '更新显示状态失败: ' + error.message);
         }
     }
 }
@@ -6943,11 +8540,10 @@ async function moveServer(serverId, direction) {
 
         // 重新加载列表以反映新顺序
         await loadServerList();
-        showAlert('success', '服务器已成功' + (direction === 'up' ? '上移' : '下移'));
+        showToast('success', '服务器已成功' + (direction === 'up' ? '上移' : '下移'));
 
     } catch (error) {
-        console.error('移动服务器错误:', error);
-        showAlert('danger', '移动服务器失败: ' + error.message, 'serverAlert');
+                showToast('danger', '移动服务器失败: ' + error.message);
     }
 }
 
@@ -6973,7 +8569,7 @@ function showServerModal() {
 function editServer(serverId) {
     const server = serverList.find(s => s.id === serverId);
     if (!server) return;
-    
+
     // 填充表单
     document.getElementById('serverId').value = server.id;
     document.getElementById('serverName').value = server.name;
@@ -6981,10 +8577,10 @@ function editServer(serverId) {
     document.getElementById('apiKeyGroup').classList.add('d-none');
     document.getElementById('serverIdDisplayGroup').classList.add('d-none');
     document.getElementById('workerUrlDisplayGroup').classList.add('d-none');
-    
+
     // 设置模态框标题
     document.getElementById('serverModalTitle').textContent = '编辑服务器';
-    
+
     // 显示模态框
     const serverModal = new bootstrap.Modal(document.getElementById('serverModal'));
     serverModal.show();
@@ -6996,12 +8592,12 @@ async function saveServer() {
     const serverName = document.getElementById('serverName').value.trim();
     const serverDescription = document.getElementById('serverDescription').value.trim();
     // const enableFrequentNotifications = document.getElementById('serverEnableFrequentNotifications').checked; // Removed
-    
+
     if (!serverName) {
-        showAlert('danger', '服务器名称不能为空', 'serverAlert'); // Added alertId
+        showToast('warning', '服务器名称不能为空');
         return;
     }
-    
+
     try {
         let data;
 
@@ -7032,39 +8628,38 @@ async function saveServer() {
             // 直接在当前模态框中显示密钥信息，提供流畅的用户体验
             // 不隐藏模态框，而是切换内容，让用户感觉是自然的过渡
             showApiKeyInCurrentModal(data.server);
-            showAlert('success', '服务器添加成功');
+            showToast('success', '服务器添加成功');
 
             // 在后台异步刷新服务器列表
             loadServerList().catch(error => {
-                console.error('后台刷新服务器列表失败:', error);
-            });
+                            });
         } else {
             // 编辑服务器的情况，正常隐藏模态框并刷新列表
             const serverModal = bootstrap.Modal.getInstance(document.getElementById('serverModal'));
             serverModal.hide();
 
             await loadServerList();
-            showAlert('success', serverId ? '服务器更新成功' : '服务器添加成功');
+            showToast('success', serverId ? '服务器更新成功' : '服务器添加成功');
         }
     } catch (error) {
-        console.error('保存服务器错误:', error);
-        showAlert('danger', '保存服务器失败，请稍后重试', 'serverAlert');
+                showToast('danger', '保存服务器失败，请稍后重试');
     }
 }
 
-// 查看API密钥（优化版本：直接从本地缓存获取）
-function viewApiKey(serverId) {
+// 查看API密钥（获取完整密钥版本）
+async function viewApiKey(serverId) {
     try {
-        // 直接从本地缓存的服务器列表中获取服务器信息
-        const server = serverList.find(s => s.id === serverId);
+        // 请求包含完整API密钥的服务器信息
+        const response = await apiRequest('/api/admin/servers?full_key=true');
+        const server = response.servers.find(s => s.id === serverId);
+
         if (server && server.api_key) {
             showApiKey(server);
         } else {
-            showAlert('danger', '未找到服务器信息或API密钥，请刷新页面重试', 'serverAlert');
+            showToast('danger', '未找到服务器信息或API密钥，请稍后重试');
         }
     } catch (error) {
-        console.error('查看API密钥错误:', error);
-        showAlert('danger', '查看API密钥失败，请稍后重试', 'serverAlert');
+                showToast('danger', '查看API密钥失败，请稍后重试');
     }
 }
 
@@ -7121,7 +8716,7 @@ function showApiKey(server) {
 function showDeleteConfirmation(serverId, serverName) {
     currentServerId = serverId;
     document.getElementById('deleteServerName').textContent = serverName;
-    
+
     const deleteModal = new bootstrap.Modal(document.getElementById('deleteModal'));
     deleteModal.show();
 }
@@ -7129,7 +8724,7 @@ function showDeleteConfirmation(serverId, serverName) {
 // 删除服务器
 async function deleteServer(serverId) {
     try {
-        await apiRequest('/api/admin/servers/' + serverId, {
+        await apiRequest('/api/admin/servers/' + serverId + '?confirm=true', {
             method: 'DELETE'
         });
 
@@ -7139,10 +8734,9 @@ async function deleteServer(serverId) {
 
         // 重新加载服务器列表
         loadServerList();
-        showAlert('success', '服务器删除成功');
+        showToast('success', '服务器删除成功');
     } catch (error) {
-        console.error('删除服务器错误:', error);
-        showAlert('danger', '删除服务器失败，请稍后重试', 'serverAlert');
+                showToast('danger', '删除服务器失败，请稍后重试');
     }
 }
 
@@ -7152,20 +8746,14 @@ async function deleteServer(serverId) {
 // 更新网站显示状态
 async function updateSiteVisibility(siteId, isPublic, originalState, toggleElement) {
     const startTime = Date.now();
-    console.log('API请求开始：网站', siteId, '从', originalState, '切换到', isPublic, '时间:', new Date().toISOString());
-
-    try {
+        try {
         await apiRequest('/api/admin/sites/' + siteId + '/visibility', {
             method: 'POST',
             body: JSON.stringify({ is_public: isPublic })
         });
 
         const requestTime = Date.now() - startTime;
-        console.log('API请求完成：网站', siteId, '耗时:', requestTime + 'ms');
-
-        console.log('API成功：网站', siteId, '最终状态', isPublic);
-
-        // 更新本地数据
+                        // 更新本地数据
         const siteIndex = siteList.findIndex(s => s.id === siteId);
         if (siteIndex !== -1) {
             siteList[siteIndex].is_public = isPublic;
@@ -7175,19 +8763,17 @@ async function updateSiteVisibility(siteId, isPublic, originalState, toggleEleme
         function restoreButtonState(retryCount = 0) {
             const currentToggle = document.querySelector('.site-visibility-toggle[data-site-id="' + siteId + '"]');
             if (currentToggle) {
-                console.log('API成功，恢复网站按钮状态：', siteId, '目标状态:', isPublic, '重试次数:', retryCount);
-                currentToggle.checked = isPublic;
+                                currentToggle.checked = isPublic;
                 currentToggle.style.opacity = '1';
                 currentToggle.disabled = false;
                 delete currentToggle.dataset.updating;
 
                 // 直接显示成功提醒
-                showAlert('success', '网站显示状态已' + (isPublic ? '开启' : '关闭'), 'siteAlert');
+                showToast('success', '网站显示状态已' + (isPublic ? '开启' : '关闭'));
             } else if (retryCount < 3) {
-                console.log('网站按钮元素未找到，100ms后重试：', siteId, '重试次数:', retryCount);
-                setTimeout(() => restoreButtonState(retryCount + 1), 100);
+                                setTimeout(() => restoreButtonState(retryCount + 1), 100);
             } else {
-                console.error('API成功但多次重试后仍找不到网站按钮元素：', siteId);
+                // 静默处理网站按钮元素未找到
             }
         }
 
@@ -7195,9 +8781,7 @@ async function updateSiteVisibility(siteId, isPublic, originalState, toggleEleme
         restoreButtonState();
 
     } catch (error) {
-        console.error('API失败：网站', siteId, '错误:', error);
-
-        // 失败时恢复原始状态
+                // 失败时恢复原始状态
         const currentToggle = document.querySelector('.site-visibility-toggle[data-site-id="' + siteId + '"]');
         if (currentToggle) {
             currentToggle.checked = originalState;
@@ -7206,10 +8790,10 @@ async function updateSiteVisibility(siteId, isPublic, originalState, toggleEleme
             delete currentToggle.dataset.updating;
 
             // 直接显示错误提醒，不需要等待状态变化
-            showAlert('danger', '更新显示状态失败: ' + error.message, 'siteAlert');
+            showToast('danger', '更新显示状态失败: ' + error.message);
         } else {
             // 如果找不到开关元素，立即显示错误
-            showAlert('danger', '更新显示状态失败: ' + error.message, 'siteAlert');
+            showToast('danger', '更新显示状态失败: ' + error.message);
         }
     }
 }
@@ -7224,11 +8808,10 @@ async function moveSite(siteId, direction) {
 
         // 重新加载列表以反映新顺序
         await loadSiteList();
-        showAlert('success', '网站已成功' + (direction === 'up' ? '上移' : '下移'), 'siteAlert');
+        showToast('success', '网站已成功' + (direction === 'up' ? '上移' : '下移'));
 
     } catch (error) {
-        console.error('移动网站错误:', error);
-        showAlert('danger', '移动网站失败: ' + error.message, 'siteAlert');
+                showToast('danger', '移动网站失败: ' + error.message);
     }
 }
 
@@ -7240,7 +8823,7 @@ function showPasswordModal() {
     // 重置表单
     document.getElementById('passwordForm').reset();
     document.getElementById('passwordAlert').classList.add('d-none');
-    
+
     const passwordModal = new bootstrap.Modal(document.getElementById('passwordModal'));
     passwordModal.show();
 }
@@ -7250,18 +8833,18 @@ async function changePassword() {
     const currentPassword = document.getElementById('currentPassword').value;
     const newPassword = document.getElementById('newPassword').value;
     const confirmPassword = document.getElementById('confirmPassword').value;
-    
+
     // 验证输入
     if (!currentPassword || !newPassword || !confirmPassword) {
-        showPasswordAlert('danger', '所有密码字段都必须填写');
+        showToast('warning', '所有密码字段都必须填写');
         return;
     }
-    
+
     if (newPassword !== confirmPassword) {
-        showPasswordAlert('danger', '新密码和确认密码不匹配');
+        showToast('warning', '新密码和确认密码不匹配');
         return;
     }
-    
+
     try {
         await apiRequest('/api/auth/change-password', {
             method: 'POST',
@@ -7278,10 +8861,9 @@ async function changePassword() {
         // 清除默认密码提醒标记，这样如果用户再次使用默认密码登录会重新提醒
         localStorage.removeItem('hasShownDefaultPasswordWarning');
 
-        showAlert('success', '密码修改成功', 'serverAlert'); // Use main alert
+        showToast('success', '密码修改成功');
     } catch (error) {
-        console.error('修改密码错误:', error);
-        showPasswordAlert('danger', '密码修改请求失败，请稍后重试');
+                showToast('danger', '密码修改请求失败，请稍后重试');
     }
 }
 
@@ -7310,8 +8892,7 @@ async function loadSiteList() {
         // 简化逻辑：直接渲染，智能状态显示会处理更新中的按钮
         renderSiteTable(siteList);
     } catch (error) {
-        console.error('加载监控网站列表错误:', error);
-        showAlert('danger', '加载监控网站列表失败: ' + error.message, 'siteAlert');
+                showToast('danger', '加载监控网站列表失败: ' + error.message);
     }
 }
 
@@ -7425,9 +9006,7 @@ function renderSiteTable(sites) {
             const targetState = this.checked; // 点击后的状态就是目标状态
             const originalState = !this.checked; // 原始状态是目标状态的相反
 
-            console.log('用户点击开关，网站:', siteId, '原始状态:', originalState, '目标状态:', targetState);
-
-            // 立即设置为加载状态
+                        // 立即设置为加载状态
             this.disabled = true;
             this.style.opacity = '0.6';
             this.dataset.updating = 'true';
@@ -7560,11 +9139,10 @@ async function performSiteDragSort(draggedSiteId, targetSiteId, insertBefore) {
 
         // 重新加载网站列表
         await loadSiteList();
-        showAlert('success', '网站排序已更新', 'siteAlert');
+        showToast('success', '网站排序已更新');
 
     } catch (error) {
-        console.error('拖拽排序错误:', error);
-        showAlert('danger', '拖拽排序失败: ' + error.message, 'siteAlert');
+                showToast('danger', '拖拽排序失败: ' + error.message);
         // 重新加载以恢复原始状态
         loadSiteList();
     }
@@ -7599,7 +9177,7 @@ function showSiteModal(siteIdToEdit = null) {
             document.getElementById('siteUrl').value = site.url;
             // document.getElementById('siteEnableFrequentNotifications').checked = site.enable_frequent_down_notifications || false; // Removed
         } else {
-            showAlert('danger', '未找到要编辑的网站信息。', 'siteAlert');
+            showToast('danger', '未找到要编辑的网站信息');
             return;
         }
     } else {
@@ -7625,11 +9203,11 @@ async function saveSite() {
     // const enableFrequentNotifications = document.getElementById('siteEnableFrequentNotifications').checked; // Removed
 
     if (!siteUrl) {
-        showAlert('warning', '请输入网站URL', 'siteAlert');
+        showToast('warning', '请输入网站URL');
         return;
     }
     if (!siteUrl.startsWith('http://') && !siteUrl.startsWith('https://')) {
-         showAlert('warning', 'URL必须以 http:// 或 https:// 开头', 'siteAlert');
+         showToast('warning', 'URL必须以 http:// 或 https:// 开头');
          return;
     }
 
@@ -7656,13 +9234,12 @@ async function saveSite() {
         if (siteModalInstance) {
             siteModalInstance.hide();
         }
-        
+
         await loadSiteList(); // Reload the list
-        showAlert('success', \`监控网站\${siteId ? '更新' : '添加'}成功\`, 'siteAlert');
+        showToast('success', '监控网站' + (siteId ? '更新' : '添加') + '成功');
 
     } catch (error) {
-        console.error('保存网站错误:', error);
-        showAlert('danger', \`保存网站失败: \${error.message}\`, 'siteAlert');
+                showToast('danger', '保存网站失败: ' + error.message);
     }
 }
 
@@ -7687,50 +9264,70 @@ async function deleteSite(siteId) {
         const deleteModal = bootstrap.Modal.getInstance(document.getElementById('deleteSiteModal'));
         deleteModal.hide();
         await loadSiteList(); // Reload list
-        showAlert('success', '网站监控已删除', 'siteAlert');
+        showToast('success', '网站监控已删除');
         currentSiteId = null; // Reset current ID
 
     } catch (error) {
-        console.error('删除网站错误:', error);
-        showAlert('danger', \`删除网站失败: \${error.message}\`, 'siteAlert');
+                showToast('danger', '删除网站失败: ' + error.message);
     }
 }
 
 
 // --- Utility Functions ---
 
-// 显示警告信息 (specify alert element ID)
-function showAlert(type, message, alertId = 'serverAlert', autoHideDelay = 5000) {
-    const alertElement = document.getElementById(alertId);
-    if (!alertElement) return; // Exit if alert element doesn't exist
+// 统一Toast弹窗函数 (增强版)
+function showToast(type, message, options = {}) {
+    const defaults = {
+        success: 3000,
+        info: 5000,
+        warning: 8000,
+        danger: 10000
+    };
 
-    alertElement.className = \`alert alert-\${type} alert-dismissible\`;
+    const duration = options.duration || defaults[type] || 5000;
+    const persistent = options.persistent || false;
 
-    // 添加关闭按钮和消息内容
-    alertElement.innerHTML = \`
-        \${message}
-        <button type="button" class="btn-close" aria-label="Close" onclick="this.parentElement.classList.add('d-none')"></button>
-    \`;
+    const container = document.getElementById('toastContainer');
+    if (!container) return;
 
-    alertElement.classList.remove('d-none');
+    const toast = document.createElement('div');
+    toast.className = 'unified-toast ' + type;
 
-    // 如果autoHideDelay大于0，则自动隐藏
-    if (autoHideDelay > 0) {
-        setTimeout(() => {
-            alertElement.classList.add('d-none');
-        }, autoHideDelay);
+    const icons = {
+        success: 'bi-check-circle-fill',
+        danger: 'bi-x-circle-fill',
+        warning: 'bi-exclamation-triangle-fill',
+        info: 'bi-info-circle-fill'
+    };
+
+    toast.innerHTML =
+        '<i class="toast-icon bi ' + icons[type] + '"></i>' +
+        '<div class="toast-content">' + message + '</div>' +
+        '<button class="toast-close" onclick="hideToast(this.parentElement)">×</button>' +
+        (persistent ? '' : '<div class="toast-progress" style="animation-duration: ' + duration + 'ms"></div>');
+
+    container.appendChild(toast);
+
+    if (!persistent) {
+        setTimeout(() => hideToast(toast), duration);
     }
+
+    return toast;
 }
 
-// 显示密码修改警告信息 (uses its own dedicated alert element)
-function showPasswordAlert(type, message) {
-    const alertElement = document.getElementById('passwordAlert');
-    if (!alertElement) return;
-    alertElement.className = \`alert alert-\${type}\`;
-    alertElement.textContent = message;
-    alertElement.classList.remove('d-none');
-    // Auto-hide not typically needed for modal alerts, but can be added if desired
+function hideToast(toast) {
+    if (!toast || toast.classList.contains('hiding')) return;
+    toast.classList.add('hiding');
+    setTimeout(function() {
+        if (toast.parentNode) {
+            toast.parentNode.removeChild(toast);
+        }
+    }, 300);
 }
+
+
+
+
 
 // --- Telegram Settings Functions ---
 
@@ -7744,8 +9341,7 @@ async function loadTelegramSettings() {
             document.getElementById('enableTelegramNotifications').checked = !!settings.enable_notifications;
         }
     } catch (error) {
-        console.error('加载Telegram设置错误:', error);
-        showAlert('danger', \`加载Telegram设置失败: \${error.message}\`, 'telegramSettingsAlert');
+                showToast('danger', '加载Telegram设置失败: ' + error.message);
     }
 }
 
@@ -7760,10 +9356,10 @@ async function saveTelegramSettings() {
         enableNotifications = false;
         document.getElementById('enableTelegramNotifications').checked = false; // Update the checkbox UI
         if (document.getElementById('enableTelegramNotifications').checked && (botToken || chatId)) { // Only show warning if user intended to enable
-             showAlert('warning', 'Bot Token 和 Chat ID 均不能为空才能启用通知。通知已自动禁用。', 'telegramSettingsAlert');
+             showToast('warning', 'Bot Token 和 Chat ID 均不能为空才能启用通知。通知已自动禁用');
         }
     } else if (enableNotifications && (!botToken || !chatId)) { // This case should ideally not be hit due to above logic, but kept for safety
-        showAlert('warning', '启用通知时，Bot Token 和 Chat ID 不能为空。', 'telegramSettingsAlert');
+        showToast('warning', '启用通知时，Bot Token 和 Chat ID 不能为空');
         return;
     }
 
@@ -7778,13 +9374,116 @@ async function saveTelegramSettings() {
             })
         });
 
-        showAlert('success', 'Telegram设置已成功保存。', 'telegramSettingsAlert');
+        showToast('success', 'Telegram设置已成功保存');
 
     } catch (error) {
-        console.error('保存Telegram设置错误:', error);
-    showAlert('danger', \`保存Telegram设置失败: \${error.message}\`, 'telegramSettingsAlert');
+            showToast('danger', '保存Telegram设置失败: ' + error.message);
     }
 }
+
+// --- Background Settings Functions ---
+
+// 加载背景设置
+async function loadBackgroundSettings() {
+    try {
+        const settings = await apiRequest('/api/background-settings');
+        if (settings) {
+            document.getElementById('enableCustomBackground').checked = !!settings.enabled;
+            document.getElementById('backgroundImageUrl').value = settings.url || '';
+            document.getElementById('pageOpacity').value = settings.opacity || 80;
+            document.getElementById('opacityValue').textContent = settings.opacity || 80;
+
+            // 应用当前设置（不保存到数据库）
+            applyBackgroundSettings(settings.enabled, settings.url, settings.opacity, false);
+        }
+    } catch (error) {
+                showToast('danger', '加载背景设置失败: ' + error.message);
+    }
+}
+
+// 保存背景设置
+async function saveBackgroundSettings() {
+    const enabled = document.getElementById('enableCustomBackground').checked;
+    const url = document.getElementById('backgroundImageUrl').value.trim();
+    const opacity = parseInt(document.getElementById('pageOpacity').value, 10);
+
+    // 验证输入
+    if (enabled && url) {
+        if (!url.startsWith('https://')) {
+            showToast('warning', '背景图片URL必须以https://开头');
+            return;
+        }
+    }
+
+    if (isNaN(opacity) || opacity < 0 || opacity > 100) {
+        showToast('warning', '透明度必须是0-100之间的数字');
+        return;
+    }
+
+    try {
+        await apiRequest('/api/admin/background-settings', {
+            method: 'POST',
+            body: JSON.stringify({
+                enabled: enabled,
+                url: url,
+                opacity: opacity
+            })
+        });
+
+        // 应用设置并保存到localStorage
+        applyBackgroundSettings(enabled, url, opacity, true);
+
+        showToast('success', '背景设置已成功保存');
+
+    } catch (error) {
+                showToast('danger', '保存背景设置失败: ' + error.message);
+    }
+}
+
+// 应用背景设置
+function applyBackgroundSettings(enabled, url, opacity, saveToCache = false) {
+    const body = document.body;
+
+    if (enabled && url) {
+        // 设置背景图片
+        body.style.setProperty('--custom-background-url', \`url(\${url})\`);
+        body.style.setProperty('--page-opacity', opacity / 100);
+        body.classList.add('custom-background-enabled');
+
+
+    } else {
+        // 移除背景图片
+        body.style.removeProperty('--custom-background-url');
+        body.style.removeProperty('--page-opacity');
+        body.classList.remove('custom-background-enabled');
+
+
+    }
+
+    // 缓存设置到localStorage（可选）
+    if (saveToCache) {
+        const settings = { enabled, url, opacity, timestamp: Date.now() };
+        localStorage.setItem('background-settings-cache', JSON.stringify(settings));
+    }
+}
+
+// 实时预览透明度变化
+function updateOpacityPreview() {
+    const opacity = parseInt(document.getElementById('pageOpacity').value, 10);
+    const enabled = document.getElementById('enableCustomBackground').checked;
+    const url = document.getElementById('backgroundImageUrl').value.trim();
+
+    // 更新显示的数值
+    document.getElementById('opacityValue').textContent = opacity;
+
+    // 实时预览（不保存）
+    if (enabled && url) {
+        document.body.style.setProperty('--page-opacity', opacity / 100);
+
+    }
+}
+
+
 
 // --- Global Settings Functions (VPS Report Interval) ---
 async function loadGlobalSettings() {
@@ -7796,8 +9495,7 @@ async function loadGlobalSettings() {
             document.getElementById('vpsReportInterval').value = 60; // Default if not set
         }
     } catch (error) {
-        console.error('加载VPS报告间隔错误:', error);
-        showAlert('danger', \`加载VPS报告间隔失败: \${error.message}\`, 'serverAlert'); // Changed to serverAlert
+                showToast('danger', '加载VPS报告间隔失败: ' + error.message);
         document.getElementById('vpsReportInterval').value = 60; // Default on error
     }
 }
@@ -7807,7 +9505,7 @@ async function saveVpsReportInterval() {
     const interval = parseInt(intervalInput.value, 10);
 
     if (isNaN(interval) || interval < 1) { // Changed to interval < 1
-        showAlert('warning', 'VPS报告间隔必须是一个大于或等于1的数字。', 'serverAlert'); // Changed to serverAlert and message
+        showToast('warning', 'VPS报告间隔必须是一个大于或等于1的数字');
         return;
     }
     // Removed warning for interval < 10
@@ -7818,21 +9516,18 @@ async function saveVpsReportInterval() {
             body: JSON.stringify({ interval: interval })
         });
 
-        showAlert('success', 'VPS数据更新频率已成功保存。前端刷新间隔已立即更新。', 'serverAlert'); // Changed to serverAlert
+        showToast('success', 'VPS数据更新频率已成功保存。前端刷新间隔已立即更新');
 
         // Immediately update the frontend refresh interval
         // Check if we're on a page that has VPS data updates running
         if (typeof initializeVpsDataUpdates === 'function') {
             try {
                 await initializeVpsDataUpdates();
-                console.log('VPS data refresh interval updated immediately');
-            } catch (error) {
-                console.error('Error updating VPS refresh interval:', error);
-            }
+                            } catch (error) {
+                            }
         }
     } catch (error) {
-        console.error('保存VPS报告间隔错误:', error);
-        showAlert('danger', \`保存VPS报告间隔失败: \${error.message}\`, 'serverAlert'); // Changed to serverAlert
+                showToast('danger', '保存VPS报告间隔失败: ' + error.message);
     }
 }
 
@@ -7851,11 +9546,10 @@ async function autoSortServers(sortBy) {
 
         // 重新加载服务器列表
         await loadServerList();
-        showAlert('success', \`服务器已按\${getSortDisplayName(sortBy)}排序\`, 'serverAlert');
+        showToast('success', '服务器已按' + getSortDisplayName(sortBy) + '排序');
 
     } catch (error) {
-        console.error('服务器自动排序错误:', error);
-        showAlert('danger', '服务器自动排序失败: ' + error.message, 'serverAlert');
+                showToast('danger', '服务器自动排序失败: ' + error.message);
     }
 }
 
@@ -7872,11 +9566,10 @@ async function autoSortSites(sortBy) {
 
         // 重新加载网站列表
         await loadSiteList();
-        showAlert('success', \`网站已按\${getSortDisplayName(sortBy)}排序\`, 'siteAlert');
+        showToast('success', '网站已按' + getSortDisplayName(sortBy) + '排序');
 
     } catch (error) {
-        console.error('网站自动排序错误:', error);
-        showAlert('danger', '网站自动排序失败: ' + error.message, 'siteAlert');
+                showToast('danger', '网站自动排序失败: ' + error.message);
     }
 }
 
@@ -8024,8 +9717,7 @@ function renderMobileAdminServerCards(servers) {
         const lastUpdateRow = document.createElement('div');
         lastUpdateRow.className = 'mobile-card-row mobile-card-footer';
         lastUpdateRow.innerHTML = \`
-            <span class="mobile-card-label">最后更新</span>
-            <span class="mobile-card-value">\${lastUpdateText}</span>
+            <span class="mobile-card-label">最后更新: \${lastUpdateText}</span>
         \`;
         cardBody.appendChild(lastUpdateRow);
 
@@ -8071,12 +9763,10 @@ async function toggleServerVisibility(serverId, isPublic) {
             toggle.style.opacity = '1';
         }
 
-        showAlert('success', '服务器显示状态已' + (isPublic ? '开启' : '关闭'), 'serverAlert');
+        showToast('success', '服务器显示状态已' + (isPublic ? '开启' : '关闭'));
 
     } catch (error) {
-        console.error('切换服务器显示状态错误:', error);
-
-        // 恢复开关状态
+                // 恢复开关状态
         const toggle = document.querySelector(\`.server-visibility-toggle[data-server-id="\${serverId}"]\`);
         if (toggle) {
             toggle.checked = !isPublic;
@@ -8084,7 +9774,7 @@ async function toggleServerVisibility(serverId, isPublic) {
             toggle.style.opacity = '1';
         }
 
-        showAlert('danger', '切换显示状态失败: ' + error.message, 'serverAlert');
+        showToast('danger', '切换显示状态失败: ' + error.message);
     }
 }
 
@@ -8095,8 +9785,34 @@ function renderMobileAdminSiteCards(sites) {
 
     mobileContainer.innerHTML = '';
 
+    // 添加居中的排序和添加网站按钮
+    const mobileActionsContainer = document.createElement('div');
+    mobileActionsContainer.className = 'text-center mb-3';
+    mobileActionsContainer.innerHTML = \`
+        <div class="d-flex gap-2 justify-content-center">
+            <div class="dropdown">
+                <button class="btn btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                    <i class="bi bi-sort-alpha-down"></i> 自动排序
+                </button>
+                <ul class="dropdown-menu">
+                    <li><a class="dropdown-item active" href="#" onclick="autoSortSites('custom')">自定义排序</a></li>
+                    <li><a class="dropdown-item" href="#" onclick="autoSortSites('name')">按名称排序</a></li>
+                    <li><a class="dropdown-item" href="#" onclick="autoSortSites('url')">按URL排序</a></li>
+                    <li><a class="dropdown-item" href="#" onclick="autoSortSites('status')">按状态排序</a></li>
+                </ul>
+            </div>
+            <button id="addSiteBtnMobile" class="btn btn-success" onclick="showSiteModal()">
+                <i class="bi bi-plus-circle"></i> 添加监控网站
+            </button>
+        </div>
+    \`;
+    mobileContainer.appendChild(mobileActionsContainer);
+
     if (!sites || sites.length === 0) {
-        mobileContainer.innerHTML = '<div class="text-center p-3 text-muted">暂无监控网站数据</div>';
+        const noDataDiv = document.createElement('div');
+        noDataDiv.className = 'text-center p-3 text-muted';
+        noDataDiv.textContent = '暂无监控网站数据';
+        mobileContainer.appendChild(noDataDiv);
         return;
     }
 
@@ -8108,62 +9824,48 @@ function renderMobileAdminSiteCards(sites) {
         const lastCheckTime = site.last_checked ? new Date(site.last_checked * 1000).toLocaleString() : '从未';
         const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
 
-        // 卡片头部
+        // 卡片头部 - 完全参考服务器卡片布局：状态在左上角，网站名在中间，显示开关在右上角
         const cardHeader = document.createElement('div');
         cardHeader.className = 'mobile-card-header';
         cardHeader.innerHTML = \`
-            <h6 class="mobile-card-title">\${site.name || '未命名网站'}</h6>
-            <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+            <div class="mobile-card-header-left">
+                <span class="badge \${statusInfo.class}">\${statusInfo.text}</span>
+            </div>
+            <h6 class="mobile-card-title text-center">\${site.name || '未命名网站'}</h6>
+            <div class="mobile-card-header-right">
+                <span class="me-2">显示</span>
+                <div class="form-check form-switch d-inline-block">
+                    <input class="form-check-input site-visibility-toggle" type="checkbox"
+                           data-site-id="\${site.id}" \${site.is_public ? 'checked' : ''}>
+                </div>
+            </div>
         \`;
 
         // 卡片主体
         const cardBody = document.createElement('div');
         cardBody.className = 'mobile-card-body';
 
-        // URL - 单行
+        // URL 和网站链接 - 单行
         const urlRow = document.createElement('div');
         urlRow.className = 'mobile-card-row';
         urlRow.innerHTML = \`
-            <span class="mobile-card-label">URL</span>
-            <span class="mobile-card-value" style="word-break: break-all;">\${site.url}</span>
+            <span class="mobile-card-label" style="word-break: break-all;">
+                URL: \${site.url}<a href="\${site.url}" target="_blank" rel="noopener noreferrer" class="text-decoration-none" style="margin-left: 4px;"><i class="bi bi-box-arrow-up-right"></i></a>
+            </span>
         \`;
         cardBody.appendChild(urlRow);
 
-        // 状态码 | 响应时间
-        const statusCode = site.last_status_code || '-';
-        const statusResponseRow = document.createElement('div');
-        statusResponseRow.className = 'mobile-card-two-columns';
-        statusResponseRow.innerHTML = \`
-            <div class="mobile-card-column-item">
-                <span class="mobile-card-label">状态码</span>
-                <span class="mobile-card-value">\${statusCode}</span>
-            </div>
-            <div class="mobile-card-column-item">
-                <span class="mobile-card-label">响应时间</span>
-                <span class="mobile-card-value">\${responseTime}</span>
-            </div>
-        \`;
-        cardBody.appendChild(statusResponseRow);
 
-        // 最后检查和显示开关 - 两列
-        const lastCheckVisibilityRow = document.createElement('div');
-        lastCheckVisibilityRow.className = 'mobile-card-two-columns';
-        lastCheckVisibilityRow.innerHTML = \`
-            <div class="mobile-card-column-item">
-                <span class="mobile-card-label">最后检查</span>
-                <span class="mobile-card-value">\${lastCheckTime}</span>
-            </div>
-            <div class="mobile-card-column-item">
-                <span class="mobile-card-label">显示开关</span>
-                <div class="form-check form-switch">
-                    <input class="form-check-input site-visibility-toggle" type="checkbox"
-                           data-site-id="\${site.id}" \${site.is_public ? 'checked' : ''}>
-                </div>
-            </div>
-        \`;
-        cardBody.appendChild(lastCheckVisibilityRow);
 
-        // 操作按钮
+        // 最后检查 - 单行
+        const lastCheckRow = document.createElement('div');
+        lastCheckRow.className = 'mobile-card-row';
+        lastCheckRow.innerHTML = \`
+            <span class="mobile-card-label">最后检查: \${lastCheckTime}</span>
+        \`;
+        cardBody.appendChild(lastCheckRow);
+
+        // 操作按钮 - 编辑和删除
         const actionsRow = document.createElement('div');
         actionsRow.className = 'mobile-card-row';
         actionsRow.innerHTML = \`
@@ -8171,7 +9873,7 @@ function renderMobileAdminSiteCards(sites) {
                 <button class="btn btn-outline-primary btn-sm flex-fill" onclick="editSite('\${site.id}')">
                     <i class="bi bi-pencil"></i> 编辑
                 </button>
-                <button class="btn btn-outline-danger btn-sm" onclick="deleteSite('\${site.id}')">
+                <button class="btn btn-outline-danger btn-sm flex-fill" onclick="deleteSite('\${site.id}')">
                     <i class="bi bi-trash"></i> 删除
                 </button>
             </div>
@@ -8220,12 +9922,10 @@ async function toggleSiteVisibility(siteId, isPublic) {
             toggle.style.opacity = '1';
         }
 
-        showAlert('success', '网站显示状态已' + (isPublic ? '开启' : '关闭'), 'siteAlert');
+        showToast('success', '网站显示状态已' + (isPublic ? '开启' : '关闭'));
 
     } catch (error) {
-        console.error('切换网站显示状态错误:', error);
-
-        // 恢复开关状态
+                // 恢复开关状态
         const toggle = document.querySelector(\`.site-visibility-toggle[data-site-id="\${siteId}"]\`);
         if (toggle) {
             toggle.checked = !isPublic;
@@ -8233,7 +9933,7 @@ async function toggleSiteVisibility(siteId, isPublic) {
             toggle.style.opacity = '1';
         }
 
-        showAlert('danger', '切换显示状态失败: ' + error.message, 'siteAlert');
+        showToast('danger', '切换显示状态失败: ' + error.message);
     }
 }
 
@@ -8241,5 +9941,41 @@ async function toggleSiteVisibility(siteId, isPublic) {
 function showServerApiKey(serverId) {
     viewApiKey(serverId);
 }
+
+// ==================== 全局背景设置同步功能 ====================
+
+// 监听storage事件，实现跨页面设置同步
+window.addEventListener('storage', function(e) {
+    if (e.key === 'background-settings-cache' && e.newValue) {
+        try {
+            const newSettings = JSON.parse(e.newValue);
+            // 使用管理页面的背景设置应用函数
+            applyBackgroundSettings(newSettings.enabled, newSettings.url, newSettings.opacity, false);
+                    } catch (error) {
+                    }
+    }
+});
+
+// 页面加载时也检查并应用缓存的背景设置
+document.addEventListener('DOMContentLoaded', function() {
+    // 延迟执行，确保loadBackgroundSettings()先执行
+    setTimeout(function() {
+        const cached = localStorage.getItem('background-settings-cache');
+        if (cached) {
+            try {
+                const cachedData = JSON.parse(cached);
+                const now = Date.now();
+                const cacheAge = now - cachedData.timestamp;
+                const CACHE_DURATION = 5 * 60 * 1000; // 5分钟缓存
+
+                if (cacheAge < CACHE_DURATION) {
+                    // 缓存有效，确保设置已应用
+                    applyBackgroundSettings(cachedData.enabled, cachedData.url, cachedData.opacity, false);
+                                    }
+            } catch (error) {
+                            }
+        }
+    }, 100);
+});
 `;
 }
