@@ -52,7 +52,13 @@ Next, create a Worker and deploy the code.
 9. Paste the copied code into the Cloudflare Worker editor.
 10. Click the `Deploy` button in the top-right corner of the editor.
 
-### 3. Bind D1 Database to Worker
+### 3. Add Environment Variables
+
+In `Settings` → `Variables and Secrets`, add the following environment variables for enhanced security:
+1. Variable Name: `JWT_SECRET`, Type: `Secret`, Value: `Any random string of about 30 characters`
+2. Save and deploy after adding
+
+### 4. Bind D1 Database to Worker
 
 The Worker needs access to the D1 database you created earlier.
 
@@ -62,12 +68,6 @@ The Worker needs access to the D1 database you created earlier.
 4. In the `D1 Database` dropdown, select the database you created earlier (e.g., `vps-monitor-db`).
 5. Click `Deploy`.
 6. **Important! Initialize Database:** Copy your Worker URL to browser and append `/api/init-db`, like `vps-monitor.abo-vendor289.workers.dev/api/init-db`. Opening this link should show `{"success":true,"message":"数据库初始化完成"}` indicating the database is ready.
-
-### 4. Add Environment Variables
-
-In `Settings` → `Variables and Secrets`, add the following environment variables for enhanced security:
-1. Variable Name: `JWT_SECRET`, Type: `Secret`, Value: `Any random string of about 30 characters`
-2. Save and deploy after adding
 
 ### 5. Set Trigger Frequency (for website monitoring)
 
