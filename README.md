@@ -159,7 +159,7 @@ curl -O https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-m
 
 ## 注意事项
 
-*   **Worker 和 D1 每日配额:** Cloudflare Worker 和 D1 免费额度有限。详情请查阅 Cloudflare 文档。
+*   **Worker 和 D1 每日配额:** 本项目当前最大的限制是Worker请求数，主要是vps上报数据的消耗，每日请求数可以用这个公式计算：vps数量 *（86400/上报频率），得到的数字再除以100000就是已消耗百分比。
 *   **安全性:** 默认密码非常不安全 ，请务必在首次登录后修改。Agent 使用的 API 密钥也应妥善保管。
 *   **错误处理:** 如果面板或 Agent 遇到问题，可以检查 Worker 的日志（在 Cloudflare 控制面板 Worker 页面）和 Agent 的日志。
 *   以上所有内容和代码均为AI生成，出现问题请直接拿着代码找AI吧。
