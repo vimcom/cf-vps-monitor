@@ -283,11 +283,7 @@ class ConfigCache {
 // 全局配置缓存实例
 const configCache = new ConfigCache();
 
-// ==================== 定时任务优化 ====================
-
-// 任务执行计数器
-let taskCounter = 0;
-let dbInitialized = false;
+ 
 
 // ==================== 工具函数 ====================
 
