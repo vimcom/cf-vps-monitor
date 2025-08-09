@@ -84,23 +84,50 @@ async function flushVpsBatchData(env) {
 
   try {
     // 使用D1的batch操作进行批量写入
-    const statements = batchData.map(report =>
-      env.DB.prepare(`
-        REPLACE INTO metrics (server_id, timestamp, cpu, memory, disk, network, uptime)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        report.serverId,
-        report.timestamp,
-        report.cpu,
-        report.memory,
-        report.disk,
-        report.network,
-        report.uptime
-      )
-    );
+    const statements = [];
+    
+    batchData.forEach(report => {
+      // 判断服务器状态（基于上报时间）
+      const now = Math.floor(Date.now() / 1000);
+      const diffMinutes = (now - report.timestamp) / 60;
+      const status = diffMinutes <= 5 ? 'online' : 'offline';
+      
+      // 更新最新状态到metrics表（保持兼容性）
+      statements.push(
+        env.DB.prepare(`
+          REPLACE INTO metrics (server_id, timestamp, cpu, memory, disk, network, uptime)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          report.serverId,
+          report.timestamp,
+          report.cpu,
+          report.memory,
+          report.disk,
+          report.network,
+          report.uptime
+        )
+      );
+      
+      // 同时写入历史记录表
+      statements.push(
+        env.DB.prepare(`
+          INSERT INTO vps_status_history (server_id, timestamp, status, cpu, memory, disk, network, uptime)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          report.serverId,
+          report.timestamp,
+          status,
+          report.cpu,
+          report.memory,
+          report.disk,
+          report.network,
+          report.uptime
+        )
+      );
+    });
 
     await env.DB.batch(statements);
-    console.log(`批量写入${batchData.length}条VPS数据`);
+    console.log(`批量写入${batchData.length}条VPS数据（包含历史记录）`);
   } catch (error) {
     console.error('批量写入VPS数据失败:', error);
     // 如果批量写入失败，将数据重新加入缓冲区
@@ -120,6 +147,45 @@ async function scheduleVpsBatchFlush(env, ctx) {
     // 使用默认间隔60秒
     if (vpsBatchProcessor.shouldFlush(60)) {
       ctx.waitUntil(flushVpsBatchData(env));
+    }
+  }
+}
+
+// ==================== 实时数据缓存系统 ====================
+
+// 服务器最新数据缓存 - 直接存储agent上报的最新数据
+const realtimeDataCache = new Map();
+const REALTIME_CACHE_TTL = 5 * 60 * 1000; // 5分钟过期
+
+// 存储agent上报的实时数据
+function storeRealtimeData(serverId, metrics) {
+  realtimeDataCache.set(serverId, {
+    metrics: metrics,
+    timestamp: Date.now(),
+    lastUpdate: new Date().toISOString()
+  });
+}
+
+// 获取实时数据
+function getRealtimeData(serverId) {
+  const cached = realtimeDataCache.get(serverId);
+  if (!cached) return null;
+  
+  // 检查是否过期
+  if (Date.now() - cached.timestamp > REALTIME_CACHE_TTL) {
+    realtimeDataCache.delete(serverId);
+    return null;
+  }
+  
+  return cached;
+}
+
+// 清理过期的实时数据缓存
+function cleanupRealtimeCache() {
+  const now = Date.now();
+  for (const [serverId, data] of realtimeDataCache.entries()) {
+    if (now - data.timestamp > REALTIME_CACHE_TTL) {
+      realtimeDataCache.delete(serverId);
     }
   }
 }
@@ -192,7 +258,7 @@ class ConfigCache {
     const cached = this.get(cacheKey);
     if (cached) return cached;
 
-    let query = 'SELECT id, name, description FROM servers';
+    let query = 'SELECT id, name, description,realtime_endpoint FROM servers';
     if (!isAdmin) {
       query += ' WHERE is_public = 1';
     }
@@ -225,11 +291,216 @@ let dbInitialized = false;
 
 // ==================== 工具函数 ====================
 
+// 计算VPS服务器在线率
+async function calculateVpsUptime(env, serverId, hours = 24) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const startTime = now - (hours * 60 * 60);
+    
+    // 获取服务器的创建时间
+    const serverInfo = await env.DB.prepare(
+      'SELECT created_at FROM servers WHERE id = ?'
+    ).bind(serverId).first();
+    
+    // 获取指定时间范围内的历史数据
+    const { results } = await env.DB.prepare(`
+      SELECT timestamp, status
+      FROM vps_status_history
+      WHERE server_id = ? AND timestamp >= ?
+      ORDER BY timestamp ASC
+    `).bind(serverId, startTime).all();
+    
+    // 计算实际的总时间（考虑服务器创建时间）
+    const serverCreatedAt = serverInfo?.created_at ? Math.floor(new Date(serverInfo.created_at).getTime() / 1000) : startTime;
+    const actualStartTime = Math.max(serverCreatedAt, startTime);
+    if (!results || results.length === 0) { 
+      return { 
+        uptime: 0, 
+        totalTime: 0,  
+        onlineTime: 0 
+      };
+    }
+    
+    let onlineTime = 0;
+    let lastTimestamp = actualStartTime;
+    let lastStatus = '';
+     
+    for (const record of results) {
+      // 如果上个状态是online，累计时间
+      if (record.status === 'online') {
+        onlineTime += record.timestamp - lastTimestamp;
+      }
+      lastTimestamp = record.timestamp;
+      lastStatus = record.status;
+    }
+    
+    const actualTotalTime = Math.max(0, lastTimestamp - actualStartTime);
+    // 处理最后一个状态到现在的时间
+    //if (lastStatus === 'online') {
+    //  onlineTime += now - lastTimestamp;
+    //}
+    
+    
+    let uptimePercentage = 100;
+    if(onlineTime===actualTotalTime) {
+		uptimePercentage=100;
+	}
+	else {
+	    uptimePercentage= actualTotalTime > 0 ? Math.min(100, (onlineTime / actualTotalTime) * 100) : 0;
+		uptimePercentage= Math.round(uptimePercentage * 100) / 100;
+	}
+    return {
+      uptime: uptimePercentage, // 保留两位小数
+      totalTime: Math.round(actualTotalTime / 60), // 转换为分钟
+      onlineTime: Math.round(onlineTime / 60) // 转换为分钟
+    };
+  } catch (error) {
+    console.error('计算VPS在线率失败:', error);
+    return { uptime: 0, totalTime: 0, onlineTime: 0 };
+  }
+}
+
+// 格式化时间duration（秒）为可读格式
+function formatDuration(seconds) {
+  if (seconds < 60) {
+    return `${seconds}秒`;
+  } else if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return remainingSeconds > 0 
+      ? `${minutes}分${remainingSeconds}秒` 
+      : `${minutes}分钟`;
+  } else if (seconds < 86400) {
+    const hours = Math.floor(seconds / 3600);
+    const remainingMinutes = Math.floor((seconds % 3600) / 60);
+    return remainingMinutes > 0 
+      ? `${hours}小时${remainingMinutes}分钟` 
+      : `${hours}小时`;
+  } else {
+    const days = Math.floor(seconds / 86400);
+    const remainingHours = Math.floor((seconds % 86400) / 3600);
+    return remainingHours > 0 
+      ? `${days}天${remainingHours}小时` 
+      : `${days}天`;
+  }
+}
+
+// 计算网站在线率
+async function calculateSiteUptime(env, siteId, hours = 24) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const startTime = now - (hours * 60 * 60);
+    
+    // 获取网站的创建时间
+    const siteInfo = await env.DB.prepare(
+      'SELECT added_at FROM monitored_sites WHERE id = ?'
+    ).bind(siteId).first();
+    
+    // 获取指定时间范围内的历史数据
+    const { results } = await env.DB.prepare(`
+      SELECT timestamp, status
+      FROM site_status_history
+      WHERE site_id = ? AND timestamp >= ?
+      ORDER BY timestamp ASC
+    `).bind(siteId, startTime).all();
+    
+    if (!results || results.length === 0) {
+      // 计算网站实际监控时间
+      const siteCreatedAt = siteInfo?.added_at ? Math.floor(new Date(siteInfo.added_at).getTime() / 1000) : startTime;
+      const actualStartTime = Math.max(siteCreatedAt, startTime);
+      const actualTotalTime = Math.max(0, now - actualStartTime);
+      
+      // 如果没有历史数据，检查网站当前状态
+      try {
+        const currentSiteStatus = await env.DB.prepare(
+          'SELECT last_status FROM monitored_sites WHERE id = ?'
+        ).bind(siteId).first();
+        
+        // 如果网站当前状态是在线且有监控时间，则认为整个时间段都在线
+        if (currentSiteStatus?.last_status === 'UP' && actualTotalTime > 0) {
+          return {
+            uptime: 100.0,
+            totalTime: Math.round(actualTotalTime / 60),
+            onlineTime: Math.round(actualTotalTime / 60),
+			
+			startTime: siteInfo?.added_at
+          };
+        }
+      } catch (statusError) {
+        console.error('获取网站当前状态失败:', statusError);
+      }
+      
+      return { 
+        uptime: 0, 
+        totalTime: Math.round(actualTotalTime / 60), // 转换为分钟
+        onlineTime: 0 ,
+		startTime: siteInfo?.added_at
+      };
+    }
+    
+    let onlineTime = 0;
+    let onlineCount = 0;
+    let checkCount = 0;
+    let lastTimestamp = startTime;
+    let lastStatus = 'UP';
+    
+    // 如果有网站创建时间，且创建时间晚于查询开始时间，则从创建时间开始计算
+    if (siteInfo?.added_at) {
+      const siteCreatedAt = Math.floor(new Date(siteInfo.added_at).getTime() / 1000);
+      if (siteCreatedAt > startTime) {
+        lastTimestamp = siteCreatedAt;
+      }
+    }
+    
+    for (const record of results) {
+      // 如果上个状态是online，累计时间
+      if (lastStatus === 'UP') {
+	    onlineCount +=1;
+        onlineTime += record.timestamp - lastTimestamp;
+      }
+	  checkCount +=1;
+      lastTimestamp = record.timestamp;
+      lastStatus = record.status;
+    }
+    
+    // 处理最后一个状态到现在的时间
+    if (lastStatus === 'UP') {
+      onlineTime += now - lastTimestamp;
+	  onlineCount +=1;
+	  checkCount +=1;
+    }
+    
+    // 计算实际的总时间（考虑网站创建时间）
+    const siteCreatedAt = siteInfo?.added_at ? Math.floor(new Date(siteInfo.added_at).getTime() / 1000) : startTime;
+    const actualStartTime = Math.max(siteCreatedAt, startTime);
+    const actualTotalTime = Math.max(0, now - actualStartTime);
+    
+    const uptimePercentage = checkCount > 0 ? Math.min(100, (onlineCount / checkCount) * 100) : 0;
+    if (onlineCount===checkCount) {
+		return {
+		  uptime: 100, // 保留两位小数
+		  totalTime: Math.round(actualTotalTime / 60), // 转换为分钟
+		  onlineTime: Math.round(onlineTime / 60), // 转换为分钟
+		  me: 2
+		};
+	}
+    return {
+      uptime: Math.round(uptimePercentage * 100) / 100, // 保留两位小数
+      totalTime: Math.round(actualTotalTime / 60), // 转换为分钟
+      onlineTime: Math.round(onlineTime / 60), // 转换为分钟
+	  me: 3
+    };
+  } catch (error) {
+    console.error('计算网站在线率失败:', error);
+    return { uptime: 0, totalTime: 0, onlineTime: 0 };
+  }
+}
+
 // SQL安全验证 - 防止注入攻击
 function validateSqlIdentifier(value, type) {
   const whitelist = {
     column: ['id', 'name', 'url', 'description', 'sort_order', 'is_public', 'last_checked', 'last_status', 'timestamp', 'cpu', 'memory', 'disk', 'network', 'uptime'],
-    table: ['servers', 'monitored_sites', 'metrics', 'site_status_history'],
+    table: ['servers', 'monitored_sites', 'metrics', 'site_status_history', 'vps_status_history'],
     order: ['ASC', 'DESC']
   };
 
@@ -325,6 +596,21 @@ function extractPathSegment(path, index) {
 
   const segment = segments[index];
   return segment && /^[a-zA-Z0-9_-]{1,50}$/.test(segment) ? segment : null;
+}
+
+// 生成随机ID
+function generateId() {
+  return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+}
+
+// 生成安全的API密钥
+function generateSecureApiKey() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 32; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
 }
 
 // 提取服务器ID的便捷函数
@@ -462,10 +748,21 @@ async function validateServerAuth(path, request, env) {
 // ==================== 统一数据库错误处理 ====================
 
 function handleDbError(error, corsHeaders, operation = 'database operation') {
+  console.error(`数据库错误在 \${operation}:`, error);
+  
   if (error.message.includes('no such table')) {
     return createErrorResponse(
       'Database table missing',
-      '数据库表不存在，请重试',
+      `数据库表不存在，请联系管理员初始化系统。操作: ${operation}`,
+      503,
+      corsHeaders
+    );
+  }
+
+  if (error.message.includes('SQLITE_BUSY') || error.message.includes('database is locked')) {
+    return createErrorResponse(
+      'Database busy',
+      '数据库忙碌，请稍后重试',
       503,
       corsHeaders
     );
@@ -473,7 +770,7 @@ function handleDbError(error, corsHeaders, operation = 'database operation') {
 
   return createErrorResponse(
     'Internal server error',
-    '系统暂时不可用，请稍后重试',
+    `系统暂时不可用，请稍后重试。数据库操作: ${operation}`,
     500,
     corsHeaders
   );
@@ -830,15 +1127,17 @@ const D1_SCHEMAS = {
 
   metrics: `
     CREATE TABLE IF NOT EXISTS metrics (
-      server_id TEXT PRIMARY KEY,
-      timestamp INTEGER,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      server_id TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
       cpu TEXT,
       memory TEXT,
       disk TEXT,
       network TEXT,
       uptime INTEGER,
       FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
-    );`,
+    );
+    CREATE INDEX IF NOT EXISTS idx_metrics_server_id_timestamp ON metrics (server_id, timestamp DESC);`,
 
   monitored_sites: `
     CREATE TABLE IF NOT EXISTS monitored_sites (
@@ -863,6 +1162,7 @@ const D1_SCHEMAS = {
       status TEXT NOT NULL,
       status_code INTEGER,
       response_time_ms INTEGER,
+	  note TEXT,
       FOREIGN KEY(site_id) REFERENCES monitored_sites(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_site_status_history_site_id_timestamp ON site_status_history (site_id, timestamp DESC);`,
@@ -885,7 +1185,22 @@ const D1_SCHEMAS = {
     INSERT OR IGNORE INTO app_config (key, value) VALUES ('vps_report_interval_seconds', '60');
     INSERT OR IGNORE INTO app_config (key, value) VALUES ('custom_background_enabled', 'false');
     INSERT OR IGNORE INTO app_config (key, value) VALUES ('custom_background_url', '');
-    INSERT OR IGNORE INTO app_config (key, value) VALUES ('page_opacity', '80');`
+    INSERT OR IGNORE INTO app_config (key, value) VALUES ('page_opacity', '80');`,
+
+  vps_status_history: `
+    CREATE TABLE IF NOT EXISTS vps_status_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      server_id TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      cpu TEXT,
+      memory TEXT,
+      disk TEXT,
+      network TEXT,
+      uptime INTEGER,
+      FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_vps_status_history_server_id_timestamp ON vps_status_history (server_id, timestamp DESC);`
 };
 
 // ==================== 数据库初始化 ====================
@@ -915,7 +1230,9 @@ async function applySchemaAlterations(db) {
     "ALTER TABLE admin_credentials ADD COLUMN must_change_password INTEGER DEFAULT 0",
     "ALTER TABLE admin_credentials ADD COLUMN password_changed_at INTEGER DEFAULT NULL",
     "ALTER TABLE servers ADD COLUMN is_public INTEGER DEFAULT 1",
-    "ALTER TABLE monitored_sites ADD COLUMN is_public INTEGER DEFAULT 1"
+    "ALTER TABLE monitored_sites ADD COLUMN is_public INTEGER DEFAULT 1",
+    "ALTER TABLE site_status_history ADD COLUMN note TEXT",
+    "ALTER TABLE servers ADD COLUMN realtime_endpoint TEXT DEFAULT NULL"
   ];
 
   for (const alterSql of alterStatements) {
@@ -1244,7 +1561,8 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
     try {
       const { results } = await env.DB.prepare(`
         SELECT s.id, s.name, s.description, s.created_at, s.sort_order,
-               s.last_notified_down_at, s.api_key, s.is_public, m.timestamp as last_report
+               s.last_notified_down_at, s.api_key, s.is_public, s.realtime_endpoint, 
+               m.timestamp as last_report
         FROM servers s
         LEFT JOIN metrics m ON s.id = m.server_id
         ORDER BY s.sort_order ASC NULLS LAST, s.name ASC
@@ -1332,7 +1650,7 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
         );
       }
 
-      const { name, description } = await request.json();
+      const { name, description, realtime_endpoint } = await request.json();
       if (!validateInput(name, 'serverName')) {
         return createErrorResponse(
           'Invalid server name',
@@ -1342,9 +1660,34 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
         );
       }
 
+      // 验证实时监控端点URL格式
+      let realtimeEndpoint = null;
+      if (realtime_endpoint && realtime_endpoint.trim()) {
+        const endpoint = realtime_endpoint.trim();
+        try {
+          const url = new URL(endpoint);
+          if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            return createErrorResponse(
+              'Invalid endpoint URL',
+              '实时监控端点必须是有效的HTTP/HTTPS URL',
+              400,
+              corsHeaders
+            );
+          }
+          realtimeEndpoint = endpoint;
+        } catch (urlError) {
+          return createErrorResponse(
+            'Invalid endpoint URL',
+            '实时监控端点URL格式无效',
+            400,
+            corsHeaders
+          );
+        }
+      }
+
       const info = await env.DB.prepare(`
-        UPDATE servers SET name = ?, description = ? WHERE id = ?
-      `).bind(name, description || '', serverId).run();
+        UPDATE servers SET name = ?, description = ?, realtime_endpoint = ? WHERE id = ?
+      `).bind(name, description || '', realtimeEndpoint, serverId).run();
 
       if (info.changes === 0) {
         return createErrorResponse('Server not found', '服务器不存在', 404, corsHeaders);
@@ -1412,6 +1755,109 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
 
     } catch (error) {
             return handleDbError(error, corsHeaders, '删除服务器');
+    }
+  }
+
+  // 获取VPS服务器在线率（管理员和公开API）
+  if (path.match(/\/api\/servers\/([^\/]+)\/uptime$/) && method === 'GET') {
+    try {
+      const serverId = path.split('/')[3];
+      
+      // 检查权限：管理员或公开服务器
+      const user = await authenticateRequestOptional(request, env);
+      const isAdmin = user !== null;
+      
+      if (!isAdmin) {
+        // 检查服务器是否公开
+        const server = await env.DB.prepare(
+          'SELECT is_public FROM servers WHERE id = ?'
+        ).bind(serverId).first();
+        
+        if (!server || !server.is_public) {
+          return createErrorResponse('Not Found', '服务器不存在或未公开', 404, corsHeaders);
+        }
+      }
+      
+      // 解析时间参数
+      const url = new URL(request.url);
+      const period = url.searchParams.get('period') || '24h';
+      
+      let hours;
+      switch (period) {
+        case '24h': hours = 24; break;
+        case '3d': hours = 24 * 3; break;
+        case '30d': hours = 24 * 30; break;
+        case '90d': hours = 24 * 90; break;
+        case '180d': hours = 24 * 180; break;
+        case '365d': hours = 24 * 365; break;
+        default: hours = 24;
+      }
+      
+      // 计算在线率
+      const uptimeData = await calculateVpsUptime(env, serverId, hours);
+      
+      return createApiResponse({
+        serverId,
+        period,
+        uptime: uptimeData.uptime,
+        totalTime: uptimeData.totalTime,
+        onlineTime: uptimeData.onlineTime
+      }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取服务器在线率');
+    }
+  }
+
+  // 获取所有VPS服务器在线率（管理员）
+  if (path === '/api/admin/servers/uptime' && method === 'GET') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      // 解析时间参数
+      const url = new URL(request.url);
+      const period = url.searchParams.get('period') || '24h';
+      
+      let hours;
+      switch (period) {
+        case '24h': hours = 24; break;
+        case '3d': hours = 24 * 3; break;
+        case '30d': hours = 24 * 30; break;
+        case '90d': hours = 24 * 90; break;
+        case '180d': hours = 24 * 180; break;
+        case '365d': hours = 24 * 365; break;
+        default: hours = 24;
+      }
+      
+      // 获取所有服务器
+      const { results } = await env.DB.prepare(
+        'SELECT id, name FROM servers ORDER BY sort_order ASC NULLS LAST, name ASC'
+      ).all();
+      
+      const uptimeResults = [];
+      
+      // 为每个服务器计算在线率
+      for (const server of results || []) {
+        const uptimeData = await calculateVpsUptime(env, server.id, hours);
+        uptimeResults.push({
+          id: server.id,  // 使用 id 而不是 serverId
+          serverName: server.name,
+          uptime: uptimeData.uptime,
+          totalTime: uptimeData.totalTime,
+          onlineTime: uptimeData.onlineTime
+        });
+      }
+      
+      return createApiResponse({
+        period,
+        servers: uptimeResults
+      }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取所有服务器在线率');
     }
   }
 
@@ -1492,6 +1938,16 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders, ctx) {
 
       reportData = validationResult.data;
 
+      // 存储到实时数据缓存（优先级高，立即存储）
+      storeRealtimeData(serverId, {
+        cpu: reportData.cpu,
+        memory: reportData.memory,
+        disk: reportData.disk,
+        network: reportData.network,
+        uptime: reportData.uptime,
+        timestamp: reportData.timestamp
+      });
+
       // 获取当前的批量写入间隔（与VPS上报间隔一致）
       const currentInterval = await getVpsReportInterval(env);
 
@@ -1523,7 +1979,7 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders, ctx) {
 
       // 使用JOIN查询一次性获取所有VPS状态
       const { results } = await env.DB.prepare(`
-        SELECT s.id, s.name, s.description,
+        SELECT s.id, s.name, s.description,s.realtime_endpoint,
                m.timestamp, m.cpu, m.memory, m.disk, m.network, m.uptime
         FROM servers s
         LEFT JOIN metrics m ON s.id = m.server_id
@@ -1533,7 +1989,7 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders, ctx) {
 
       // 处理数据格式，保持与单个查询API的兼容性
       const servers = (results || []).map(row => {
-        const server = { id: row.id, name: row.name, description: row.description };
+        const server = { id: row.id, name: row.name, description: row.description ,realtime_endpoint: row.realtime_endpoint};
         let metrics = null;
 
         if (row.timestamp) {
@@ -1559,8 +2015,66 @@ async function handleVpsRoutes(path, method, request, env, corsHeaders, ctx) {
       return createApiResponse({ servers }, 200, corsHeaders);
 
     } catch (error) {
-            return handleDbError(error, corsHeaders, '批量VPS状态查询');
+            return handleDbError(error, corsHeaders, '批量状态查询');
     }
+  }
+ 
+  // 实时VPS状态查询（ 无需认证） 
+    if (path.startsWith('/api/realtime/') && method === 'GET') {
+      const serverId = path.split('/')[3]; 
+      if (!serverId || serverId === '') {
+        return createErrorResponse('Invalid server ID', '无效的服务器ID', 400, corsHeaders);
+      }
+
+      // 验证服务器是否存在，并获取实时监控端点配置
+      const serverResult = await env.DB.prepare('SELECT id, name, realtime_endpoint FROM servers WHERE id = ?').bind(serverId).first();
+      if (!serverResult) {
+        return createErrorResponse('Server not found', '服务器不存在', 404, corsHeaders);
+      } 
+
+	// 如果配置了实时端点，尝试直接访问VPS
+	if (serverResult.realtime_endpoint) {
+	
+		try {
+		  const response = await fetch(serverResult.realtime_endpoint, {
+			method: 'GET',
+			headers: {
+			  'Accept': 'application/json',
+			  'User-Agent': 'VPS-Monitor/1.0'
+			},
+			signal: AbortSignal.timeout(5000) // 5秒超时
+		  });
+
+  return createApiResponse({
+				success: true,
+				source: 'real',
+				data: await response.json()
+			  }, 200, corsHeaders);
+		  if (response.ok) {
+			const data = await response.json();
+			if (data.success && data.data) {
+			  return createApiResponse({
+				success: true,
+				source: 'real',
+				data: data.data
+			  }, 200, corsHeaders);
+			}
+		  }
+		} catch (fetchError) { 
+		return createApiResponse({
+				success: false,
+				source: 'real',
+				data: 'vps接口数据获取失败'
+			  }, 200, corsHeaders); 
+		}         
+	}  
+	else{
+		return createApiResponse({
+			success: false,
+			source: 'real',
+			data: '未配置实时监控api'
+		  }, 200, corsHeaders);
+	}
   }
 
   // VPS状态查询（公开，无需认证）
@@ -1702,7 +2216,7 @@ async function handleApiRequest(request, env, ctx) {
 
   // VPS监控路由
   if (path.startsWith('/api/config/') || path.startsWith('/api/report/') ||
-      path.startsWith('/api/status/') || path.startsWith('/api/notify/')) {
+      path.startsWith('/api/status/') || path.startsWith('/api/notify/')|| path.startsWith('/api/realtime/')) {
     const vpsResult = await handleVpsRoutes(path, method, request, env, corsHeaders, ctx);
     if (vpsResult) return vpsResult;
   }
@@ -1723,28 +2237,6 @@ async function handleApiRequest(request, env, ctx) {
       );
     }
   }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1864,6 +2356,329 @@ async function handleApiRequest(request, env, ctx) {
         status: 500,
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
+    }
+  }
+
+  // 导出服务器列表（管理员）
+  if (path === '/api/admin/servers/export' && method === 'GET') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const { results } = await env.DB.prepare(`
+        SELECT id, name, description, sort_order, is_public, created_at, api_key
+        FROM servers
+        ORDER BY sort_order ASC NULLS LAST, name ASC
+      `).all();
+
+      const exportData = {
+        type: 'servers',
+        version: '1.0',
+        exportTime: new Date().toISOString(),
+        data: (results || []).map(server => ({
+          id: server.id,
+          name: server.name,
+          description: server.description || '',
+          sort_order: server.sort_order,
+          is_public: server.is_public || 1,
+          api_key: server.api_key,
+          created_at: server.created_at
+        }))
+      };
+
+      return createApiResponse(exportData, 200, corsHeaders);
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '导出服务器列表');
+    }
+  }
+
+  // 导入服务器列表（管理员）
+  if (path === '/api/admin/servers/import' && method === 'POST') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const importData = await request.json();
+      
+      // 验证导入数据格式
+      if (!importData || importData.type !== 'servers' || !Array.isArray(importData.data)) {
+        return createErrorResponse('Invalid format', '导入数据格式无效', 400, corsHeaders);
+      }
+
+      const servers = importData.data;
+      let importedCount = 0;
+      let skippedCount = 0;
+      const errors = [];
+
+      for (const server of servers) {
+        try {
+          // 验证必要字段
+          if (!server.name || typeof server.name !== 'string') {
+            errors.push(`服务器名称无效: ${JSON.stringify(server)}`);
+            continue;
+          }
+
+          // 检查是否已存在同ID或同名服务器
+          let existing = null;
+          if (server.id) {
+            existing = await env.DB.prepare(
+              'SELECT id FROM servers WHERE id = ?'
+            ).bind(server.id).first();
+          }
+          
+          if (!existing && server.name) {
+            existing = await env.DB.prepare(
+              'SELECT id FROM servers WHERE name = ?'
+            ).bind(server.name).first();
+          }
+
+          if (existing) {
+            skippedCount++;
+            continue;
+          }
+
+          // 使用导出的ID和API密钥，如果没有则生成新的
+          const serverId = server.id || generateId();
+          const apiKey = server.api_key || generateSecureApiKey();
+          const now = server.created_at ? Math.floor(new Date(server.created_at).getTime() / 1000) : Math.floor(Date.now() / 1000);
+
+          await env.DB.prepare(`
+            INSERT INTO servers (id, name, description, api_key, created_at, sort_order, is_public)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            serverId,
+            server.name,
+            server.description || '',
+            apiKey,
+            now,
+            server.sort_order || null,
+            server.is_public !== undefined ? server.is_public : 1
+          ).run();
+
+          importedCount++;
+        } catch (serverError) {
+          errors.push(`导入服务器 "${server.name}" 失败: ${serverError.message}`);
+        }
+      }
+
+      // 清除缓存
+      configCache.clearKey('servers_admin');
+      configCache.clearKey('servers_public');
+
+      return createApiResponse({
+        success: true,
+        message: `导入完成: ${importedCount} 个服务器已导入, ${skippedCount} 个已跳过`,
+        imported: importedCount,
+        skipped: skippedCount,
+        errors: errors
+      }, 200, corsHeaders);
+
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '导入服务器列表');
+    }
+  }
+
+  // 初始化所有服务器在线率（管理员）
+  if (path === '/api/admin/servers/init-uptime' && method === 'POST') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      // 获取所有服务器
+      const { results } = await env.DB.prepare(
+        'SELECT id FROM servers'
+      ).all();
+      
+      let count = 0;
+      const now = Math.floor(Date.now() / 1000);
+      
+      // 为每个服务器创建初始在线率记录
+      for (const server of results || []) {
+        // 清除历史数据
+        await env.DB.prepare(
+          'DELETE FROM vps_status_history WHERE server_id = ?'
+        ).bind(server.id).run();
+        
+        // 更新服务器的创建时间为当前时间（作为在线率计算的起始点）
+        await env.DB.prepare(
+          'UPDATE servers SET created_at = ? WHERE id = ?'
+        ).bind(new Date().toISOString(), server.id).run();
+        
+        // 插入初始在线状态记录
+        await env.DB.prepare(`
+          INSERT INTO vps_status_history (server_id, timestamp, status)
+          VALUES (?, ?, 'online')
+        `).bind(server.id, now).run();
+        
+        count++;
+      }
+      
+      return createApiResponse({
+        success: true,
+        message: `已初始化 ${count} 个服务器的在线率`,
+        count
+      }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '初始化服务器在线率');
+    }
+  }
+
+  // 获取VPS服务器详细在线率历史（管理员和公开API）
+  if (path.match(/\/api\/servers\/([^\/]+)\/uptime\/history$/) && method === 'GET') {
+    try {
+      const serverId = path.split('/')[3];
+      
+      // 检查权限：管理员或公开服务器
+      const user = await authenticateRequestOptional(request, env);
+      const isAdmin = user !== null;
+      
+      if (!isAdmin) {
+        // 检查服务器是否公开
+        const server = await env.DB.prepare(
+          'SELECT is_public FROM servers WHERE id = ?'
+        ).bind(serverId).first();
+        
+        if (!server || !server.is_public) {
+          return createErrorResponse('Not Found', '服务器不存在或未公开', 404, corsHeaders);
+        }
+      }
+      
+      // 解析时间参数
+      const url = new URL(request.url);
+      const period = url.searchParams.get('period') || '24h';
+      
+      let hours;
+      switch (period) {
+        case '24h': hours = 24; break;
+        case '3d': hours = 24 * 3; break;
+        case '30d': hours = 24 * 30; break;
+        case '90d': hours = 24 * 90; break;
+        case '180d': hours = 24 * 180; break;
+        case '365d': hours = 24 * 365; break;
+        default: hours = 24;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      const startTime = now - (hours * 60 * 60);
+      
+      // 获取服务器信息
+      const serverInfo = await env.DB.prepare(
+        'SELECT name, created_at FROM servers WHERE id = ?'
+      ).bind(serverId).first();
+      
+      if (!serverInfo) {
+        return createErrorResponse('Not Found', '服务器不存在', 404, corsHeaders);
+      }
+      
+      // 获取历史状态变化记录
+      const { results } = await env.DB.prepare(`
+        SELECT timestamp, status
+        FROM vps_status_history
+        WHERE server_id = ? AND timestamp >= ?
+        ORDER BY timestamp ASC
+      `).bind(serverId, startTime).all();
+      
+      // 分析断开时间段
+      const downtimes = [];
+      let lastStatus = 'online';
+      let lastTimestamp = startTime;
+      let offlineStart = null;
+      
+      // 考虑服务器创建时间
+      const serverCreatedAt = serverInfo.created_at ? Math.floor(new Date(serverInfo.created_at).getTime() / 1000) : startTime;
+      const actualStartTime = Math.max(serverCreatedAt, startTime);
+	  if ( (now-actualStartTime)/3600 < hours ) {
+		hours=Math.floor((now-actualStartTime)/3600);
+	  } 
+      for (const record of results || []) {
+        if (lastStatus === 'online' && record.status === 'offline') {
+          // 开始断开
+          offlineStart = record.timestamp;
+        } else if (lastStatus === 'offline' && record.status === 'online') {
+          // 恢复在线
+          if (offlineStart) {
+            const duration = record.timestamp - offlineStart;
+            downtimes.push({
+              startTime: offlineStart,
+              endTime: record.timestamp,
+              duration: duration,
+              startTimeFormatted: offlineStart ,
+              endTimeFormatted: record.timestamp ,
+              durationFormatted: formatDuration(duration)
+            });
+          }
+        }
+        lastStatus = record.status;
+        lastTimestamp = record.timestamp;
+      }
+      
+      // 如果当前仍然离线，添加到断开记录
+      if (lastStatus === 'offline' && offlineStart) {
+        const duration = now - offlineStart;
+        downtimes.push({
+          startTime: offlineStart,
+          endTime: null, // 当前仍离线
+          duration: duration,
+          startTimeFormatted: offlineStart ,
+          endTimeFormatted: '仍离线',
+          durationFormatted: formatDuration(duration)
+        });
+      }
+      
+      // 计算总体统计
+      const uptimeData = await calculateVpsUptime(env, serverId, hours);
+      
+      // 生成图表数据点 (每小时一个数据点)
+      const chartDataPoints = [];
+      const dataPointInterval = Math.max(1, Math.floor(hours / 72)); // 最多72个数据点
+      
+      for (let i = 0; i < hours; i += dataPointInterval) {
+        const pointStartTime = actualStartTime + (i * 60 * 60);
+        const pointEndTime = Math.min(actualStartTime + ((i + dataPointInterval) * 60 * 60), now);
+        
+        // 检查这个时间段内是否在线
+        let isOnline = true;
+        for (const downtime of downtimes) {
+          const downtimeStart = downtime.startTime;
+          const downtimeEnd = downtime.endTime || now;
+          
+          if (!(pointEndTime <= downtimeStart || pointStartTime >= downtimeEnd)) {
+            isOnline = false;
+            break;
+          }
+        }
+        
+        chartDataPoints.push({
+          timestamp: pointStartTime,
+          timeFormatted: pointStartTime ,
+          status: isOnline ? 'online' : 'offline'
+        });
+      }
+      
+      return createApiResponse({
+        serverId,
+        serverName: serverInfo.name,
+        period,
+        periodHours: hours,
+        actualStartTime: actualStartTime,
+        startTimeFormatted: actualStartTime ,
+        uptime: uptimeData.uptime,
+        totalTime: uptimeData.totalTime,
+        onlineTime: uptimeData.onlineTime,
+        downtimeCount: downtimes.length,
+        downtimes: downtimes,
+        chartData: chartDataPoints
+      }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取服务器在线率历史');
     }
   }
 
@@ -2384,6 +3199,117 @@ async function handleApiRequest(request, env, ctx) {
     }
   }
 
+  // 导出网站列表（管理员）
+  if (path === '/api/admin/sites/export' && method === 'GET') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const { results } = await env.DB.prepare(`
+        SELECT id, name, url, description, sort_order, is_public
+        FROM monitored_sites
+        ORDER BY sort_order ASC NULLS LAST, name ASC
+      `).all();
+
+      const exportData = {
+        type: 'sites',
+        version: '1.0',
+        exportTime: new Date().toISOString(),
+        data: (results || []).map(site => ({
+          name: site.name || '',
+          url: site.url,
+          description: site.description || '',
+          sort_order: site.sort_order,
+          is_public: site.is_public || 1
+        }))
+      };
+
+      return createApiResponse(exportData, 200, corsHeaders);
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '导出网站列表');
+    }
+  }
+
+  // 导入网站列表（管理员）
+  if (path === '/api/admin/sites/import' && method === 'POST') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const importData = await request.json();
+      
+      // 验证导入数据格式
+      if (!importData || importData.type !== 'sites' || !Array.isArray(importData.data)) {
+        return createErrorResponse('Invalid format', '导入数据格式无效', 400, corsHeaders);
+      }
+
+      const sites = importData.data;
+      let importedCount = 0;
+      let skippedCount = 0;
+      const errors = [];
+
+      for (const site of sites) {
+        try {
+          // 验证必要字段
+          if (!site.url || typeof site.url !== 'string') {
+            errors.push(`网站URL无效: ${JSON.stringify(site)}`);
+            continue;
+          }
+
+          // 验证URL格式
+          if (!isValidHttpUrl(site.url)) {
+            errors.push(`无效的URL格式: ${site.url}`);
+            continue;
+          }
+
+          // 检查是否已存在相同URL的网站
+          const existing = await env.DB.prepare(
+            'SELECT id FROM monitored_sites WHERE url = ?'
+          ).bind(site.url).first();
+
+          if (existing) {
+            skippedCount++;
+            continue;
+          }
+
+          // 生成新的网站ID
+          const siteId = generateId();
+
+          await env.DB.prepare(`
+            INSERT INTO monitored_sites (id, name, url, description, sort_order, is_public, last_checked, last_status)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+          `).bind(
+            siteId,
+            site.name || '',
+            site.url,
+            site.description || '',
+            site.sort_order || null,
+            site.is_public !== undefined ? site.is_public : 1
+          ).run();
+
+          importedCount++;
+        } catch (siteError) {
+          errors.push(`导入网站 "${site.url}" 失败: ${siteError.message}`);
+        }
+      }
+
+      return createApiResponse({
+        success: true,
+        message: `导入完成: ${importedCount} 个网站已导入, ${skippedCount} 个已跳过`,
+        imported: importedCount,
+        skipped: skippedCount,
+        errors: errors
+      }, 200, corsHeaders);
+
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '导入网站列表');
+    }
+  }
+
   // 网站排序（管理员）- 保留原有的单个移动功能
   if (path.match(/\/api\/admin\/sites\/[^\/]+\/reorder$/) && method === 'POST') {
     try {
@@ -2532,6 +3458,292 @@ async function handleApiRequest(request, env, ctx) {
         status: 500,
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
+    }
+  }
+
+  // 获取所有网站在线率（管理员）
+  if (path === '/api/admin/sites/uptime' && method === 'GET') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      // 解析时间参数
+      const url = new URL(request.url);
+      const period = url.searchParams.get('period') || '24h';
+      
+      let hours;
+      switch (period) {
+        case '24h': hours = 24; break;
+        case '3d': hours = 24 * 3; break;
+        case '30d': hours = 24 * 30; break;
+        case '90d': hours = 24 * 90; break;
+        case '180d': hours = 24 * 180; break;
+        case '365d': hours = 24 * 365; break;
+        default: hours = 24;
+      }
+      
+      // 获取所有网站
+      const { results } = await env.DB.prepare(
+        'SELECT id, name FROM monitored_sites ORDER BY sort_order ASC NULLS LAST, name ASC'
+      ).all();
+      
+      const uptimeResults = [];
+      
+      // 为每个网站计算在线率
+      for (const site of results || []) {
+        const uptimeData = await calculateSiteUptime(env, site.id, hours);
+        uptimeResults.push({
+          id: site.id,
+          siteName: site.name,
+          uptime: uptimeData.uptime,
+          totalTime: uptimeData.totalTime,
+          onlineTime: uptimeData.onlineTime ,
+		  me: uptimeData.me 
+        });
+      }
+      
+      return createApiResponse({
+        period,
+        sites: uptimeResults
+      }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取所有网站在线率');
+    }
+  }
+
+  // 调试端点：检查网站监控状态
+  if (path === '/api/admin/sites/debug' && method === 'GET') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      // 检查监控网站的状态
+      const { results: sites } = await env.DB.prepare(`
+        SELECT id, name, url, last_status, last_checked, last_status_code, 
+               last_response_time_ms, created_at
+        FROM monitored_sites 
+        ORDER BY sort_order ASC NULLS LAST, name ASC
+      `).all();
+
+      // 检查历史数据
+      const debugInfo = [];
+      for (const site of sites || []) {
+        const { results: historyCount } = await env.DB.prepare(
+          'SELECT COUNT(*) as count FROM site_status_history WHERE site_id = ?'
+        ).bind(site.id).all();
+
+        const { results: recentHistory } = await env.DB.prepare(`
+          SELECT timestamp, status, status_code, response_time_ms 
+          FROM site_status_history 
+          WHERE site_id = ? 
+          ORDER BY timestamp DESC 
+          LIMIT 5
+        `).bind(site.id).all();
+
+        debugInfo.push({
+          ...site,
+          historyRecordCount: historyCount[0]?.count || 0,
+          recentHistory: recentHistory || []
+        });
+      }
+
+      return createApiResponse({
+        totalSites: sites.length,
+        sites: debugInfo,
+        currentTime: new Date().toISOString(),
+        timestamp: Math.floor(Date.now() / 1000)
+      }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取网站调试信息');
+    }
+  }
+
+  // 获取网站详细在线率历史（管理员和公开API）
+  if (path.match(/\/api\/sites\/([^\/]+)\/uptime\/history$/) && method === 'GET') {
+    try {
+      const siteId = path.split('/')[3];
+      
+      // 检查权限：管理员或公开网站
+      const user = await authenticateRequestOptional(request, env);
+      const isAdmin = user !== null;
+      
+      if (!isAdmin) {
+        // 检查网站是否公开
+        const site = await env.DB.prepare(
+          'SELECT is_public FROM monitored_sites WHERE id = ?'
+        ).bind(siteId).first();
+        
+        if (!site || !site.is_public) {
+          return createErrorResponse('Not Found', '网站不存在或未公开', 404, corsHeaders);
+        }
+      }
+      
+      // 解析时间参数
+      const url = new URL(request.url);
+      const period = url.searchParams.get('period') || '24h';
+      
+      let hours;
+      switch (period) {
+        case '24h': hours = 24; break;
+        case '3d': hours = 24 * 3; break;
+        case '30d': hours = 24 * 30; break;
+        case '90d': hours = 24 * 90; break;
+        case '180d': hours = 24 * 180; break;
+        case '365d': hours = 24 * 365; break;
+        default: hours = 24;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      const startTime = now - (hours * 60 * 60);
+      
+      // 获取网站信息
+      const siteInfo = await env.DB.prepare(
+        'SELECT name, url, added_at FROM monitored_sites WHERE id = ?'
+      ).bind(siteId).first();
+      
+      if (!siteInfo) {
+        return createErrorResponse('Not Found', '网站不存在', 404, corsHeaders);
+      }
+      
+      // 获取历史状态变化记录
+      const { results } = await env.DB.prepare(`
+        SELECT timestamp, status, status_code, response_time_ms, note
+        FROM site_status_history
+        WHERE site_id = ? AND timestamp >= ?
+        ORDER BY timestamp ASC
+      `).bind(siteId, startTime).all();
+      
+      // 分析断开时间段
+      const downtimes = [];
+      let lastStatus = 'UP';
+      let lastTimestamp = startTime;
+      let offlineStart = null;
+      let offlineStartRecord = null;
+      
+      // 考虑网站创建时间
+      const siteCreatedAt = siteInfo.added_at ? Math.floor(new Date(siteInfo.added_at).getTime() / 1000) : startTime;
+      const actualStartTime = Math.max(siteCreatedAt, startTime);
+      
+      for (const record of results || []) {
+        if (lastStatus === 'UP' && record.status === 'DOWN') {
+          // 开始断开
+          offlineStart = record.timestamp;
+          offlineStartRecord = record;
+        } else if (lastStatus === 'DOWN' && record.status === 'UP') {
+          // 恢复在线
+          if (offlineStart && offlineStartRecord) {
+            const duration = record.timestamp - offlineStart;
+            downtimes.push({
+              id: '${siteId}_${offlineStart}', // 用于编辑 删除
+              startTime: offlineStart,
+              endTime: record.timestamp,
+              duration: duration,
+              startTimeFormatted: offlineStart,
+              endTimeFormatted: record.timestamp ,
+              durationFormatted: formatDuration(duration),
+              statusCode: offlineStartRecord.status_code || '-',
+              responseTimeMs: offlineStartRecord.response_time_ms || '-',
+              note: offlineStartRecord.note || ''
+            });
+          }
+        }
+        lastStatus = record.status;
+        lastTimestamp = record.timestamp;
+      }
+      
+      // 如果当前仍然离线，添加到断开记录
+      if (lastStatus === 'offline' && offlineStart && offlineStartRecord) {
+        const duration = now - offlineStart;
+        downtimes.push({
+          id: '${siteId}_${offlineStart}',
+          startTime: offlineStart,
+          endTime: null, // 当前仍离线
+          duration: duration,
+          startTimeFormatted: offlineStart,
+          endTimeFormatted: '仍离线',
+          durationFormatted: formatDuration(duration),
+          statusCode: offlineStartRecord.status_code || '-',
+          responseTimeMs: offlineStartRecord.response_time_ms || '-',
+          note: offlineStartRecord.note || ''
+        });
+      }
+      
+      // 计算总体统计
+      const uptimeData = await calculateSiteUptime(env, siteId, hours);
+      
+      return createApiResponse({
+        siteId,
+        siteName: siteInfo.name,
+        siteUrl: siteInfo.url,
+        period,
+        periodHours: hours,
+        actualStartTime: actualStartTime,
+        startTimeFormatted: actualStartTime,
+        uptime: uptimeData.uptime,
+        totalTime: uptimeData.totalTime,
+        onlineTime: uptimeData.onlineTime,
+        downtimeCount: downtimes.length,
+        downtimes: downtimes
+      }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取网站在线率历史');
+    }
+  }
+
+  // 更新断开记录备注
+  if (path.match(/\/api\/sites\/downtime\/([^\/]+)\/note$/) && method === 'PUT') {
+    try {
+      const downtimeId = path.split('/')[4];
+      const [siteId, timestamp] = downtimeId.split('_');
+      
+      // 验证权限
+      const user = await authenticateAdmin(request, env);
+      if (!user) {
+        return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+      }
+      
+      const { note } = await request.json();
+      
+      // 更新断开记录的备注
+      await env.DB.prepare(
+        'UPDATE site_status_history SET note = ? WHERE site_id = ? AND timestamp = ? AND status = ?'
+      ).bind(note || null, siteId, parseInt(timestamp), 'offline').run();
+      
+      return createApiResponse({ success: true, message: '备注已更新' }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '更新断开记录备注');
+    }
+  }
+
+  // 删除断开记录
+  if (path.match(/\/api\/sites\/downtime\/([^\/]+)$/) && method === 'DELETE') {
+    try {
+      const downtimeId = path.split('/')[4];
+      const [siteId, timestamp] = downtimeId.split('_');
+      
+      // 验证权限
+      const user = await authenticateAdmin(request, env);
+      if (!user) {
+        return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+      }
+      
+      // 删除断开记录
+      await env.DB.prepare(
+        'DELETE FROM site_status_history WHERE site_id = ? AND timestamp = ? AND status = ?'
+      ).bind(siteId, parseInt(timestamp), 'offline').run();
+      
+      return createApiResponse({ success: true, message: '断开记录已删除' }, 200, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '删除断开记录');
     }
   }
 
@@ -3211,8 +4423,13 @@ async function performDatabaseMaintenance(db) {
 
   try {
     // 清理30天前的网站状态历史
-    const result = await db.prepare(
+    await db.prepare(
       'DELETE FROM site_status_history WHERE timestamp < ?'
+    ).bind(thirtyDaysAgo).run();
+
+    // 清理30天前的VPS状态历史
+    await db.prepare(
+      'DELETE FROM vps_status_history WHERE timestamp < ?'
     ).bind(thirtyDaysAgo).run();
 
     // 清理JWT缓存
@@ -3224,91 +4441,145 @@ async function performDatabaseMaintenance(db) {
 }
 
 // ==================== 主函数导出 ====================
+// ==================== Vercel Edge Functions 配置 ====================
+export const config = { runtime: 'edge' }
 
-export default {
-  async fetch(request, env, ctx) {
-    // 优化：仅在必要时初始化数据库表
-    if (!dbInitialized) {
-      try {
-        await ensureTablesExist(env.DB, env);
-        dbInitialized = true;
-      } catch (error) {
-        // 静默处理数据库初始化失败
+// 全局变量
+let dbInitialized = false;
+let taskCounter = 0;
+
+// ==================== 主函数导出 ====================
+export default async function handler(request) {
+  // 模拟 env 对象 - 需要通过环境变量获取
+  const env = {
+    DB: process.env.DATABASE_URL, // 你需要配置数据库连接
+    // 其他环境变量...
+  };
+  
+  // 模拟 ctx 对象
+  const ctx = {
+    waitUntil: (promise) => {
+      // Vercel Edge Functions 中可以直接 await
+      // 或者使用其他方式处理异步任务
+      return promise;
+    }
+  };
+
+  // 优化：仅在必要时初始化数据库表
+  if (!dbInitialized) {
+    try {
+      await ensureTablesExist(env.DB, env);
+      dbInitialized = true;
+    } catch (error) {
+      // 静默处理数据库初始化失败
+      console.log('Database initialization failed:', error.message);
+    }
+  }
+
+  // 定时刷新VPS批量数据（在每个请求中检查）
+  scheduleVpsBatchFlush(env, ctx);
+  
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // API请求处理
+  if (path.startsWith('/api/')) {
+    return handleApiRequest(request, env, ctx);
+  }
+
+  // 安装脚本处理
+  if (path === '/install.sh') {
+    return handleInstallScript(request, url, env);
+  }
+
+  // 前端静态文件处理
+  return handleFrontendRequest(request, path);
+}
+
+// ==================== 替代定时任务的方案 ====================
+// 方案1: 创建单独的API端点来触发定时任务
+export async function scheduledTasks(request) {
+  // 验证请求来源（可选）
+  const authHeader = request.headers.get('authorization');
+  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  const env = {
+    DB: process.env.DATABASE_URL,
+    // 其他环境变量...
+  };
+
+  const ctx = {
+    waitUntil: (promise) => promise
+  };
+
+  taskCounter++;
+
+  try {
+    // 智能数据库初始化 - 仅在必要时执行
+    if (!dbInitialized || taskCounter % 10 === 1) {
+      await ensureTablesExist(env.DB, env);
+      dbInitialized = true;
+    }
+
+    // ==================== 网站监控部分 ====================
+    const { results: sitesToCheck } = await env.DB.prepare(
+      'SELECT id, url, name FROM monitored_sites'
+    ).all();
+
+    if (sitesToCheck?.length > 0) {
+      // 限制并发数量为5个，优化资源使用
+      const siteConcurrencyLimit = 5;
+      const sitePromises = [];
+      
+      for (const site of sitesToCheck) {
+        sitePromises.push(checkWebsiteStatusOptimized(site, env.DB, ctx));
+        if (sitePromises.length >= siteConcurrencyLimit) {
+          await Promise.all(sitePromises);
+          sitePromises.length = 0;
+        }
+      }
+      
+      if (sitePromises.length > 0) {
+        await Promise.all(sitePromises);
       }
     }
 
-    // 定时刷新VPS批量数据（在每个请求中检查）
-    scheduleVpsBatchFlush(env, ctx);
+    // ==================== VPS离线提醒检查 ====================
+    // 每小时执行一次，发送持续离线提醒
+    await checkVpsOfflineReminder(env, ctx);
 
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // API请求处理
-    if (path.startsWith('/api/')) {
-      return handleApiRequest(request, env, ctx);
+    // ==================== 数据库维护检查 ====================
+    // 每天执行一次数据库维护
+    if (taskCounter % 1440 === 0) {
+      await performDatabaseMaintenance(env.DB);
     }
 
-    // 安装脚本处理
-    if (path === '/install.sh') {
-      return handleInstallScript(request, url, env);
+    // ==================== 实时缓存清理 ====================
+    // 每15分钟执行一次实时缓存清理
+    if (taskCounter % 15 === 0) {
+      cleanupRealtimeCache();
     }
 
-    // 前端静态文件处理
-    return handleFrontendRequest(request, path);
-  },
+    return new Response(JSON.stringify({ 
+      success: true, 
+      message: 'Scheduled tasks completed',
+      taskCounter 
+    }), {
+      headers: { 'content-type': 'application/json' }
+    });
 
-  async scheduled(event, env, ctx) {
-    taskCounter++;
-
-    ctx.waitUntil(
-      (async () => {
-        try {
-          // 智能数据库初始化 - 仅在必要时执行
-          if (!dbInitialized || taskCounter % 10 === 1) {
-            await ensureTablesExist(env.DB, env);
-            dbInitialized = true;
-          }
-
-          // ==================== 网站监控部分 ====================
-          const { results: sitesToCheck } = await env.DB.prepare(
-            'SELECT id, url, name FROM monitored_sites'
-          ).all();
-
-          if (sitesToCheck?.length > 0) {
-            // 限制并发数量为5个，优化资源使用
-            const siteConcurrencyLimit = 5;
-            const sitePromises = [];
-
-            for (const site of sitesToCheck) {
-              sitePromises.push(checkWebsiteStatusOptimized(site, env.DB, ctx));
-              if (sitePromises.length >= siteConcurrencyLimit) {
-                await Promise.all(sitePromises);
-                sitePromises.length = 0;
-              }
-            }
-
-            if (sitePromises.length > 0) {
-              await Promise.all(sitePromises);
-            }
-          }
-
-          // ==================== VPS离线提醒检查 ====================
-          // 每小时执行一次，发送持续离线提醒
-          await checkVpsOfflineReminder(env, ctx);
-
-          // ==================== 数据库维护检查 ====================
-          // 每天执行一次数据库维护
-          if (taskCounter % 1440 === 0) {
-            await performDatabaseMaintenance(env.DB);
-          }
-
-        } catch (error) {
-          // 静默处理定时任务错误
-        }
-      })()
-    );
+  } catch (error) {
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: error.message 
+    }), {
+      status: 500,
+      headers: { 'content-type': 'application/json' }
+    });
   }
-};
+}
 
 
 // ==================== 工具函数 ====================
@@ -3984,12 +5255,13 @@ function getIndexHtml() {
                                     <th>总上传</th>
                                     <th>总下载</th>
                                     <th>运行时长</th>
+                                    <th>在线率</th>
                                     <th>最后更新</th>
                                 </tr>
                             </thead>
                             <tbody id="serverTableBody">
                                 <tr>
-                                    <td colspan="11" class="text-center">加载中...</td>
+                                    <td colspan="12" class="text-center">加载中...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -4029,7 +5301,7 @@ function getIndexHtml() {
                                     <th>状态码</th>
                                     <th>响应时间 (ms)</th>
                                     <th>最后检查</th>
-                                    <th>24h记录</th>
+                                    <th>在线率</th>
                                 </tr>
                             </thead>
                             <tbody id="siteStatusTableBody">
@@ -4058,7 +5330,7 @@ function getIndexHtml() {
     <!-- Server Detailed row template (hidden by default) -->
     <template id="serverDetailsTemplate">
         <tr class="server-details-row d-none">
-            <td colspan="11">
+            <td colspan="12">
                 <div class="server-details-content">
                     <!-- Detailed metrics will be populated here by JavaScript -->
                 </div>
@@ -4074,6 +5346,87 @@ function getIndexHtml() {
             </a>
         </div>
     </footer>
+
+    <!-- 在线率历史模态框 -->
+    <div class="modal fade" id="uptimeHistoryModal" tabindex="-1" aria-labelledby="uptimeHistoryModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="uptimeHistoryModalLabel">
+                        <i class="bi bi-graph-up me-2"></i>在线率历史详情
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="uptimeHistoryContent">
+                        <div class="text-center">
+                            <div class="spinner-border" role="status">
+                                <span class="visually-hidden">加载中...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <div class="btn-group" role="group" id="uptimePeriodButtons">
+                        <input type="radio" class="btn-check" name="uptimePeriod" id="period24h" value="24h" checked>
+                        <label class="btn btn-outline-primary" for="period24h">24小时</label>
+                        
+                        <input type="radio" class="btn-check" name="uptimePeriod" id="period3d" value="3d">
+                        <label class="btn btn-outline-primary" for="period3d">3天</label>
+                        
+                        <input type="radio" class="btn-check" name="uptimePeriod" id="period30d" value="30d">
+                        <label class="btn btn-outline-primary" for="period30d">1个月</label>
+                        
+                        <input type="radio" class="btn-check" name="uptimePeriod" id="period90d" value="90d">
+                        <label class="btn btn-outline-primary" for="period90d">3个月</label>
+                        
+                        <input type="radio" class="btn-check" name="uptimePeriod" id="period180d" value="180d">
+                        <label class="btn btn-outline-primary" for="period180d">6个月</label>
+                        
+                        <input type="radio" class="btn-check" name="uptimePeriod" id="period365d" value="365d">
+                        <label class="btn btn-outline-primary" for="period365d">1年</label>
+                    </div>
+                    <button type="button" class="btn btn-secondary ms-auto" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 网站在线率历史模态框 -->
+    <div class="modal fade" id="siteUptimeHistoryModal" tabindex="-1" aria-labelledby="siteUptimeHistoryModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="siteUptimeHistoryModalLabel">
+                        <i class="bi bi-globe me-2"></i>网站在线率历史详情
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="siteUptimeHistoryContent">
+                        <div class="text-center">
+                            <div class="spinner-border" role="status">
+                                <span class="visually-hidden">加载中...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <div class="btn-group" role="group">
+                        <input type="radio" class="btn-check" name="siteUptimePeriod" id="sitePeriod24h" value="24h" checked>
+                        <label class="btn btn-outline-primary" for="sitePeriod24h">24小时</label>
+                        
+                        <input type="radio" class="btn-check" name="siteUptimePeriod" id="sitePeriod7d" value="7d">
+                        <label class="btn btn-outline-primary" for="sitePeriod7d">7天</label>
+                        
+                        <input type="radio" class="btn-check" name="siteUptimePeriod" id="sitePeriod30d" value="30d">
+                        <label class="btn btn-outline-primary" for="sitePeriod30d">30天</label>
+                    </div>
+                    <button type="button" class="btn btn-secondary ms-auto" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
     <script src="/js/main.js"></script>
@@ -4495,6 +5848,22 @@ function getAdminHtml() {
                                 <button id="addServerBtn" class="btn btn-primary">
                                     <i class="bi bi-plus-circle"></i> 添加服务器
                                 </button>
+                                
+                                <!-- Export/Import Buttons -->
+                                <div class="btn-group ms-2">
+                                    <button id="exportServersBtn" class="btn btn-outline-success">
+                                        <i class="bi bi-download"></i> 导出
+                                    </button>
+                                    <button id="importServersBtn" class="btn btn-outline-info">
+                                        <i class="bi bi-upload"></i> 导入
+                                    </button>
+                                    <button id="initUptimeBtn" class="btn btn-outline-warning">
+                                        <i class="bi bi-arrow-clockwise"></i> 初始化在线率
+                                    </button>
+                                </div>
+                                
+                                <!-- Hidden file input for import -->
+                                <input type="file" id="serverImportFile" accept=".json" style="display: none;">
                             </div>
                         </div>
                     </div>
@@ -4520,7 +5889,7 @@ function getAdminHtml() {
                             </thead>
                             <tbody id="serverTableBody">
                                 <tr>
-                                    <td colspan="10" class="text-center">加载中...</td>
+                                    <td colspan="12" class="text-center">加载中...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -4567,6 +5936,19 @@ function getAdminHtml() {
                                 <button id="addSiteBtn" class="btn btn-success">
                                     <i class="bi bi-plus-circle"></i> 添加监控网站
                                 </button>
+                                
+                                <!-- Export/Import Buttons -->
+                                <div class="btn-group ms-2">
+                                    <button id="exportSitesBtn" class="btn btn-outline-success">
+                                        <i class="bi bi-download"></i> 导出
+                                    </button>
+                                    <button id="importSitesBtn" class="btn btn-outline-info">
+                                        <i class="bi bi-upload"></i> 导入
+                                    </button>
+                                </div>
+                                
+                                <!-- Hidden file input for import -->
+                                <input type="file" id="siteImportFile" accept=".json" style="display: none;">
                             </div>
                         </div>
                     </div>
@@ -4698,6 +6080,10 @@ function getAdminHtml() {
                         </div>
                         <!-- Removed serverEnableFrequentNotifications checkbox -->
 
+                        <div class="mb-3">
+                            <label for="vpsRealApi" class="form-label">实时监控vps api（ http://IP:8999）</label>
+                            <input type="text" class="form-control" id="vpsRealApi"   >
+                        </div>
                         <div id="serverIdDisplayGroup" class="mb-3 d-none">
                             <label for="serverIdDisplay" class="form-label">服务器ID</label>
                             <div class="input-group">
@@ -4843,7 +6229,7 @@ function getAdminHtml() {
     <footer class="footer fixed-bottom py-2 bg-light border-top">
         <div class="container text-center">
             <span class="text-muted small">VPS监控面板 &copy; 2025</span>
-            <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
+            <a href="https://github.com/fanbang/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
                 <i class="bi bi-github"></i>
             </a>
         </div>
@@ -6713,7 +8099,8 @@ function handleRowClick(event) {
     const clickedRow = event.target.closest('tr.server-row');
     if (!clickedRow) return; // Not a server row
 
-    const serverId = clickedRow.getAttribute('data-server-id');
+    const  realtime_endpoint= clickedRow.getAttribute('data-realtime-endpoint');
+    const  serverId= clickedRow.getAttribute('data-server-id');
     const detailsRow = clickedRow.nextElementSibling; // The details row is the next sibling
 
     if (detailsRow && detailsRow.classList.contains('server-details-row')) {
@@ -6722,13 +8109,260 @@ function handleRowClick(event) {
 
         // If showing, populate with detailed data
         if (!detailsRow.classList.contains('d-none')) {
-            populateDetailsRow(serverId, detailsRow);
+            populateDetailsRow(serverId,realtime_endpoint, detailsRow);
         }
     }
 }
 
+// 实时监控功能
+let realtimeMonitoringInterval = null;
+let isRealtimeMonitoringActive = false;
+let currentServerId = null;
+let cpuUsageHistory = []; // 存储CPU使用率历史数据
+const MAX_CPU_HISTORY_POINTS = 60; // 最多显示60秒的数据
+
+function toggleRealtimeMonitoring() {
+    const btn = document.getElementById('realtime-monitoring-btn');
+    const icon = document.getElementById('monitoring-icon');
+    
+    if (isRealtimeMonitoringActive) {
+        // 停止实时监控
+        clearInterval(realtimeMonitoringInterval);
+        realtimeMonitoringInterval = null;
+        isRealtimeMonitoringActive = false;
+        
+        btn.innerHTML = '<i class="bi bi-play-fill"></i> 实时监控';
+        btn.className = 'btn btn-outline-primary btn-sm';
+        
+        // 清空CPU历史数据并重置图表
+        cpuUsageHistory = [];
+        resetCpuChart();
+    } else {
+        // 开始实时监控
+        isRealtimeMonitoringActive = true;
+        
+        btn.innerHTML = '<i class="bi bi-stop-fill"></i> 停止监控';
+        btn.className = 'btn btn-outline-danger btn-sm';
+        
+        // 启动定时更新
+        updateRealtimeData();
+        realtimeMonitoringInterval = setInterval(updateRealtimeData, 3000);
+    }
+}
+
+async function updateRealtimeData() {
+    if (!currentServerId) return;
+     // 生成随机回调函数名
+    const callbackName = \`jsonp_\${Date.now()}\`;
+   
+        // 使用实时API接口获取单个服务器状态
+        const response = await apiRequest(\`\/api\/realtime\/\${currentServerId}\`);
+        //const response = await apiRequest(currentRealtimeEndPoint);
+		  
+    // 创建script标签发起JSONP请求
+   // const script = document.createElement('script');
+    //script.src =\`\${currentRealtimeEndPoint}?callback=\${callbackName}\`;
+	 // 定义全局回调函数
+   // window[callbackName] = (data) => {
+       // try {
+            // 清理script标签
+          //  document.body.removeChild(script);
+         //   delete window[callbackName];
+        if ( response.data) {
+            const metrics = response.data;
+            
+            // 更新CPU负载显示
+            const cpuLoadDisplay = document.getElementById('cpu-load-display');
+            if (cpuLoadDisplay && metrics.cpu && metrics.cpu.load_avg) {
+                cpuLoadDisplay.querySelector('i').nextSibling.textContent = ' ' + metrics.cpu.load_avg.join(', ');
+            }
+            
+            // 更新CPU使用率显示
+            const cpuUsageElement = document.getElementById('cpu-usage-value');
+            if (cpuUsageElement && metrics.cpu && typeof metrics.cpu.usage_percent === 'number') {
+                cpuUsageElement.textContent = metrics.cpu.usage_percent.toFixed(1) + '%';
+                
+                // 添加CPU使用率到历史记录
+                cpuUsageHistory.push({
+                    timestamp: Date.now(),
+                    usage: metrics.cpu.usage_percent
+                });
+                
+                // 保持最大数据量
+                if (cpuUsageHistory.length > MAX_CPU_HISTORY_POINTS) {
+                    cpuUsageHistory.shift();
+                }
+                
+                // 绘制CPU曲线图
+                renderCpuUsageChart();
+            }
+            
+            // 更新内存使用率和进度条
+            const memoryUsageElement = document.getElementById('memory-usage-value');
+            const memoryProgressBar = document.getElementById('memory-progress-bar');
+            if (memoryUsageElement && metrics.memory && typeof metrics.memory.usage_percent === 'number') {
+                const memoryPercent = metrics.memory.usage_percent;
+                memoryUsageElement.textContent = memoryPercent.toFixed(1) + '%';
+                
+                // 更新进度条
+                if (memoryProgressBar) {
+                    const memoryTotal = formatDataSize(metrics.memory.total * 1024);
+                    const memoryUsed = formatDataSize(metrics.memory.used * 1024);
+                    let memoryColor = 'bg-success';
+                    if (memoryPercent > 80) memoryColor = 'bg-danger';
+                    else if (memoryPercent > 60) memoryColor = 'bg-warning';
+                    
+                    memoryProgressBar.style.width = memoryPercent + '%';
+                    memoryProgressBar.className = \`progress-bar \${memoryColor}\`;
+                    memoryProgressBar.textContent = \`\${memoryUsed}/\${memoryTotal} (\${memoryPercent.toFixed(1)}%)\`;
+                }
+            }
+            
+            // 更新硬盘进度条
+            const diskProgressBar = document.getElementById('disk-progress-bar');
+            if (diskProgressBar && metrics.disk) {
+                const diskPercent = metrics.disk.usage_percent || 0;
+                const diskTotal = typeof metrics.disk.total === 'number' ? metrics.disk.total.toFixed(2) : '-';
+                const diskUsed = typeof metrics.disk.used === 'number' ? metrics.disk.used.toFixed(2) : '-';
+                let diskColor = 'bg-success';
+                if (diskPercent > 90) diskColor = 'bg-danger';
+                else if (diskPercent > 75) diskColor = 'bg-warning';
+                
+                diskProgressBar.style.width = diskPercent + '%';
+                diskProgressBar.className = \`progress-bar \${diskColor}\`;
+                diskProgressBar.textContent = \`\${diskUsed}G/\${diskTotal}G (\${diskPercent.toFixed(1)}%)\`;
+            }
+        }
+   // } catch (error) {
+    //    console.error('更新实时数据失败:', error);
+    //}
+//};
+     /* 错误处理
+        script.onerror = () => {
+            console.error('JSONP请求失败');
+            if (window[callbackName]) {
+                delete window[callbackName];
+            }
+        };
+        
+        // 可选：添加超时处理
+        setTimeout(() => {
+            if (window[callbackName]) {
+                console.error('JSONP请求超时');
+                document.body.removeChild(script);
+                delete window[callbackName];
+            }
+        }, 5000); // 添加到DOM发起请求
+        document.body.appendChild(script);*/
+}
+// 绘制CPU使用率曲线图
+function renderCpuUsageChart() {
+    const chartContainer = document.getElementById('cpu-usage-chart');
+    if (!chartContainer || cpuUsageHistory.length === 0) return;
+    
+    // 清空容器
+    chartContainer.innerHTML = '';
+    
+    // 创建SVG容器
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('width', '100%');
+    svg.setAttribute('height', '100%');
+    svg.setAttribute('viewBox', '0 0 400 80');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.style.position = 'absolute';
+    svg.style.top = '0';
+    svg.style.left = '0';
+    svg.style.width = '100%';
+    svg.style.height = '100%';
+    
+    // 计算最大值用于缩放（至少20%以显示低使用率）
+    const maxUsage = Math.max(20, Math.max(...cpuUsageHistory.map(point => point.usage)));
+    
+    // 创建曲线路径
+    let pathData = '';
+    const pointCount = cpuUsageHistory.length;
+    
+    cpuUsageHistory.forEach((point, index) => {
+        const x = (index / (MAX_CPU_HISTORY_POINTS - 1)) * 400;
+        const y = 80 - ((point.usage / maxUsage) * 70); // 70是可用高度，留出10px边距
+        
+        if (index === 0) {
+            pathData += \`M \${x} \${y}\`;
+        } else {
+            pathData += \` L \${x} \${y}\`;
+        }
+    });
+    
+    // 创建路径元素
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', pathData);
+    path.setAttribute('stroke', '#007bff');
+    path.setAttribute('stroke-width', '2');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke-linecap', 'round');
+    path.setAttribute('stroke-linejoin', 'round');
+    
+    // 创建填充区域
+    if (cpuUsageHistory.length > 1) {
+        const fillPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        const fillData = pathData + \` L 400 80 L 0 80 Z\`;
+        fillPath.setAttribute('d', fillData);
+        fillPath.setAttribute('fill', 'rgba(0, 123, 255, 0.1)');
+        svg.appendChild(fillPath);
+    }
+    
+    svg.appendChild(path);
+    
+    // 添加网格线
+    for (let i = 0; i <= 4; i++) {
+        const y = (i / 4) * 70 + 5;
+        const gridLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        gridLine.setAttribute('x1', '0');
+        gridLine.setAttribute('y1', y.toString());
+        gridLine.setAttribute('x2', '400');
+        gridLine.setAttribute('y2', y.toString());
+        gridLine.setAttribute('stroke', '#e9ecef');
+        gridLine.setAttribute('stroke-width', '0.5');
+        svg.appendChild(gridLine);
+    }
+    
+    chartContainer.appendChild(svg);
+    
+    // 添加当前值标签
+    const currentValue = cpuUsageHistory[cpuUsageHistory.length - 1].usage;
+    const valueLabel = document.createElement('div');
+    valueLabel.style.cssText = \`
+        position: absolute;
+        top: 5px;
+        right: 10px;
+        background: rgba(0, 123, 255, 0.8);
+        color: white;
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-size: 11px;
+        font-weight: 600;
+    \`;
+    valueLabel.textContent = \`\${currentValue.toFixed(1)}%\`;
+    chartContainer.appendChild(valueLabel);
+}
+
+// 重置CPU曲线图
+function resetCpuChart() {
+    const chartContainer = document.getElementById('cpu-usage-chart');
+    if (chartContainer) {
+        chartContainer.innerHTML = \`
+            <div class="text-center p-3 text-muted" style="font-size: 0.875rem;">
+                点击"实时监控"开始显示CPU使用率曲线
+            </div>
+        \`;
+    }
+}
+
 // Populate the detailed row with data
-function populateDetailsRow(serverId, detailsRow) {
+function populateDetailsRow(serverId, vpsRealtimeEndPoint,detailsRow) {
+    // 设置当前服务器ID用于实时监控
+    currentServerId = serverId;
+    currentRealtimeEndPoint=vpsRealtimeEndPoint;
     const serverData = serverDataCache[serverId];
     const detailsContentDiv = detailsRow.querySelector('.server-details-content');
 
@@ -6741,49 +8375,120 @@ function populateDetailsRow(serverId, detailsRow) {
 
     let detailsHtml = '';
 
-    // CPU Details
-    if (metrics.cpu && metrics.cpu.load_avg) {
-        detailsHtml += \`
-            <div class="detail-item">
-                <strong>CPU负载 (1m, 5m, 15m):</strong> \${metrics.cpu.load_avg.join(', ')}
-            </div>
-        \`;
+    // Memory and Disk Details with progress bars (combined)
+    if (metrics.memory || metrics.disk) {
+        detailsHtml += \`<div class="detail-item"><strong>内存 & 硬盘:</strong>\`;
+        
+        // Memory bar
+        if (metrics.memory) {
+            const memoryTotal = formatDataSize(metrics.memory.total * 1024);
+            const memoryUsed = formatDataSize(metrics.memory.used * 1024);
+            const memoryPercent = metrics.memory.usage_percent || 0;
+            let memoryColor = 'bg-success';
+            if (memoryPercent > 80) memoryColor = 'bg-danger';
+            else if (memoryPercent > 60) memoryColor = 'bg-warning';
+            
+            detailsHtml += \`
+                <div class="mt-2">
+                    <small class="text-muted">内存</small>
+                    <div class="progress" style="height: 25px; background-color: #e9ecef;">
+                        <div class="progress-bar \${memoryColor}" role="progressbar" 
+                             style="width: \${memoryPercent}%; display: flex; align-items: center; justify-content: center; font-weight: 600; color: white;" 
+                             id="memory-progress-bar">
+                            \${memoryUsed}/\${memoryTotal} (\${memoryPercent.toFixed(1)}%)
+                        </div>
+                    </div>
+                </div>
+            \`;
+        }
+        
+        // Disk bar
+        if (metrics.disk) {
+            const diskTotal = typeof metrics.disk.total === 'number' ? metrics.disk.total.toFixed(2) : '-';
+            const diskUsed = typeof metrics.disk.used === 'number' ? metrics.disk.used.toFixed(2) : '-';
+            const diskPercent = metrics.disk.usage_percent || 0;
+            let diskColor = 'bg-success';
+            if (diskPercent > 90) diskColor = 'bg-danger';
+            else if (diskPercent > 75) diskColor = 'bg-warning';
+            
+            detailsHtml += \`
+                <div class="mt-2">
+                    <small class="text-muted">硬盘 (/)</small>
+                    <div class="progress" style="height: 25px; background-color: #e9ecef;">
+                        <div class="progress-bar \${diskColor}" role="progressbar" 
+                             style="width: \${diskPercent}%; display: flex; align-items: center; justify-content: center; font-weight: 600; color: white;" 
+                             id="disk-progress-bar">
+                            \${diskUsed}G/\${diskTotal}G (\${diskPercent.toFixed(1)}%)
+                        </div>
+                    </div>
+                </div>
+            \`;
+        }
+        
+        detailsHtml += \`</div>\`;
     }
 
-    // Memory Details
-    if (metrics.memory) {
-        detailsHtml += \`
-            <div class="detail-item">
-                <strong>内存:</strong>
-                总计: \${formatDataSize(metrics.memory.total * 1024)}<br>
-                已用: \${formatDataSize(metrics.memory.used * 1024)}<br>
-                空闲: \${formatDataSize(metrics.memory.free * 1024)}
+    // CPU负载 & 总流量 (combined with CPU usage chart)
+    detailsHtml += \`
+        <div class="detail-item">
+            <div class="d-flex justify-content-between align-items-center">
+                <strong>CPU负载 & 总流量:</strong>
+                
             </div>
-        \`;
-    }
-
-    // Disk Details
-    if (metrics.disk) {
-         detailsHtml += \`
-            <div class="detail-item">
-                <strong>硬盘 (/):</strong>
-                总计: \${typeof metrics.disk.total === 'number' ? metrics.disk.total.toFixed(2) : '-'} GB<br>
-                已用: \${typeof metrics.disk.used === 'number' ? metrics.disk.used.toFixed(2) : '-'} GB<br>
-                空闲: \${typeof metrics.disk.free === 'number' ? metrics.disk.free.toFixed(2) : '-'} GB
+            
+            <!-- CPU Load and Total Traffic Info -->
+            <div class="row mt-2">
+                <div class="col-6">
+                    <small class="text-muted">CPU负载 (1m, 5m, 15m)</small>
+                    <div class="fw-bold text-info" id="cpu-load-display">
+                        <i class="bi bi-cpu me-1"></i>
+                        \${metrics.cpu && metrics.cpu.load_avg ? metrics.cpu.load_avg.join(', ') : '-'}
+                    </div>
+                </div>
+                <div class="col-6">
+                    <small class="text-muted">CPU使用率</small>
+                    <div class="fw-bold text-warning" id="cpu-usage-display">
+                        <i class="bi bi-speedometer me-1"></i>
+                        <span id="cpu-usage-value">\${metrics.cpu && typeof metrics.cpu.usage_percent === 'number' ? metrics.cpu.usage_percent.toFixed(1) + '%' : '-'}</span>
+                    </div>
+                </div>
             </div>
-        \`;
-    }
-
-    // Network Totals
-    if (metrics.network) {
-        detailsHtml += \`
-            <div class="detail-item">
-                <strong>总流量:</strong>
-                上传: \${formatDataSize(metrics.network.total_upload)}<br>
-                下载: \${formatDataSize(metrics.network.total_download)}
+            
+            <!-- Total Traffic -->
+            \${metrics.network ? \`
+            <div class="row mt-2">
+                <div class="col-6">
+                    <small class="text-muted">总上传</small>
+                    <div class="fw-bold text-success">
+                        <i class="bi bi-arrow-up-circle-fill me-1"></i>
+                        \${formatDataSize(metrics.network.total_upload)}
+                    </div>
+                </div>
+                <div class="col-6">
+                    <small class="text-muted">总下载</small>
+                    <div class="fw-bold text-primary">
+                        <i class="bi bi-arrow-down-circle-fill me-1"></i>
+                        \${formatDataSize(metrics.network.total_download)}
+                    </div>
+                </div>
             </div>
-        \`;
-    }
+            \` : ''}
+            
+        </div>
+        <div class="detail-item">
+            <!-- CPU Usage Chart -->
+            <div class="mt-3">
+                <small class="text-muted">CPU使用率曲线图 (最近60秒)</small><button class="btn btn-outline-primary btn-sm" id="realtime-monitoring-btn" onclick="toggleRealtimeMonitoring()">
+                    <i class="bi bi-play-fill" id="monitoring-icon"></i> 实时监控
+                </button>
+                <div id="cpu-usage-chart" style="height: 80px; border: 1px solid #ddd; border-radius: 4px; position: relative; background-color: #f8f9fa; margin-top: 5px;">
+                    <div class="text-center p-3 text-muted" style="font-size: 0.875rem;">
+                        点击"实时监控"开始显示CPU使用率曲线
+                    </div>
+                </div>
+            </div>
+        </div>
+    \`;
 
     detailsContentDiv.innerHTML = detailsHtml || '<p class="text-muted">无详细数据</p>';
 }
@@ -6808,7 +8513,7 @@ async function loadAllServerStatuses() {
 
         if (allStatuses.length === 0) {
             noServersAlert.classList.remove('d-none');
-            serverTableBody.innerHTML = '<tr><td colspan="11" class="text-center">No server data available. Please log in to the admin panel to add servers.</td></tr>';
+            serverTableBody.innerHTML = '<tr><td colspan="13" class="text-center">No server data available. Please log in to the admin panel to add servers.</td></tr>';
             // Remove any existing detail rows if the server list becomes empty
             removeAllDetailRows();
             // 同时更新移动端卡片容器
@@ -6831,7 +8536,7 @@ async function loadAllServerStatuses() {
 
     } catch (error) {
                 const serverTableBody = document.getElementById('serverTableBody');
-        serverTableBody.innerHTML = '<tr><td colspan="11" class="text-center text-danger">Failed to load server data. Please refresh the page.</td></tr>';
+        serverTableBody.innerHTML = '<tr><td colspan="13" class="text-center text-danger">Failed to load server data. Please refresh the page.</td></tr>';
         removeAllDetailRows();
         // 同时更新移动端卡片容器显示错误状态
         showToast('danger', '加载服务器数据失败，请刷新页面重试');
@@ -6904,6 +8609,7 @@ function renderMobileServerCards(allStatuses) {
 
     allStatuses.forEach(data => {
         const serverId = data.server.id;
+        const realTimeEndPoint = data.server.realtime_endpoint;
         const serverName = data.server.name;
         const metrics = data.metrics;
         const hasError = data.error;
@@ -6912,6 +8618,7 @@ function renderMobileServerCards(allStatuses) {
         card.className = 'mobile-server-card';
         card.setAttribute('data-server-id', serverId);
 
+        card.setAttribute('data-realtime-endpoint', realTimeEndPoint);
         // 确定服务器状态
         let status = 'unknown';
         let lastUpdate = '从未';
@@ -7003,6 +8710,21 @@ function renderMobileServerCards(allStatuses) {
         \`;
         cardBody.appendChild(diskUptimeRow);
 
+        // 在线率 - 单行（可点击查看历史）
+        const uptimeRateRow = document.createElement('div');
+        uptimeRateRow.className = 'mobile-card-row';
+        uptimeRateRow.style.cursor = 'pointer';
+        uptimeRateRow.innerHTML = \`
+            <span class="mobile-card-label">在线率</span>
+            <span class="mobile-card-value" id="mobile-uptime-\${serverId}" style="color: #007bff; text-decoration: underline;">加载中...</span>
+        \`;
+        uptimeRateRow.onclick = () => {
+            if (typeof showUptimeHistory === 'function') {
+                showUptimeHistory(serverId);
+            }
+        };
+        cardBody.appendChild(uptimeRateRow);
+
         // 总上传 | 总下载
         const totalRow = document.createElement('div');
         totalRow.className = 'mobile-card-two-columns';
@@ -7025,6 +8747,17 @@ function renderMobileServerCards(allStatuses) {
             <span class="mobile-card-label">最后更新: \${lastUpdate}</span>
         \`;
         cardBody.appendChild(lastUpdateRow);
+
+        // 实时监控按钮行
+        const realtimeRow = document.createElement('div');
+        realtimeRow.className = 'mobile-card-row';
+        realtimeRow.style.marginTop = '10px';
+        realtimeRow.innerHTML = \`
+            <button class="btn btn-primary btn-sm w-100" onclick="startRealtimeMonitoring('\${serverId}', '\${serverName}')">
+                <i class="bi bi-speedometer2"></i> 实时监控
+            </button>
+        \`;
+        cardBody.appendChild(realtimeRow);
 
         // 组装卡片
         card.appendChild(cardHeader);
@@ -7127,6 +8860,417 @@ function renderMobileSiteCards(sites) {
 
 
 
+// 加载服务器在线率数据
+async function loadServerUptimeData() {
+    // 确保在浏览器环境中运行
+    if (typeof document === 'undefined') {
+        return;
+    }
+    
+    try {
+        const data = await apiRequest('/api/admin/servers/uptime?period=24h');
+        const uptimeData = data.servers || [];
+        
+        // 更新每个服务器的在线率显示
+        uptimeData.forEach(server => {
+            const uptimeCell = document.querySelector(\`.uptime-cell[data-server-id="\${server.id}"]\`);
+            const uptimePercentage = server.uptime;
+            let uptimeClass = 'text-success';
+            if (uptimePercentage < 95) uptimeClass = 'text-warning';
+            if (uptimePercentage < 80) uptimeClass = 'text-danger';
+            
+            // 更新桌面端显示
+            if (uptimeCell) {
+                uptimeCell.innerHTML = \`<span class="\${uptimeClass}" style="cursor: pointer; text-decoration: underline;" onclick="showUptimeHistory('\${server.id}')">\${uptimePercentage}%</span>\`;
+                const totalHours = Math.round(server.totalTime / 60 * 100) / 100;
+                uptimeCell.title = \`点击查看详细历史 - 在线率: \${uptimePercentage}% (在线\${server.onlineTime}分钟 / 总计\${server.totalTime}分钟，约\${totalHours}小时)\`;
+            } else {
+                // 如果找不到特定的单元格，尝试通过索引找到对应行的在线率列
+                console.warn(\`无法找到服务器 \${server.id} 的在线率单元格\`);
+            }
+            
+            // 更新移动端显示
+            const mobileUptimeCell = document.getElementById(\`mobile-uptime-\${server.id}\`);
+            if (mobileUptimeCell) {
+                mobileUptimeCell.innerHTML = \`\${uptimePercentage}%\`;
+                mobileUptimeCell.className = \`mobile-card-value \${uptimeClass}\`;
+                mobileUptimeCell.style.color = '#007bff';
+                mobileUptimeCell.style.textDecoration = 'underline';
+            }
+        });
+    } catch (error) {
+        console.error('加载在线率数据失败:', error);
+        // 如果获取在线率失败，显示错误信息
+        const uptimeCells = document.querySelectorAll('.uptime-cell');
+        if (uptimeCells.length > 0) {
+            uptimeCells.forEach(cell => {
+                cell.innerHTML = '<span class="text-muted">-</span>';
+                cell.title = '获取在线率数据失败';
+            });
+        }
+    }
+}
+
+// 显示在线率历史详情
+let currentUptimeServerId = null;
+
+function showUptimeHistory(serverId) {
+    if (typeof document === 'undefined') {
+        return;
+    }
+    
+    currentUptimeServerId = serverId;
+    const modal = new bootstrap.Modal(document.getElementById('uptimeHistoryModal'));
+    
+    // 重置内容为加载状态
+    document.getElementById('uptimeHistoryContent').innerHTML = \`
+        <div class="text-center">
+            <div class="spinner-border" role="status">
+                <span class="visually-hidden">加载中...</span>
+            </div>
+        </div>
+    \`;
+    
+    // 检测设备类型 - 移动设备只显示24小时，桌面设备显示所有选项
+    const isMobile = window.innerWidth <= 768;
+    const periodButtons = document.getElementById('uptimePeriodButtons');
+    
+    if (isMobile) {
+        // 移动端：只显示24小时选项
+        periodButtons.innerHTML = \`
+            <input type="radio" class="btn-check" name="uptimePeriod" id="period24h" value="24h" checked>
+            <label class="btn btn-outline-primary" for="period24h">24小时</label>
+        \`;
+        document.getElementById('period24h').checked = true;
+        modal.show();
+        loadUptimeHistory('24h');
+    } else {
+        // 桌面端：显示所有时间段选项，但需要检查监控历史
+        // 先显示默认的按钮组
+        periodButtons.innerHTML = \`
+            <input type="radio" class="btn-check" name="uptimePeriod" id="period24h" value="24h" checked>
+            <label class="btn btn-outline-primary" for="period24h">24小时</label>
+            
+            <input type="radio" class="btn-check" name="uptimePeriod" id="period3d" value="3d">
+            <label class="btn btn-outline-primary" for="period3d">3天</label>
+            
+            <input type="radio" class="btn-check" name="uptimePeriod" id="period30d" value="30d">
+            <label class="btn btn-outline-primary" for="period30d">1个月</label>
+            
+            <input type="radio" class="btn-check" name="uptimePeriod" id="period90d" value="90d">
+            <label class="btn btn-outline-primary" for="period90d">3个月</label>
+            
+            <input type="radio" class="btn-check" name="uptimePeriod" id="period180d" value="180d">
+            <label class="btn btn-outline-primary" for="period180d">6个月</label>
+            
+            <input type="radio" class="btn-check" name="uptimePeriod" id="period365d" value="365d">
+            <label class="btn btn-outline-primary" for="period365d">1年</label>
+        \`;
+        
+        // 设置默认时间段为3天，如果监控历史不足1个月则只显示3天
+        document.getElementById('period3d').checked = true;
+        modal.show();
+        
+        // 先检查服务器的监控历史长度
+        checkServerHistoryAndAdjustPeriods(serverId).then(() => {
+            loadUptimeHistory('3d');
+        });
+    }
+    
+    // 重新绑定时间段切换事件
+    const periodInputs = document.querySelectorAll('input[name="uptimePeriod"]');
+    periodInputs.forEach(input => {
+        input.addEventListener('change', function() {
+            if (this.checked && currentUptimeServerId) {
+                loadUptimeHistory(this.value);
+            }
+        });
+    });
+}
+
+// 检查服务器监控历史长度并调整可用时间段
+async function checkServerHistoryAndAdjustPeriods(serverId) {
+    try {
+        // 获取服务器信息，检查创建时间
+        const serverInfo = await apiRequest(\`/api/servers/\${serverId}\`);
+        const now = new Date();
+        const createdAt = new Date(serverInfo.created_at || serverInfo.added_at);
+        const daysSinceCreation = Math.floor((now - createdAt) / (1000 * 60 * 60 * 24));
+        
+        const periodButtons = document.getElementById('uptimePeriodButtons');
+        
+        if (daysSinceCreation < 30) {
+            // 监控历史不足1个月，只显示24小时和3天
+            periodButtons.innerHTML = \`
+                <input type="radio" class="btn-check" name="uptimePeriod" id="period24h" value="24h">
+                <label class="btn btn-outline-primary" for="period24h">24小时</label>
+                
+                <input type="radio" class="btn-check" name="uptimePeriod" id="period3d" value="3d" checked>
+                <label class="btn btn-outline-primary" for="period3d">3天</label>
+            \`;
+            document.getElementById('period3d').checked = true;
+        }
+        
+        // 重新绑定事件监听器
+        const periodInputs = document.querySelectorAll('input[name="uptimePeriod"]');
+        periodInputs.forEach(input => {
+            input.addEventListener('change', function() {
+                if (this.checked && currentUptimeServerId) {
+                    loadUptimeHistory(this.value);
+                }
+            });
+        });
+    } catch (error) {
+        console.error('检查服务器历史失败:', error);
+        // 如果检查失败，保持默认显示
+    }
+}
+
+// 加载在线率历史数据
+async function loadUptimeHistory(period) {
+    if (!currentUptimeServerId) return;
+    
+    try {
+        const response = await apiRequest(\`/api/servers/\${currentUptimeServerId}/uptime/history?period=\${period}\`);
+        renderUptimeHistory(response);
+    } catch (error) {
+        console.error('加载在线率历史失败:', error);
+        document.getElementById('uptimeHistoryContent').innerHTML = \`
+            <div class="alert alert-danger">
+                <i class="bi bi-exclamation-triangle me-2"></i>
+                加载失败: \${error.message}
+            </div>
+        \`;
+    }
+}
+
+// 渲染断开记录（带分页）
+function renderDowntimeRecords(downtimes, currentPage = 1, pageSize = 10) {
+    const totalPages = Math.ceil(downtimes.length / pageSize);
+    const startIndex = (currentPage - 1) * pageSize;
+    const endIndex = startIndex + pageSize;
+    const paginatedData = downtimes.slice(startIndex, endIndex);
+    
+    let html = \`
+        <div class="table-responsive">
+            <table class="table table-sm table-striped">
+                <thead>
+                    <tr>
+                        <th>断开时间</th>
+                        <th>恢复时间</th>
+                        <th>持续时间</th>
+                    </tr>
+                </thead>
+                <tbody>
+    \`;
+    
+    let startTimeF = '';
+    let endTimeF = '';
+    paginatedData.forEach(downtime => {
+        startTimeF = new Date(downtime.startTimeFormatted * 1000).toLocaleString();
+        endTimeF = new Date(downtime.endTimeFormatted * 1000).toLocaleString();
+        const rowClass = downtime.endTime === null ? 'table-danger' : '';
+        html += \`
+            <tr class="\${rowClass}">
+                <td>\${startTimeF}</td>
+                <td>\${endTimeF}</td>
+                <td>\${downtime.durationFormatted}</td>
+            </tr>
+        \`;
+    });
+    
+    html += \`
+                </tbody>
+            </table>
+        </div>
+    \`;
+    
+    // 添加分页控件
+    if (totalPages > 1) {
+        html += \`
+            <nav aria-label="断开记录分页">
+                <ul class="pagination pagination-sm justify-content-center mb-0">
+        \`;
+        
+        // 上一页
+        html += \`
+            <li class="page-item \${currentPage === 1 ? 'disabled' : ''}">
+                <a class="page-link" href="#" onclick="changeDowntimePage(\${currentPage - 1}); return false;">
+                    <i class="bi bi-chevron-left"></i>
+                </a>
+            </li>
+        \`;
+        
+        // 页码
+        const maxVisiblePages = 5;
+        let startPage = Math.max(1, currentPage - Math.floor(maxVisiblePages / 2));
+        let endPage = Math.min(totalPages, startPage + maxVisiblePages - 1);
+        
+        if (endPage - startPage + 1 < maxVisiblePages) {
+            startPage = Math.max(1, endPage - maxVisiblePages + 1);
+        }
+        
+        for (let i = startPage; i <= endPage; i++) {
+            html += \`
+                <li class="page-item \${i === currentPage ? 'active' : ''}">
+                    <a class="page-link" href="#" onclick="changeDowntimePage(\${i}); return false;">\${i}</a>
+                </li>
+            \`;
+        }
+        
+        // 下一页
+        html += \`
+            <li class="page-item \${currentPage === totalPages ? 'disabled' : ''}">
+                <a class="page-link" href="#" onclick="changeDowntimePage(\${currentPage + 1}); return false;">
+                    <i class="bi bi-chevron-right"></i>
+                </a>
+            </li>
+        \`;
+        
+        html += \`
+                </ul>
+            </nav>
+            <div class="text-center mt-2">
+                <small class="text-muted">
+                    显示第 \${startIndex + 1} - \${Math.min(endIndex, downtimes.length)} 条，共 \${downtimes.length} 条记录
+                </small>
+            </div>
+        \`;
+    }
+    
+    return html;
+}
+
+// 分页切换函数
+function changeDowntimePage(page) {
+    const currentData = window.currentUptimeData;
+    if (currentData && currentData.downtimes) {
+        const newContent = renderDowntimeRecords(currentData.downtimes, page, 10);
+        document.getElementById('downtimeRecords').innerHTML = newContent;
+    }
+}
+
+// 渲染在线率历史内容
+function renderUptimeHistory(data) {
+    // 存储当前数据供分页使用
+    window.currentUptimeData = data;
+    
+    const content = document.getElementById('uptimeHistoryContent');
+    const starttime = new Date(data.actualStartTime*1000).toLocaleString();
+	const uptimeFormat = formatUptime(data.onlineTime*60);
+    let html = \`
+        <div class="row mb-4">
+            <div class="col-md-4">
+                <h6><i class="bi bi-server me-2"></i>\${data.serverName}</h6>
+                <p class="text-muted mb-1">统计时间段: \${data.period}</p>
+                <p class="text-muted">开始时间: \${starttime}</p>
+            </div>
+            <div class="col-md-7">
+                <div class="row text-center">
+                    <div class="col-3">
+                        <div class="border rounded p-2">
+                            <div class="h5 mb-1 \${data.uptime >= 95 ? 'text-success' : data.uptime >= 80 ? 'text-warning' : 'text-danger'}">\${data.uptime}%</div>
+                            <small class="text-muted">在线率</small>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="border rounded p-2">
+                            <div class="h5 mb-1 text-success">\${uptimeFormat}</div>
+                            <small class="text-muted">在线时间</small>
+                        </div>
+                    </div>
+                    <div class="col-3">
+                        <div class="border rounded p-2">
+                            <div class="h5 mb-1 text-info">\${data.downtimeCount}</div>
+                            <small class="text-muted">断开次数</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    \`;
+    
+    // 添加图形化在线率显示
+    if (data.chartData && data.chartData.length > 0) {
+        html += \`
+            <div class="mb-4">
+                <h6><i class="bi bi-graph-up me-2"></i>在线率图表</h6>
+                <div class="uptime-chart-container" style="height: 60px; border: 1px solid #ddd; border-radius: 4px; overflow: hidden; position: relative;">
+        \`;
+        let timep='';
+        const totalDataPoints = data.chartData.length;
+        data.chartData.forEach((point, index) => {
+            const width = (100 / totalDataPoints);
+            const left = (index * width);
+            const color = point.status === 'online' ? '#28a745' : '#dc3545'; // 绿色在线，红色离线
+            timep = new Date(point.timeFormatted*1000).toLocaleString();
+            html += \`
+                <div class="uptime-bar" 
+                     style="position: absolute; 
+                            left: \${left}%; 
+                            width: \${width}%; 
+                            height: 100%; 
+                            background-color: \${color}; 
+                            border-right: 1px solid #fff;"
+                     title="\${timep}: \${point.status === 'online' ? '在线' : '离线'}">
+                </div>
+            \`;
+        });
+        
+        html += \`
+                </div>
+                <div class="d-flex justify-content-between mt-1 text-muted small">
+                    <span>开始时间</span>
+                    <span>现在</span>
+                </div>
+            </div>
+        \`;
+    }
+    
+    if (data.downtimes && data.downtimes.length > 0) {
+        html += \`
+            <h6><i class="bi bi-exclamation-triangle-fill text-warning me-2"></i>断开记录 (共\${data.downtimes.length}条)</h6>
+            <div id="downtimeRecords">
+                \${renderDowntimeRecords(data.downtimes, 1, 10)}
+            </div>
+        \`;
+    } else {
+        html += \`
+            <div class="alert alert-success">
+                <i class="bi bi-check-circle me-2"></i>
+                在此时间段内没有断开记录，服务器一直保持在线状态！
+            </div>
+        \`;
+    }
+    
+    content.innerHTML = html;
+}
+
+// 在模态框初始化时添加时间段切换事件监听
+document.addEventListener('DOMContentLoaded', function() {
+    if (typeof document === 'undefined') return;
+    
+    // VPS在线率时间段切换事件
+    const periodInputs = document.querySelectorAll('input[name="uptimePeriod"]');
+    periodInputs.forEach(input => {
+        input.addEventListener('change', function() {
+            if (this.checked && currentUptimeServerId) {
+                loadUptimeHistory(this.value);
+            }
+        });
+    });
+    
+    // 网站在线率时间段切换事件
+    const sitePeriodInputs = document.querySelectorAll('input[name="siteUptimePeriod"]');
+    sitePeriodInputs.forEach(input => {
+        input.addEventListener('change', function() {
+            if (this.checked && currentSiteUptimeId) {
+                loadSiteUptimeHistory(this.value);
+            }
+        });
+    });
+});
+
 
 // Render the server table using DOM manipulation
 function renderServerTable(allStatuses) {
@@ -7151,9 +9295,9 @@ function renderServerTable(allStatuses) {
     allStatuses.forEach(data => {
         const serverId = data.server.id;
         const serverName = data.server.name;
+		const realtime_endpoint = data.server.realtime_endpoint; 	  
         const metrics = data.metrics;
         const hasError = data.error;
-
         let statusBadge = '<span class="badge bg-secondary">未知</span>';
         let cpuHtml = '-';
         let memoryHtml = '-';
@@ -7193,6 +9337,7 @@ function renderServerTable(allStatuses) {
         const mainRow = document.createElement('tr');
         mainRow.classList.add('server-row');
         mainRow.setAttribute('data-server-id', serverId);
+        mainRow.setAttribute('data-realtime-endpoint', realtime_endpoint);
         mainRow.innerHTML = \`
             <td>\${serverName}</td>
             <td>\${statusBadge}</td>
@@ -7204,7 +9349,14 @@ function renderServerTable(allStatuses) {
             <td><span style="color: #000;">\${totalUpload}</span></td>
             <td><span style="color: #000;">\${totalDownload}</span></td>
             <td><span style="color: #000;">\${uptime}</span></td>
+            <td class="uptime-cell" data-server-id="\${serverId}">-</td>
             <td><span style="color: #000;">\${lastUpdate}</span></td>
+            <td><span style="display: none" data-realtime-endpoint="\${realtime_endpoint}">-</span></td>
+            <td>
+                <button class="btn btn-primary btn-sm" onclick="startRealtimeMonitoring('\${serverId}', '\${serverName}')" title="开启实时监控">
+                    <i class="bi bi-speedometer2"></i>
+                </button>
+            </td>
         \`;
 
         // Clone the details row template
@@ -7219,12 +9371,31 @@ function renderServerTable(allStatuses) {
         // 2. If this server was previously expanded, re-expand it and populate its details
         if (expandedServerIds.has(serverId)) {
             detailsRowElement.classList.remove('d-none');
-            populateDetailsRow(serverId, detailsRowElement); // Populate content
+            populateDetailsRow(serverId, realtime_endpoint, detailsRowElement); // Populate content
         }
     });
 
     // 3. 同时渲染移动端卡片
     renderMobileServerCards(allStatuses);
+    
+    // 4. 异步加载在线率数据
+    const loadUptimeWithRetry = async (retries = 3) => {
+        const tableBody = document.getElementById('serverTableBody');
+        const uptimeCells = tableBody?.querySelectorAll('td.uptime-cell');
+        
+        if (uptimeCells && uptimeCells.length > 0) {
+            // DOM已准备好，加载在线率数据
+            await loadServerUptimeData();
+        } else if (retries > 0) {
+            // DOM还没准备好，重试
+            setTimeout(() => loadUptimeWithRetry(retries - 1), 500);
+        } else {
+            console.warn('无法找到在线率单元格，可能DOM渲染失败');
+        }
+    };
+    
+    // 立即开始检查，不等待固定时间
+    setTimeout(() => loadUptimeWithRetry(), 100);
 }
 
 
@@ -7334,11 +9505,12 @@ async function renderSiteStatusTable(sites) {
         const lastCheckTime = site.last_checked ? new Date(site.last_checked * 1000).toLocaleString() : '从未';
         const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
 
-        const historyCell = document.createElement('td');
-        const historyContainer = document.createElement('div');
-        historyContainer.className = 'history-bar-container';
-        historyCell.appendChild(historyContainer);
-
+        // 在线率单元格
+        const uptimeCell = document.createElement('td');
+        uptimeCell.className = 'uptime-cell';
+        uptimeCell.setAttribute('data-site-id', site.id);
+        uptimeCell.innerHTML = '-'; // 初始显示，等待异步加载
+        
         row.innerHTML = \`
             <td>\${site.name || '-'}</td>
             <td><span class="badge \${statusInfo.class}">\${statusInfo.text}</span></td>
@@ -7346,15 +9518,317 @@ async function renderSiteStatusTable(sites) {
             <td>\${responseTime}</td>
             <td>\${lastCheckTime}</td>
         \`;
-        row.appendChild(historyCell);
+        row.appendChild(uptimeCell);
         tableBody.appendChild(row);
-
-        // 直接使用站点的历史数据渲染历史条
-        renderSiteHistoryBar(historyContainer, site.history || []);
     }
+
+    // 异步加载网站在线率数据
+    const loadUptimeWithRetry = async (retries = 3) => {
+        const uptimeCells = tableBody?.querySelectorAll('td.uptime-cell');
+        
+        if (uptimeCells && uptimeCells.length > 0) {
+            // DOM已准备好，加载在线率数据
+            await loadSiteUptimeData();
+        } else if (retries > 0) {
+            // DOM还没准备好，重试
+            setTimeout(() => loadUptimeWithRetry(retries - 1), 500);
+        } else {
+            console.warn('无法找到网站在线率单元格，可能DOM渲染失败');
+        }
+    };
+    
+    // 立即开始检查，不等待固定时间
+    setTimeout(() => loadUptimeWithRetry(), 100);
 
     // 同时渲染移动端卡片
     renderMobileSiteCards(sites);
+}
+
+// 加载网站在线率数据
+async function loadSiteUptimeData() {
+    // 确保在浏览器环境中运行
+    if (typeof document === 'undefined') {
+        return;
+    }
+    
+    try {
+        const data = await apiRequest('/api/admin/sites/uptime?period=24h');
+        const uptimeData = data.sites || [];
+        
+        // 更新每个网站的在线率显示
+        uptimeData.forEach(site => {
+            const uptimeCell = document.querySelector(\`td.uptime-cell[data-site-id="\${site.id}"]\`);
+            if (uptimeCell) {
+                const uptimePercentage = site.uptime;
+                let uptimeClass = 'text-success';
+                if (uptimePercentage < 95) uptimeClass = 'text-warning';
+                if (uptimePercentage < 80) uptimeClass = 'text-danger';
+                
+                uptimeCell.innerHTML = \`<span class="\${uptimeClass}" style="cursor: pointer; text-decoration: underline;" onclick="showSiteUptimeHistory('\${site.id}')">\${uptimePercentage}%</span>\`;
+                const totalHours = Math.round(site.totalTime / 60 * 100) / 100;
+                uptimeCell.title = \`点击查看详细历史 - 在线率: \${uptimePercentage}% (在线\${site.onlineTime}分钟 / 总计\${site.totalTime}分钟，约\${totalHours}小时)\`;
+            } else {
+                // 如果找不到特定的单元格
+                console.warn(\`无法找到网站 \${site.id} 的在线率单元格\`);
+            }
+        });
+    } catch (error) {
+        console.error('加载网站在线率数据失败:', error);
+        // 如果获取在线率失败，显示错误信息
+        const uptimeCells = document.querySelectorAll('td.uptime-cell');
+        if (uptimeCells.length > 0) {
+            uptimeCells.forEach(cell => {
+                cell.innerHTML = '<span class="text-muted">-</span>';
+                cell.title = '获取在线率数据失败';
+            });
+        }
+    }
+}
+
+// 显示网站在线率历史详情
+let currentSiteUptimeId = null;
+
+function showSiteUptimeHistory(siteId) {
+    if (typeof document === 'undefined') {
+        return;
+    }
+    
+    currentSiteUptimeId = siteId;
+    const modal = new bootstrap.Modal(document.getElementById('siteUptimeHistoryModal'));
+    
+    // 重置内容为加载状态
+    document.getElementById('siteUptimeHistoryContent').innerHTML = \`
+        <div class="text-center">
+            <div class="spinner-border" role="status">
+                <span class="visually-hidden">加载中...</span>
+            </div>
+        </div>
+    \`;
+    
+    // 设置默认时间段为24小时
+    document.getElementById('sitePeriod24h').checked = true;
+    
+    modal.show();
+    loadSiteUptimeHistory('24h');
+}
+
+// 加载网站在线率历史数据
+async function loadSiteUptimeHistory(period) {
+    if (!currentSiteUptimeId) return;
+    
+    try {
+        const response = await apiRequest(\`/api/sites/\${currentSiteUptimeId}/uptime/history?period=\${period}\`);
+        renderSiteUptimeHistory(response);
+    } catch (error) {
+        console.error('加载网站在线率历史失败:', error);
+        let errorMessage = '系统暂时不可用';
+        
+        // 根据不同的错误类型提供更详细的信息
+        if (error.message.includes('Not Found') || error.message.includes('404')) {
+            errorMessage = '网站不存在或未公开访问';
+        } else if (error.message.includes('Unauthorized') || error.message.includes('401')) {
+            errorMessage = '权限不足，需要管理员权限';
+        } else if (error.message.includes('no such table')) {
+            errorMessage = '数据库表不存在，请联系管理员初始化系统';
+        } else if (error.message.includes('timeout')) {
+            errorMessage = '请求超时，请稍后重试';
+        } else if (error.message.includes('Failed to fetch')) {
+            errorMessage = '网络连接失败，请检查网络连接';
+        }
+        
+        document.getElementById('siteUptimeHistoryContent').innerHTML = \`
+            <div class="alert alert-danger">
+                <i class="bi bi-exclamation-triangle me-2"></i>
+                <strong>加载失败</strong><br>
+                \${errorMessage}<br>
+                <small class="text-muted">错误详情: \${error.message}</small>
+            </div>
+            <div class="text-center mt-3">
+                <button class="btn btn-outline-primary btn-sm" onclick="loadSiteUptimeHistory('24h')">
+                    <i class="bi bi-arrow-clockwise me-1"></i>重试
+                </button>
+            </div>
+        \`;
+    }
+}
+
+// 渲染网站在线率历史内容
+function renderSiteUptimeHistory(data) {
+    const content = document.getElementById('siteUptimeHistoryContent');
+    
+    let html = \`
+        <div class="row mb-4">
+            <div class="col-md-6">
+                <h6><i class="bi bi-globe me-2"></i>\${data.siteName}</h6>
+                <p class="text-muted mb-1">URL: \${data.siteUrl}</p>
+                <p class="text-muted mb-1">统计时间段: \${data.period}</p>
+                <p class="text-muted">开始时间: \${data.startTimeFormatted}</p>
+            </div>
+            <div class="col-md-6">
+                <div class="row text-center">
+                    <div class="col-4">
+                        <div class="border rounded p-2">
+                            <div class="h5 mb-1 \${data.uptime >= 95 ? 'text-success' : data.uptime >= 80 ? 'text-warning' : 'text-danger'}">\${data.uptime}%</div>
+                            <small class="text-muted">在线率</small>
+                        </div>
+                    </div>
+                    <div class="col-4">
+                        <div class="border rounded p-2">
+                            <div class="h5 mb-1 text-success">\${data.onlineTime}分</div>
+                            <small class="text-muted">在线时间</small>
+                        </div>
+                    </div>
+                    <div class="col-4">
+                        <div class="border rounded p-2">
+                            <div class="h5 mb-1 text-info">\${data.downtimeCount}</div>
+                            <small class="text-muted">断开次数</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    \`;
+    
+    if (data.downtimes && data.downtimes.length > 0) {
+        html += \`
+            <h6><i class="bi bi-exclamation-triangle-fill text-warning me-2"></i>断开记录</h6>
+            <div class="table-responsive">
+                <table class="table table-sm table-striped">
+                    <thead>
+                        <tr>
+                            <th>断开时间</th>
+                            <th>恢复时间</th>
+                            <th>持续时间</th>
+                            <th>状态码</th>
+                            <th>响应时间</th>
+                            <th>备注</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        \`;
+        
+        data.downtimes.forEach(downtime => {
+            const rowClass = downtime.endTime === null ? 'table-danger' : '';
+            html += \`
+                <tr class="\${rowClass}">
+                    <td>\${downtime.startTimeFormatted}</td>
+                    <td>\${downtime.endTimeFormatted}</td>
+                    <td>\${downtime.durationFormatted}</td>
+                    <td>\${downtime.statusCode}</td>
+                    <td>\${downtime.responseTimeMs === '-' ? '-' : downtime.responseTimeMs + 'ms'}</td>
+                    <td>
+                        <span class="note-display" id="note-\${downtime.id}">\${downtime.note || '无备注'}</span>
+                        <input type="text" class="form-control form-control-sm note-input d-none" id="input-\${downtime.id}" value="\${downtime.note || ''}" maxlength="100">
+                    </td>
+                    <td>
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-primary btn-sm edit-note-btn" onclick="editNote('\${downtime.id}')" title="编辑备注">
+                                <i class="bi bi-pencil"></i>
+                            </button>
+                            <button class="btn btn-outline-success btn-sm save-note-btn d-none" onclick="saveNote('\${downtime.id}')" title="保存">
+                                <i class="bi bi-check"></i>
+                            </button>
+                            <button class="btn btn-outline-secondary btn-sm cancel-note-btn d-none" onclick="cancelEditNote('\${downtime.id}')" title="取消">
+                                <i class="bi bi-x"></i>
+                            </button>
+                            \${downtime.endTime !== null ? \`<button class="btn btn-outline-danger btn-sm" onclick="deleteDowntime('\${downtime.id}')" title="删除记录"><i class="bi bi-trash"></i></button>\` : ''}
+                        </div>
+                    </td>
+                </tr>
+            \`;
+        });
+        
+        html += \`
+                    </tbody>
+                </table>
+            </div>
+        \`;
+    } else {
+        html += \`
+            <div class="alert alert-success">
+                <i class="bi bi-check-circle me-2"></i>
+                在此时间段内没有断开记录，网站一直保持在线状态！
+            </div>
+        \`;
+    }
+    
+    content.innerHTML = html;
+}
+
+// 编辑备注
+function editNote(downtimeId) {
+    const display = document.getElementById(\`note-\${downtimeId}\`);
+    const input = document.getElementById(\`input-\${downtimeId}\`);
+    const editBtn = display.parentElement.parentElement.querySelector('.edit-note-btn');
+    const saveBtn = display.parentElement.parentElement.querySelector('.save-note-btn');
+    const cancelBtn = display.parentElement.parentElement.querySelector('.cancel-note-btn');
+    
+    display.classList.add('d-none');
+    input.classList.remove('d-none');
+    editBtn.classList.add('d-none');
+    saveBtn.classList.remove('d-none');
+    cancelBtn.classList.remove('d-none');
+    
+    input.focus();
+}
+
+// 取消编辑备注
+function cancelEditNote(downtimeId) {
+    const display = document.getElementById(\`note-\${downtimeId}\`);
+    const input = document.getElementById(\`input-\${downtimeId}\`);
+    const editBtn = display.parentElement.parentElement.querySelector('.edit-note-btn');
+    const saveBtn = display.parentElement.parentElement.querySelector('.save-note-btn');
+    const cancelBtn = display.parentElement.parentElement.querySelector('.cancel-note-btn');
+    
+    display.classList.remove('d-none');
+    input.classList.add('d-none');
+    editBtn.classList.remove('d-none');
+    saveBtn.classList.add('d-none');
+    cancelBtn.classList.add('d-none');
+}
+
+// 保存备注
+async function saveNote(downtimeId) {
+    const display = document.getElementById(\`note-\${downtimeId}\`);
+    const input = document.getElementById(\`input-\${downtimeId}\`);
+    const newNote = input.value.trim();
+    
+    try {
+        // 这里需要实现保存备注的API调用
+        await apiRequest(\`/api/sites/downtime/\${downtimeId}/note\`, {
+            method: 'PUT',
+            body: JSON.stringify({ note: newNote })
+        });
+        
+        display.textContent = newNote || '无备注';
+        cancelEditNote(downtimeId);
+        showToast('success', '备注已保存');
+    } catch (error) {
+        console.error('保存备注失败:', error);
+        showToast('danger', '保存备注失败: ' + error.message);
+    }
+}
+
+// 删除断开记录
+async function deleteDowntime(downtimeId) {
+    if (!confirm('确定要删除这条断开记录吗？此操作不可撤销。')) {
+        return;
+    }
+    
+    try {
+        await apiRequest(\`/api/sites/downtime/\${downtimeId}\`, {
+            method: 'DELETE'
+        });
+        
+        showToast('success', '断开记录已删除');
+        // 重新加载当前时间段的数据
+        const period = document.querySelector('input[name="siteUptimePeriod"]:checked').value;
+        loadSiteUptimeHistory(period);
+    } catch (error) {
+        console.error('删除记录失败:', error);
+        showToast('danger', '删除记录失败: ' + error.message);
+    }
 }
 
 // Render 24h history bar for a site (unified function for PC and mobile)
@@ -7965,6 +10439,7 @@ function cleanupStuckToggles() {
 
 // 全局变量
 let currentServerId = null;
+let currentRealtimeEndPoint = null;
 let currentSiteId = null; // For site deletion
 let serverList = [];
 let siteList = []; // For monitored sites
@@ -8007,6 +10482,7 @@ document.addEventListener('DOMContentLoaded', async function() {
     // 优化：停止自动清理以节省配额
     // setInterval(cleanupStuckToggles, 30000);
     });
+
 
 // 检查登录状态
 async function checkLoginStatus() {
@@ -8060,11 +10536,63 @@ async function checkDefaultPasswordUsage() {
             }
 }
 
+// 初始化在线率
+async function initializeUptime() {
+    if (typeof document === 'undefined') {
+        console.error('初始化功能需要在浏览器环境中运行');
+        return;
+    }
+    
+    if (!confirm('确定要初始化所有服务器的在线率吗？这将清除所有历史在线率数据并重新开始计算。')) {
+        return;
+    }
+    
+    try {
+        const response = await apiRequest('/api/admin/servers/init-uptime', {
+            method: 'POST'
+        });
+        
+        showToast('success', \`已初始化 \${response.count || 0} 个服务器的在线率\`);
+        
+        // 刷新在线率显示
+        setTimeout(() => {
+            if (typeof loadServerUptimeData === 'function') {
+                loadServerUptimeData();
+            }
+        }, 1000);
+        
+    } catch (error) {
+        showToast('danger', '初始化在线率失败: ' + error.message);
+    }
+}
+
 // 初始化事件监听
 function initEventListeners() {
     // 添加服务器按钮
     document.getElementById('addServerBtn').addEventListener('click', function() {
         showServerModal();
+    });
+
+    // 导出服务器按钮
+    document.getElementById('exportServersBtn').addEventListener('click', function() {
+        exportServers();
+    });
+
+    // 导入服务器按钮
+    document.getElementById('importServersBtn').addEventListener('click', function() {
+        document.getElementById('serverImportFile').click();
+    });
+
+    // 初始化在线率按钮
+    document.getElementById('initUptimeBtn').addEventListener('click', function() {
+        initializeUptime();
+    });
+
+    // 服务器导入文件选择
+    document.getElementById('serverImportFile').addEventListener('change', function(e) {
+        if (e.target.files.length > 0) {
+            importServers(e.target.files[0]);
+        }
     });
 
     // 保存服务器按钮
@@ -8147,6 +10675,23 @@ function initEventListeners() {
     // --- Site Monitoring Event Listeners ---
     document.getElementById('addSiteBtn').addEventListener('click', function() {
         showSiteModal();
+    });
+
+    // 导出网站按钮
+    document.getElementById('exportSitesBtn').addEventListener('click', function() {
+        exportSites();
+    });
+
+    // 导入网站按钮
+    document.getElementById('importSitesBtn').addEventListener('click', function() {
+        document.getElementById('siteImportFile').click();
+    });
+
+    // 网站导入文件选择
+    document.getElementById('siteImportFile').addEventListener('change', function(e) {
+        if (e.target.files.length > 0) {
+            importSites(e.target.files[0]);
+        }
     });
 
     document.getElementById('saveSiteBtn').addEventListener('click', function() {
@@ -8232,6 +10777,7 @@ async function loadServerList() {
     }
 }
 
+
 // 渲染服务器表格
 function renderServerTable(servers) {
     const tableBody = document.getElementById('serverTableBody');
@@ -8242,7 +10788,7 @@ function renderServerTable(servers) {
 
     if (servers.length === 0) {
         const row = document.createElement('tr');
-        row.innerHTML = '<td colspan="10" class="text-center">暂无服务器数据</td>'; // Updated colspan
+        row.innerHTML = '<td colspan="12" class="text-center">暂无服务器数据</td>'; // Updated colspan
         tableBody.appendChild(row);
         // 同时更新移动端卡片
         renderMobileAdminServerCards([]);
@@ -8252,6 +10798,7 @@ function renderServerTable(servers) {
     servers.forEach((server, index) => {
         const row = document.createElement('tr');
         row.setAttribute('data-server-id', server.id);
+        row.setAttribute('data-realtime-endpoint', server.realtime_endpoint);
         row.classList.add('server-row-draggable');
         row.draggable = true;
 
@@ -8647,6 +11194,7 @@ function showServerModal() {
     // 重置表单和标记
     document.getElementById('serverForm').reset();
     document.getElementById('serverId').value = '';
+    document.getElementById('vpsRealApi').value = '';
     document.getElementById('apiKeyGroup').classList.add('d-none');
     document.getElementById('serverIdDisplayGroup').classList.add('d-none');
     document.getElementById('workerUrlDisplayGroup').classList.add('d-none');
@@ -8669,6 +11217,7 @@ function editServer(serverId) {
     document.getElementById('serverId').value = server.id;
     document.getElementById('serverName').value = server.name;
     document.getElementById('serverDescription').value = server.description || '';
+    document.getElementById('vpsRealApi').value = server.realtime_endpoint || '';
     document.getElementById('apiKeyGroup').classList.add('d-none');
     document.getElementById('serverIdDisplayGroup').classList.add('d-none');
     document.getElementById('workerUrlDisplayGroup').classList.add('d-none');
@@ -8686,7 +11235,7 @@ async function saveServer() {
     const serverId = document.getElementById('serverId').value;
     const serverName = document.getElementById('serverName').value.trim();
     const serverDescription = document.getElementById('serverDescription').value.trim();
-    // const enableFrequentNotifications = document.getElementById('serverEnableFrequentNotifications').checked; // Removed
+    const vpsRealApi = document.getElementById('vpsRealApi').value.trim(); // Removed
 
     if (!serverName) {
         showToast('warning', '服务器名称不能为空');
@@ -8702,7 +11251,8 @@ async function saveServer() {
                 method: 'PUT',
                 body: JSON.stringify({
                     name: serverName,
-                    description: serverDescription
+                    description: serverDescription,
+		    realtime_endpoint: vpsRealApi
                 })
             });
         } else {
@@ -8711,7 +11261,8 @@ async function saveServer() {
                 method: 'POST',
                 body: JSON.stringify({
                     name: serverName,
-                    description: serverDescription
+                    description: serverDescription,
+		    realtime_endpoint: vpsRealApi
                 })
             });
         }
@@ -9730,6 +12281,7 @@ function renderMobileAdminServerCards(servers) {
         const card = document.createElement('div');
         card.className = 'mobile-server-card';
         card.setAttribute('data-server-id', server.id);
+        card.setAttribute('data-realtime-endpoint', server.realtime_endpoint);
 
         // 状态显示逻辑（与PC端一致）
         let statusBadge = '<span class="badge bg-secondary">未知</span>';
@@ -10071,5 +12623,149 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }, 100);
 });
+
+// ==================== 导出导入功能 ====================
+
+// 导出服务器列表
+async function exportServers() {
+    // 确保在浏览器环境中运行
+    if (typeof document === 'undefined' || typeof Blob === 'undefined') {
+        console.error('导出功能需要在浏览器环境中运行');
+        return;
+    }
+    
+    try {
+        const response = await apiRequest('/api/admin/servers/export');
+        const blob = new Blob([JSON.stringify(response, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = \`servers_export_\${new Date().toISOString().slice(0, 10)}.json\`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        showToast('success', \`已导出 \${response.data.length} 个服务器配置\`);
+    } catch (error) {
+        showToast('danger', '导出服务器列表失败: ' + error.message);
+    }
+}
+
+// 导入服务器列表
+async function importServers(file) {
+    // 确保在浏览器环境中运行
+    if (typeof document === 'undefined') {
+        console.error('导入功能需要在浏览器环境中运行');
+        return;
+    }
+    
+    try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        
+        // 验证文件格式
+        if (!data || data.type !== 'servers' || !Array.isArray(data.data)) {
+            showToast('danger', '导入文件格式无效，请选择正确的服务器配置文件');
+            return;
+        }
+        
+        const response = await apiRequest('/api/admin/servers/import', {
+            method: 'POST',
+            body: JSON.stringify(data)
+        });
+        
+        if (response.success) {
+            showToast('success', response.message);
+            if (response.errors && response.errors.length > 0) {
+                console.warn('导入过程中的错误:', response.errors);
+            }
+            // 刷新服务器列表
+            await loadServerList();
+        } else {
+            showToast('danger', response.message || '导入失败');
+        }
+        
+        // 清空文件输入
+        const fileInput = document.getElementById('serverImportFile');
+        if (fileInput) fileInput.value = '';
+        
+    } catch (error) {
+        showToast('danger', '导入服务器列表失败: ' + error.message);
+        const fileInput = document.getElementById('serverImportFile');
+        if (fileInput) fileInput.value = '';
+    }
+}
+
+// 导出网站列表
+async function exportSites() {
+    // 确保在浏览器环境中运行
+    if (typeof document === 'undefined' || typeof Blob === 'undefined') {
+        console.error('导出功能需要在浏览器环境中运行');
+        return;
+    }
+    
+    try {
+        const response = await apiRequest('/api/admin/sites/export');
+        const blob = new Blob([JSON.stringify(response, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = \`sites_export_\${new Date().toISOString().slice(0, 10)}.json\`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        showToast('success', \`已导出 \${response.data.length} 个网站配置\`);
+    } catch (error) {
+        showToast('danger', '导出网站列表失败: ' + error.message);
+    }
+}
+
+// 导入网站列表
+async function importSites(file) {
+    // 确保在浏览器环境中运行
+    if (typeof document === 'undefined') {
+        console.error('导入功能需要在浏览器环境中运行');
+        return;
+    }
+    
+    try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        
+        // 验证文件格式
+        if (!data || data.type !== 'sites' || !Array.isArray(data.data)) {
+            showToast('danger', '导入文件格式无效，请选择正确的网站配置文件');
+            return;
+        }
+        
+        const response = await apiRequest('/api/admin/sites/import', {
+            method: 'POST',
+            body: JSON.stringify(data)
+        });
+        
+        if (response.success) {
+            showToast('success', response.message);
+            if (response.errors && response.errors.length > 0) {
+                console.warn('导入过程中的错误:', response.errors);
+            }
+            // 刷新网站列表
+            await loadSiteList();
+        } else {
+            showToast('danger', response.message || '导入失败');
+        }
+        
+        // 清空文件输入
+        const fileInput = document.getElementById('siteImportFile');
+        if (fileInput) fileInput.value = '';
+        
+    } catch (error) {
+        showToast('danger', '导入网站列表失败: ' + error.message);
+        const fileInput = document.getElementById('siteImportFile');
+        if (fileInput) fileInput.value = '';
+    }
+}
 `;
 }
