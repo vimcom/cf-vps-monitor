@@ -4438,7 +4438,7 @@ async function performDatabaseMaintenance(db) {
 
 // ==================== 主函数导出 ====================
 // ==================== Vercel Edge Functions 配置 ====================
-export const config = { runtime: 'edge' }
+
 
 // 全局变量
 let dbInitialized = false;
