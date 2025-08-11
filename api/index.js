@@ -283,7 +283,11 @@ class ConfigCache {
 // 全局配置缓存实例
 const configCache = new ConfigCache();
 
- 
+// ==================== 定时任务优化 ====================
+
+// 任务执行计数器
+let taskCounter = 0;
+let dbInitialized = false;
 
 // ==================== 工具函数 ====================
 
@@ -1196,7 +1200,33 @@ const D1_SCHEMAS = {
       uptime INTEGER,
       FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS idx_vps_status_history_server_id_timestamp ON vps_status_history (server_id, timestamp DESC);`
+    CREATE INDEX IF NOT EXISTS idx_vps_status_history_server_id_timestamp ON vps_status_history (server_id, timestamp DESC);`,
+
+  ping_nodes: `
+    CREATE TABLE IF NOT EXISTS ping_nodes (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      target_address TEXT NOT NULL,
+      description TEXT,
+      enabled INTEGER DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      sort_order INTEGER DEFAULT 0
+    );`,
+
+  ping_results: `
+    CREATE TABLE IF NOT EXISTS ping_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      server_id TEXT NOT NULL,
+      node_id TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      ping_time_ms REAL,
+      status TEXT NOT NULL,
+      error_message TEXT,
+      FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+      FOREIGN KEY(node_id) REFERENCES ping_nodes(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_ping_results_server_node_timestamp ON ping_results (server_id, node_id, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_ping_results_timestamp ON ping_results (timestamp DESC);`
 };
 
 // ==================== 数据库初始化 ====================
@@ -1308,7 +1338,7 @@ function getSecureCorsHeaders(origin, env) {
   const config = getSecurityConfig(env);
   const allowedOrigins = config.ALLOWED_ORIGINS;
 
-  let allowedOrigin = 'null';  // 默认拒绝所有跨域请求
+  let allowedOrigin = '*';  // 默认拒绝所有跨域请求
 
   // 只有明确配置了允许的域名才允许跨域
   if (allowedOrigins.length > 0 && origin) {
@@ -1339,7 +1369,7 @@ function getSecureCorsHeaders(origin, env) {
     'X-Frame-Options': 'DENY',
     'X-XSS-Protection': '1; mode=block',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' https://cdn.jsdelivr.net; img-src 'self' data: https:; font-src 'self' https://cdn.jsdelivr.net; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';"
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none';"
   };
 }
 
@@ -1860,6 +1890,151 @@ async function handleServerRoutes(path, method, request, env, corsHeaders) {
   return null; // 不匹配此模块的路由
 }
 
+// Ping节点管理路由处理器
+async function handlePingNodeRoutes(path, method, request, env, corsHeaders) {
+  // 获取所有ping节点（管理员）
+  if (path === '/api/admin/ping-nodes' && method === 'GET') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const { results } = await env.DB.prepare(`
+        SELECT id, name, target_address, description, enabled, created_at, sort_order
+        FROM ping_nodes 
+        ORDER BY sort_order ASC, created_at ASC
+      `).all();
+
+      return createSuccessResponse({ ping_nodes: results }, corsHeaders);
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取ping节点列表');
+    }
+  }
+
+  // 添加ping节点（管理员）
+  if (path === '/api/admin/ping-nodes' && method === 'POST') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const { name, target_address, description, enabled } = await request.json();
+
+      if (!name || !target_address) {
+        return createErrorResponse('Bad Request', '节点名称和目标地址不能为空', 400, corsHeaders);
+      }
+
+      const nodeId = generateUniqueId();
+      const now = Math.floor(Date.now() / 1000);
+
+      await env.DB.prepare(`
+        INSERT INTO ping_nodes (id, name, target_address, description, enabled, created_at, sort_order)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+      `).bind(nodeId, name, target_address, description || '', enabled ? 1 : 0, now).run();
+
+      return createSuccessResponse({ 
+        message: 'Ping节点添加成功',
+        node_id: nodeId
+      }, corsHeaders);
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '添加ping节点');
+    }
+  }
+
+  // 更新ping节点（管理员）
+  if (path.match(/^\/api\/admin\/ping-nodes\/([^\/]+)$/) && method === 'PUT') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const nodeId = path.split('/')[4];
+      const { name, target_address, description, enabled } = await request.json();
+
+      if (!name || !target_address) {
+        return createErrorResponse('Bad Request', '节点名称和目标地址不能为空', 400, corsHeaders);
+      }
+
+      const result = await env.DB.prepare(`
+        UPDATE ping_nodes 
+        SET name = ?, target_address = ?, description = ?, enabled = ?
+        WHERE id = ?
+      `).bind(name, target_address, description || '', enabled ? 1 : 0, nodeId).run();
+
+      if (result.changes === 0) {
+        return createErrorResponse('Not Found', 'Ping节点不存在', 404, corsHeaders);
+      }
+
+      return createSuccessResponse({ message: 'Ping节点更新成功' }, corsHeaders);
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '更新ping节点');
+    }
+  }
+
+  // 删除ping节点（管理员）
+  if (path.match(/^\/api\/admin\/ping-nodes\/([^\/]+)$/) && method === 'DELETE') {
+    const user = await authenticateAdmin(request, env);
+    if (!user) {
+      return createErrorResponse('Unauthorized', '需要管理员权限', 401, corsHeaders);
+    }
+
+    try {
+      const nodeId = path.split('/')[4];
+
+      const result = await env.DB.prepare(`DELETE FROM ping_nodes WHERE id = ?`).bind(nodeId).run();
+
+      if (result.changes === 0) {
+        return createErrorResponse('Not Found', 'Ping节点不存在', 404, corsHeaders);
+      }
+
+      return createSuccessResponse({ message: 'Ping节点删除成功' }, corsHeaders);
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '删除ping节点');
+    }
+  }
+
+  // 获取服务器的ping结果历史
+  if (path.match(/^\/api\/servers\/([^\/]+)\/ping\/history$/) && method === 'GET') {
+    try {
+      const serverId = path.split('/')[3];
+      const url = new URL(request.url);
+      const period = url.searchParams.get('period') || '24h';
+
+      let timeRange;
+      const now = Math.floor(Date.now() / 1000);
+      
+      switch (period) {
+        case '1h': timeRange = now - 3600; break;
+        case '6h': timeRange = now - 21600; break;
+        case '12h': timeRange = now - 43200; break;
+        case '24h': timeRange = now - 86400; break;
+        case '7d': timeRange = now - 604800; break;
+        case '30d': timeRange = now - 2592000; break;
+        default: timeRange = now - 86400;
+      }
+
+      const { results } = await env.DB.prepare(`
+        SELECT pr.timestamp, pr.ping_time_ms, pr.status, pr.error_message,
+               pn.name as node_name, pn.target_address
+        FROM ping_results pr
+        JOIN ping_nodes pn ON pr.node_id = pn.id
+        WHERE pr.server_id = ? AND pr.timestamp >= ?
+        ORDER BY pr.timestamp DESC
+        LIMIT 1000
+      `).bind(serverId, timeRange).all();
+
+      return createSuccessResponse({ ping_history: results }, corsHeaders);
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取ping历史记录');
+    }
+  }
+
+  return null; // 不匹配此模块的路由
+}
+
 // VPS监控路由处理器
 async function handleVpsRoutes(path, method, request, env, corsHeaders, ctx) {
   // VPS配置获取（使用API密钥认证）
@@ -2206,6 +2381,12 @@ async function handleApiRequest(request, env, ctx) {
   if (path.startsWith('/api/servers') || path.startsWith('/api/admin/servers')) {
     const serverResult = await handleServerRoutes(path, method, request, env, corsHeaders);
     if (serverResult) return serverResult;
+  }
+
+  // Ping节点管理路由
+  if (path.startsWith('/api/ping-nodes') || path.startsWith('/api/admin/ping-nodes')) {
+    const pingResult = await handlePingNodeRoutes(path, method, request, env, corsHeaders);
+    if (pingResult) return pingResult;
   }
 
 
@@ -2578,7 +2759,7 @@ async function handleApiRequest(request, env, ctx) {
         SELECT timestamp, status
         FROM vps_status_history
         WHERE server_id = ? AND timestamp >= ?
-        ORDER BY timestamp ASC
+        ORDER BY timestamp DESC
       `).bind(serverId, startTime).all();
       
       // 分析断开时间段
@@ -2675,6 +2856,152 @@ async function handleApiRequest(request, env, ctx) {
       
     } catch (error) {
       return handleDbError(error, corsHeaders, '获取服务器在线率历史');
+    }
+  }
+
+  // 获取服务器CPU使用率历史数据（管理员和公开API）
+  if (path.match(/\/api\/servers\/([^\/]+)\/cpu\/history$/) && method === 'GET') {
+    try {
+      const serverId = path.split('/')[3];
+      
+      // 检查权限：管理员或公开服务器
+      const user = await authenticateRequestOptional(request, env);
+      const isAdmin = user !== null;
+      
+      if (!isAdmin) {
+        // 检查服务器是否公开
+        const server = await env.DB.prepare(
+          'SELECT is_public FROM servers WHERE id = ?'
+        ).bind(serverId).first();
+        
+        if (!server || !server.is_public) {
+          return createErrorResponse('Not Found', '服务器不存在或未公开', 404, corsHeaders);
+        }
+      }
+      
+      // 获取服务器信息
+      const serverInfo = await env.DB.prepare(
+        'SELECT name, created_at FROM servers WHERE id = ?'
+      ).bind(serverId).first();
+      
+      if (!serverInfo) {
+        return createErrorResponse('Not Found', '服务器不存在', 404, corsHeaders);
+      }
+      
+      // 获取过去24小时的CPU使用率数据
+      const now = Math.floor(Date.now() / 1000);
+      const startTime = now - (24 * 60 * 60); // 24小时前
+      
+      const { results } = await env.DB.prepare(`
+        SELECT timestamp, cpu
+        FROM vps_status_history
+        WHERE server_id = ? AND timestamp >= ? AND cpu IS NOT NULL
+        ORDER BY timestamp ASC
+      `).bind(serverId, startTime).all();
+      
+      // 处理CPU数据
+      const cpuHistory = [];
+      
+      if (results && results.length > 0) {
+        // 从数据库中获取CPU数据
+        results.forEach(record => {
+          try {
+            const cpuData = JSON.parse(record.cpu);
+            const usagePercent = cpuData.usage_percent || 0;
+            
+            cpuHistory.push({
+              timestamp: record.timestamp * 1000,
+              usage: usagePercent
+            });
+          } catch (parseError) {
+            console.error('CPU数据解析失败:', parseError);
+          }
+        });
+      }
+      
+      // 如果没有数据，返回空的结果
+      return createSuccessResponse({
+        server_name: serverInfo.name,
+        period: '24h',
+        history: cpuHistory,
+        data_points: cpuHistory.length
+      }, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取CPU历史数据');
+    }
+  }
+
+  // 获取服务器流量使用历史数据（管理员和公开API）
+  if (path.match(/\/api\/servers\/([^\/]+)\/traffic\/history$/) && method === 'GET') {
+    try {
+      const serverId = path.split('/')[3];
+      
+      // 检查权限：管理员或公开服务器
+      const user = await authenticateRequestOptional(request, env);
+      const isAdmin = user !== null;
+      
+      if (!isAdmin) {
+        // 检查服务器是否公开
+        const server = await env.DB.prepare(
+          'SELECT is_public FROM servers WHERE id = ?'
+        ).bind(serverId).first();
+        
+        if (!server || !server.is_public) {
+          return createErrorResponse('Not Found', '服务器不存在或未公开', 404, corsHeaders);
+        }
+      }
+      
+      // 获取服务器信息
+      const serverInfo = await env.DB.prepare(
+        'SELECT name, created_at FROM servers WHERE id = ?'
+      ).bind(serverId).first();
+      
+      if (!serverInfo) {
+        return createErrorResponse('Not Found', '服务器不存在', 404, corsHeaders);
+      }
+      
+      // 获取过去24小时的流量数据
+      const now = Math.floor(Date.now() / 1000);
+      const startTime = now - (24 * 60 * 60); // 24小时前
+      
+      const { results } = await env.DB.prepare(`
+        SELECT timestamp, network
+        FROM vps_status_history
+        WHERE server_id = ? AND timestamp >= ? AND network IS NOT NULL
+        ORDER BY timestamp ASC
+      `).bind(serverId, startTime).all();
+      
+      // 处理流量数据
+      const trafficHistory = [];
+      
+      if (results && results.length > 0) {
+        // 从数据库中获取流量数据
+        results.forEach(record => {
+          try {
+            const networkData = JSON.parse(record.network);
+            
+            trafficHistory.push({
+              timestamp: record.timestamp * 1000,
+              upload: networkData.upload_speed || 0,
+              download: networkData.download_speed || 0
+            });
+          } catch (parseError) {
+            console.error('流量数据解析失败:', parseError);
+          }
+        });
+      }
+      
+      // 如果没有数据，返回空的结果
+      return createSuccessResponse({
+        server_name: serverInfo.name,
+        period: '24h',
+        history: trafficHistory,
+        data_points: trafficHistory.length
+      }, corsHeaders);
+      
+    } catch (error) {
+      return handleDbError(error, corsHeaders, '获取流量历史数据');
     }
   }
 
@@ -4437,145 +4764,97 @@ async function performDatabaseMaintenance(db) {
 }
 
 // ==================== 主函数导出 ====================
-// ==================== Vercel Edge Functions 配置 ====================
 
-
-// 全局变量
-let dbInitialized = false;
-let taskCounter = 0;
-
-// ==================== 主函数导出 ====================
-export default async function handler(request) {
-  // 模拟 env 对象 - 需要通过环境变量获取
-  const env = {
-    DB: process.env.DATABASE_URL, // 你需要配置数据库连接
-    // 其他环境变量...
-  };
-  
-  // 模拟 ctx 对象
-  const ctx = {
-    waitUntil: (promise) => {
-      // Vercel Edge Functions 中可以直接 await
-      // 或者使用其他方式处理异步任务
-      return promise;
-    }
-  };
-
-  // 优化：仅在必要时初始化数据库表
-  if (!dbInitialized) {
-    try {
-      await ensureTablesExist(env.DB, env);
-      dbInitialized = true;
-    } catch (error) {
-      // 静默处理数据库初始化失败
-      console.log('Database initialization failed:', error.message);
-    }
-  }
-
-  // 定时刷新VPS批量数据（在每个请求中检查）
-  scheduleVpsBatchFlush(env, ctx);
-  
-  const url = new URL(request.url);
-  const path = url.pathname;
-
-  // API请求处理
-  if (path.startsWith('/api/')) {
-    return handleApiRequest(request, env, ctx);
-  }
-
-  // 安装脚本处理
-  if (path === '/install.sh') {
-    return handleInstallScript(request, url, env);
-  }
-
-  // 前端静态文件处理
-  return handleFrontendRequest(request, path);
-}
-
-// ==================== 替代定时任务的方案 ====================
-// 方案1: 创建单独的API端点来触发定时任务
-export async function scheduledTasks(request) {
-  // 验证请求来源（可选）
-  const authHeader = request.headers.get('authorization');
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-    return new Response('Unauthorized', { status: 401 });
-  }
-
-  const env = {
-    DB: process.env.DATABASE_URL,
-    // 其他环境变量...
-  };
-
-  const ctx = {
-    waitUntil: (promise) => promise
-  };
-
-  taskCounter++;
-
-  try {
-    // 智能数据库初始化 - 仅在必要时执行
-    if (!dbInitialized || taskCounter % 10 === 1) {
-      await ensureTablesExist(env.DB, env);
-      dbInitialized = true;
+export default {
+  async fetch(request, env, ctx) {
+    // 优化：仅在必要时初始化数据库表
+    if (!dbInitialized) {
+      try {
+        await ensureTablesExist(env.DB, env);
+        dbInitialized = true;
+      } catch (error) {
+        // 静默处理数据库初始化失败
+      }
     }
 
-    // ==================== 网站监控部分 ====================
-    const { results: sitesToCheck } = await env.DB.prepare(
-      'SELECT id, url, name FROM monitored_sites'
-    ).all();
+    // 定时刷新VPS批量数据（在每个请求中检查）
+    scheduleVpsBatchFlush(env, ctx);
 
-    if (sitesToCheck?.length > 0) {
-      // 限制并发数量为5个，优化资源使用
-      const siteConcurrencyLimit = 5;
-      const sitePromises = [];
-      
-      for (const site of sitesToCheck) {
-        sitePromises.push(checkWebsiteStatusOptimized(site, env.DB, ctx));
-        if (sitePromises.length >= siteConcurrencyLimit) {
-          await Promise.all(sitePromises);
-          sitePromises.length = 0;
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // API请求处理
+    if (path.startsWith('/api/')) {
+      return handleApiRequest(request, env, ctx);
+    }
+
+    // 安装脚本处理
+    if (path === '/install.sh') {
+      return handleInstallScript(request, url, env);
+    }
+
+    // 前端静态文件处理
+    return handleFrontendRequest(request, path);
+  },
+
+  async scheduled(event, env, ctx) {
+    taskCounter++;
+
+    ctx.waitUntil(
+      (async () => {
+        try {
+          // 智能数据库初始化 - 仅在必要时执行
+          if (!dbInitialized || taskCounter % 10 === 1) {
+            await ensureTablesExist(env.DB, env);
+            dbInitialized = true;
+          }
+
+          // ==================== 网站监控部分 ====================
+          const { results: sitesToCheck } = await env.DB.prepare(
+            'SELECT id, url, name FROM monitored_sites'
+          ).all();
+
+          if (sitesToCheck?.length > 0) {
+            // 限制并发数量为5个，优化资源使用
+            const siteConcurrencyLimit = 5;
+            const sitePromises = [];
+
+            for (const site of sitesToCheck) {
+              sitePromises.push(checkWebsiteStatusOptimized(site, env.DB, ctx));
+              if (sitePromises.length >= siteConcurrencyLimit) {
+                await Promise.all(sitePromises);
+                sitePromises.length = 0;
+              }
+            }
+
+            if (sitePromises.length > 0) {
+              await Promise.all(sitePromises);
+            }
+          }
+
+          // ==================== VPS离线提醒检查 ====================
+          // 每小时执行一次，发送持续离线提醒
+          await checkVpsOfflineReminder(env, ctx);
+
+          // ==================== 数据库维护检查 ====================
+          // 每天执行一次数据库维护
+          if (taskCounter % 1440 === 0) {
+            await performDatabaseMaintenance(env.DB);
+          }
+
+          // ==================== 实时缓存清理 ====================
+          // 每15分钟执行一次实时缓存清理
+          if (taskCounter % 15 === 0) {
+            cleanupRealtimeCache();
+          }
+
+        } catch (error) {
+          // 静默处理定时任务错误
         }
-      }
-      
-      if (sitePromises.length > 0) {
-        await Promise.all(sitePromises);
-      }
-    }
-
-    // ==================== VPS离线提醒检查 ====================
-    // 每小时执行一次，发送持续离线提醒
-    await checkVpsOfflineReminder(env, ctx);
-
-    // ==================== 数据库维护检查 ====================
-    // 每天执行一次数据库维护
-    if (taskCounter % 1440 === 0) {
-      await performDatabaseMaintenance(env.DB);
-    }
-
-    // ==================== 实时缓存清理 ====================
-    // 每15分钟执行一次实时缓存清理
-    if (taskCounter % 15 === 0) {
-      cleanupRealtimeCache();
-    }
-
-    return new Response(JSON.stringify({ 
-      success: true, 
-      message: 'Scheduled tasks completed',
-      taskCounter 
-    }), {
-      headers: { 'content-type': 'application/json' }
-    });
-
-  } catch (error) {
-    return new Response(JSON.stringify({ 
-      success: false, 
-      error: error.message 
-    }), {
-      status: 500,
-      headers: { 'content-type': 'application/json' }
-    });
+      })()
+    );
   }
-}
+};
 
 
 // ==================== 工具函数 ====================
@@ -4893,8 +5172,8 @@ function getIndexHtml() {
             document.documentElement.setAttribute('data-bs-theme', theme);
         })();
     </script>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet" integrity="sha384-4LISF5TTJX/fLmGSxO53rV4miRxdg84mZsxmO8Rx5jGtp/LbrixFETvWa5a6sESd" crossorigin="anonymous">
+	<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" integrity="sha512-b2QcS5SsA8tZodcDtGRELiGv5SaKSk1vDHDaQRda0htPYWZ6046lr3kJ5bAAQdpV2mmA/4v0wQF9MyU6/pDIAg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.11.1/font/bootstrap-icons.min.css" rel="stylesheet" integrity="sha512-oAvZuuYVzkcTc2dH5z1ZJup5OmSQ000qlfRvuoTTiyTBjwX1faoyearj8KdMq0LgsBTHMrRuMek7s+CxF8yE+w==" crossorigin="anonymous">
     <link href="/css/style.css" rel="stylesheet">
     <style>
         .server-row {
@@ -4944,6 +5223,9 @@ function getIndexHtml() {
             border-radius: 1px;
         }
         .history-bar-up { background-color: #28a745; } /* Green */
+        .history-bar-slow-yellow { background-color: #ffc107; } /* Yellow - >1s */
+        .history-bar-slow-orange { background-color: #fd7e14; } /* Orange - >2s */
+        .history-bar-slow-red { background-color: #dc3545; } /* Red - >5s */
         .history-bar-down { background-color: #dc3545; } /* Red */
         .history-bar-pending { background-color: #6c757d; } /* Gray */
 
@@ -5298,6 +5580,7 @@ function getIndexHtml() {
                                     <th>响应时间 (ms)</th>
                                     <th>最后检查</th>
                                     <th>在线率</th>
+                                    <th>24h记录</th>
                                 </tr>
                             </thead>
                             <tbody id="siteStatusTableBody">
@@ -5334,6 +5617,40 @@ function getIndexHtml() {
         </tr>
     </template>
 
+    <!-- CPU历史模态框 -->
+    <div class="modal fade" id="cpuHistoryModal" tabindex="-1" aria-labelledby="cpuHistoryModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-xl modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="cpuHistoryModalLabel">CPU使用率历史详情</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="cpuHistoryChartContainer" style="height: 400px; position: relative;">
+                        <!-- Zoomed chart will be rendered here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 流量历史模态框 -->
+    <div class="modal fade" id="trafficHistoryModal" tabindex="-1" aria-labelledby="trafficHistoryModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-xl modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="trafficHistoryModalLabel">流量历史详情</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="trafficHistoryChartContainer" style="height: 400px; position: relative;">
+                        <!-- Zoomed chart will be rendered here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <footer class="footer fixed-bottom py-2 bg-light border-top">
         <div class="container text-center">
             <span class="text-muted small">VPS监控面板 &copy; 2025</span>
@@ -5345,7 +5662,7 @@ function getIndexHtml() {
 
     <!-- 在线率历史模态框 -->
     <div class="modal fade" id="uptimeHistoryModal" tabindex="-1" aria-labelledby="uptimeHistoryModalLabel" aria-hidden="true">
-        <div class="modal-dialog modal-lg">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable" >
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title" id="uptimeHistoryModalLabel">
@@ -5390,7 +5707,7 @@ function getIndexHtml() {
 
     <!-- 网站在线率历史模态框 -->
     <div class="modal fade" id="siteUptimeHistoryModal" tabindex="-1" aria-labelledby="siteUptimeHistoryModalLabel" aria-hidden="true">
-        <div class="modal-dialog modal-lg">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable" >
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title" id="siteUptimeHistoryModalLabel">
@@ -5424,7 +5741,7 @@ function getIndexHtml() {
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/js/bootstrap.bundle.min.js" integrity="sha512-X/YkDZyjTf4wyc2Vy16YGCPHwAY8rZJY+POgokZjQB2mhIRFJCckEGc6YyX9eNsPfn0PzThEuNs+uaomE5CO6A==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <script src="/js/main.js"></script>
 </body>
 </html>`;
@@ -5445,8 +5762,8 @@ function getLoginHtml() {
             document.documentElement.setAttribute('data-bs-theme', theme);
         })();
     </script>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet" integrity="sha384-4LISF5TTJX/fLmGSxO53rV4miRxdg84mZsxmO8Rx5jGtp/LbrixFETvWa5a6sESd" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" integrity="sha512-b2QcS5SsA8tZodcDtGRELiGv5SaKSk1vDHDaQRda0htPYWZ6046lr3kJ5bAAQdpV2mmA/4v0wQF9MyU6/pDIAg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.11.1/font/bootstrap-icons.min.css" rel="stylesheet" integrity="sha512-oAvZuuYVzkcTc2dH5z1ZJup5OmSQ000qlfRvuoTTiyTBjwX1faoyearj8KdMq0LgsBTHMrRuMek7s+CxF8yE+w==" crossorigin="anonymous">
     <link href="/css/style.css" rel="stylesheet">
     <style>
         .server-row {
@@ -5501,6 +5818,9 @@ function getLoginHtml() {
             border-radius: 1px;
         }
         .history-bar-up { background-color: #28a745; } /* Green */
+        .history-bar-slow-yellow { background-color: #ffc107; } /* Yellow - >1s */
+        .history-bar-slow-orange { background-color: #fd7e14; } /* Orange - >2s */
+        .history-bar-slow-red { background-color: #dc3545; } /* Red - >5s */
         .history-bar-down { background-color: #dc3545; } /* Red */
         .history-bar-pending { background-color: #6c757d; } /* Gray */
 
@@ -5705,8 +6025,8 @@ function getLoginHtml() {
         </div>
     </footer>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
-    <script src="/js/login.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/js/bootstrap.bundle.min.js" integrity="sha512-X/YkDZyjTf4wyc2Vy16YGCPHwAY8rZJY+POgokZjQB2mhIRFJCckEGc6YyX9eNsPfn0PzThEuNs+uaomE5CO6A==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+	<script src="/js/login.js"></script>
 </body>
 </html>`;
 }
@@ -5726,8 +6046,8 @@ function getAdminHtml() {
             document.documentElement.setAttribute('data-bs-theme', theme);
         })();
     </script>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet" integrity="sha384-4LISF5TTJX/fLmGSxO53rV4miRxdg84mZsxmO8Rx5jGtp/LbrixFETvWa5a6sESd" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" integrity="sha512-b2QcS5SsA8tZodcDtGRELiGv5SaKSk1vDHDaQRda0htPYWZ6046lr3kJ5bAAQdpV2mmA/4v0wQF9MyU6/pDIAg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.11.1/font/bootstrap-icons.min.css" rel="stylesheet" integrity="sha512-oAvZuuYVzkcTc2dH5z1ZJup5OmSQ000qlfRvuoTTiyTBjwX1faoyearj8KdMq0LgsBTHMrRuMek7s+CxF8yE+w==" crossorigin="anonymous">
     <link href="/css/style.css" rel="stylesheet">
 </head>
 <body>
@@ -6050,6 +6370,74 @@ function getAdminHtml() {
         </div>
     </div>
 
+    <!-- Ping节点管理部分 -->
+    <div class="container mt-4">
+        <div class="card shadow-sm">
+            <div class="card-body">
+                <div class="mb-4">
+                    <div class="admin-header-row mb-3">
+                        <div class="admin-header-title">
+                            <h5 class="card-title mb-0">
+                                <i class="bi bi-diagram-3 me-2"></i>Ping节点管理
+                            </h5>
+                        </div>
+                        <div class="admin-header-content">
+                            <div class="admin-actions-group desktop-only">
+                                <button type="button" class="btn btn-success me-2" onclick="showPingNodeModal()">
+                                    <i class="bi bi-plus-circle me-1"></i>添加节点
+                                </button>
+                                <button type="button" class="btn btn-outline-info" onclick="refreshPingNodes()">
+                                    <i class="bi bi-arrow-clockwise me-1"></i>刷新
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="noPingNodes" class="alert alert-info d-none">
+                        暂无ping测试节点。点击"添加节点"来添加第一个节点。
+                    </div>
+
+                    <!-- 桌面端表格视图 -->
+                    <div class="table-responsive">
+                        <table class="table table-striped table-hover align-middle">
+                            <thead>
+                                <tr>
+                                    <th>节点名称</th>
+                                    <th>目标地址</th>
+                                    <th>描述</th>
+                                    <th>状态</th>
+                                    <th>创建时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="pingNodesTable">
+                                <!-- 动态填充 -->
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- 移动端卡片视图 -->
+                    <div class="mobile-card-container" id="mobilePingNodeContainer">
+                        <div class="text-center p-3">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">加载中...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 移动端操作按钮 -->
+                    <div class="admin-actions-group mobile-only">
+                        <button type="button" class="btn btn-success me-2" onclick="showPingNodeModal()">
+                            <i class="bi bi-plus-circle me-1"></i>添加节点
+                        </button>
+                        <button type="button" class="btn btn-outline-info" onclick="refreshPingNodes()">
+                            <i class="bi bi-arrow-clockwise me-1"></i>刷新
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
     <!-- Global Settings Section (Now integrated above Server Management List) -->
     <!-- The form is now part of the header for Server Management -->
     <!-- End Global Settings Section -->
@@ -6149,6 +6537,48 @@ function getAdminHtml() {
         </div>
     </div>
 
+    <!-- Ping节点模态框 -->
+    <div class="modal fade" id="pingNodeModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="pingNodeModalTitle">添加Ping节点</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="pingNodeForm">
+                        <input type="hidden" id="pingNodeId">
+                        <div class="mb-3">
+                            <label for="pingNodeName" class="form-label">节点名称</label>
+                            <input type="text" class="form-control" id="pingNodeName" placeholder="如：阿里云北京" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="pingNodeTarget" class="form-label">目标地址</label>
+                            <input type="text" class="form-control" id="pingNodeTarget" placeholder="如：8.8.8.8 或 www.google.com" required>
+                            <div class="form-text">支持IP地址或域名</div>
+                        </div>
+                        <div class="mb-3">
+                            <label for="pingNodeDescription" class="form-label">描述（可选）</label>
+                            <textarea class="form-control" id="pingNodeDescription" rows="2" placeholder="节点说明或备注"></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="pingNodeEnabled" checked>
+                                <label class="form-check-label" for="pingNodeEnabled">
+                                    启用此节点
+                                </label>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                    <button type="button" class="btn btn-primary" id="savePingNodeBtn">保存</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- 服务器删除确认模态框 -->
     <div class="modal fade" id="deleteModal" tabindex="-1">
         <div class="modal-dialog">
@@ -6184,6 +6614,26 @@ function getAdminHtml() {
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
                     <button type="button" class="btn btn-danger" id="confirmDeleteSiteBtn">删除</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Ping节点删除确认模态框 -->
+    <div class="modal fade" id="deletePingNodeModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">确认删除Ping节点</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p>确定要删除ping节点 "<span id="deletePingNodeName"></span>" 吗？</p>
+                    <p class="text-danger">此操作不可逆，所有相关的ping测试数据也将被删除。</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-danger" id="confirmDeletePingNodeBtn">删除</button>
                 </div>
             </div>
         </div>
@@ -6231,8 +6681,8 @@ function getAdminHtml() {
         </div>
     </footer>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
-    <script src="/js/admin.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/js/bootstrap.bundle.min.js" integrity="sha512-X/YkDZyjTf4wyc2Vy16YGCPHwAY8rZJY+POgokZjQB2mhIRFJCckEGc6YyX9eNsPfn0PzThEuNs+uaomE5CO6A==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+	<script src="/js/admin.js"></script>
 </body>
 </html>`;
 }
@@ -6863,6 +7313,37 @@ body {
     .container h2 {
         font-size: 1.5rem;
         margin-bottom: 1rem;
+    }
+
+    /* 移动端模态框优化 */
+    .modal-dialog {
+        margin: 0.5rem;
+        max-width: calc(100% - 1rem);
+    }
+    
+    .modal-body {
+        padding: 1rem;
+        max-height: calc(100vh - 200px);
+        overflow-y: auto;
+    }
+    
+    .modal-footer {
+        padding: 0.75rem 1rem;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+    }
+    
+    .modal-footer .btn-group {
+        flex-wrap: wrap;
+        justify-content: center;
+        width: 100%;
+    }
+    
+    .modal-footer .btn-group .btn {
+        font-size: 0.75rem;
+        padding: 0.375rem 0.5rem;
+        margin: 0.125rem;
+        flex: 0 0 auto;
     }
 
     /* 移动端卡片标题层次优化 */
@@ -7771,6 +8252,15 @@ p, div, span:not(.badge), td, th, .btn, button, a:not(.navbar-brand),
     to { width: 0%; }
 }
 
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.spin {
+    animation: spin 1s linear infinite;
+}
+
 [data-bs-theme="dark"] .unified-toast {
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
     border-color: rgba(255, 255, 255, 0.1);
@@ -8110,151 +8600,71 @@ function handleRowClick(event) {
     }
 }
 
-// 实时监控功能
-let realtimeMonitoringInterval = null;
-let isRealtimeMonitoringActive = false;
-let currentServerId = null;
-let cpuUsageHistory = []; // 存储CPU使用率历史数据
-const MAX_CPU_HISTORY_POINTS = 60; // 最多显示60秒的数据
+// CPU使用率历史数据功能
+let cpuUsageHistory = []; // 存储VPS CPU使用率历史数据
 
-function toggleRealtimeMonitoring() {
-    const btn = document.getElementById('realtime-monitoring-btn');
-    const icon = document.getElementById('monitoring-icon');
+// 初始化CPU历史数据图表
+async function initializeCpuHistoryChart(serverId) {
+    if (!serverId) return;
     
-    if (isRealtimeMonitoringActive) {
-        // 停止实时监控
-        clearInterval(realtimeMonitoringInterval);
-        realtimeMonitoringInterval = null;
-        isRealtimeMonitoringActive = false;
-        
-        btn.innerHTML = '<i class="bi bi-play-fill"></i> 实时监控';
-        btn.className = 'btn btn-outline-primary btn-sm';
-        
-        // 清空CPU历史数据并重置图表
-        cpuUsageHistory = [];
-        resetCpuChart();
-    } else {
-        // 开始实时监控
-        isRealtimeMonitoringActive = true;
-        
-        btn.innerHTML = '<i class="bi bi-stop-fill"></i> 停止监控';
-        btn.className = 'btn btn-outline-danger btn-sm';
-        
-        // 启动定时更新
-        updateRealtimeData();
-        realtimeMonitoringInterval = setInterval(updateRealtimeData, 3000);
+    try {
+        // 获取24小时内的CPU历史数据
+        const response = await fetch(\`/api/servers/\${serverId}/cpu/history\`);
+        if (response.ok) {
+            const data = await response.json();
+            cpuUsageHistory = data.history || [];
+            renderCpuUsageChart(serverId);
+        } else {
+            resetCpuChart(serverId);
+        }
+    } catch (error) {
+        console.error('加载CPU历史数据失败:', error);
+        resetCpuChart(serverId);
     }
 }
 
-async function updateRealtimeData() {
-    if (!currentServerId) return;
-     // 生成随机回调函数名
-    const callbackName = \`jsonp_\${Date.now()}\`;
-   
-        // 使用实时API接口获取单个服务器状态
-        const response = await apiRequest(\`\/api\/realtime\/\${currentServerId}\`);
-        //const response = await apiRequest(currentRealtimeEndPoint);
-		  
-    // 创建script标签发起JSONP请求
-   // const script = document.createElement('script');
-    //script.src =\`\${currentRealtimeEndPoint}?callback=\${callbackName}\`;
-	 // 定义全局回调函数
-   // window[callbackName] = (data) => {
-       // try {
-            // 清理script标签
-          //  document.body.removeChild(script);
-         //   delete window[callbackName];
-        if ( response.data) {
-            const metrics = response.data;
-            
-            // 更新CPU负载显示
-            const cpuLoadDisplay = document.getElementById('cpu-load-display');
-            if (cpuLoadDisplay && metrics.cpu && metrics.cpu.load_avg) {
-                cpuLoadDisplay.querySelector('i').nextSibling.textContent = ' ' + metrics.cpu.load_avg.join(', ');
-            }
-            
-            // 更新CPU使用率显示
-            const cpuUsageElement = document.getElementById('cpu-usage-value');
-            if (cpuUsageElement && metrics.cpu && typeof metrics.cpu.usage_percent === 'number') {
-                cpuUsageElement.textContent = metrics.cpu.usage_percent.toFixed(1) + '%';
-                
-                // 添加CPU使用率到历史记录
-                cpuUsageHistory.push({
-                    timestamp: Date.now(),
-                    usage: metrics.cpu.usage_percent
-                });
-                
-                // 保持最大数据量
-                if (cpuUsageHistory.length > MAX_CPU_HISTORY_POINTS) {
-                    cpuUsageHistory.shift();
-                }
-                
-                // 绘制CPU曲线图
-                renderCpuUsageChart();
-            }
-            
-            // 更新内存使用率和进度条
-            const memoryUsageElement = document.getElementById('memory-usage-value');
-            const memoryProgressBar = document.getElementById('memory-progress-bar');
-            if (memoryUsageElement && metrics.memory && typeof metrics.memory.usage_percent === 'number') {
-                const memoryPercent = metrics.memory.usage_percent;
-                memoryUsageElement.textContent = memoryPercent.toFixed(1) + '%';
-                
-                // 更新进度条
-                if (memoryProgressBar) {
-                    const memoryTotal = formatDataSize(metrics.memory.total * 1024);
-                    const memoryUsed = formatDataSize(metrics.memory.used * 1024);
-                    let memoryColor = 'bg-success';
-                    if (memoryPercent > 80) memoryColor = 'bg-danger';
-                    else if (memoryPercent > 60) memoryColor = 'bg-warning';
-                    
-                    memoryProgressBar.style.width = memoryPercent + '%';
-                    memoryProgressBar.className = \`progress-bar \${memoryColor}\`;
-                    memoryProgressBar.textContent = \`\${memoryUsed}/\${memoryTotal} (\${memoryPercent.toFixed(1)}%)\`;
-                }
-            }
-            
-            // 更新硬盘进度条
-            const diskProgressBar = document.getElementById('disk-progress-bar');
-            if (diskProgressBar && metrics.disk) {
-                const diskPercent = metrics.disk.usage_percent || 0;
-                const diskTotal = typeof metrics.disk.total === 'number' ? metrics.disk.total.toFixed(2) : '-';
-                const diskUsed = typeof metrics.disk.used === 'number' ? metrics.disk.used.toFixed(2) : '-';
-                let diskColor = 'bg-success';
-                if (diskPercent > 90) diskColor = 'bg-danger';
-                else if (diskPercent > 75) diskColor = 'bg-warning';
-                
-                diskProgressBar.style.width = diskPercent + '%';
-                diskProgressBar.className = \`progress-bar \${diskColor}\`;
-                diskProgressBar.textContent = \`\${diskUsed}G/\${diskTotal}G (\${diskPercent.toFixed(1)}%)\`;
-            }
+// 流量历史数据功能
+let trafficUsageHistory = []; // 存储VPS 流量使用历史数据
+
+// 初始化流量历史数据图表
+async function initializeTrafficHistoryChart(serverId) {
+    if (!serverId) return;
+    
+    try {
+        // 获取24小时内的流量历史数据
+        const response = await fetch(\`/api/servers/\${serverId}/traffic/history\`);
+        if (response.ok) {
+            const data = await response.json();
+            trafficUsageHistory = data.history || [];
+            renderTrafficChart(serverId);
+        } else {
+            resetTrafficChart(serverId);
         }
-   // } catch (error) {
-    //    console.error('更新实时数据失败:', error);
-    //}
-//};
-     /* 错误处理
-        script.onerror = () => {
-            console.error('JSONP请求失败');
-            if (window[callbackName]) {
-                delete window[callbackName];
-            }
-        };
-        
-        // 可选：添加超时处理
-        setTimeout(() => {
-            if (window[callbackName]) {
-                console.error('JSONP请求超时');
-                document.body.removeChild(script);
-                delete window[callbackName];
-            }
-        }, 5000); // 添加到DOM发起请求
-        document.body.appendChild(script);*/
+    } catch (error) {
+        console.error('加载流量历史数据失败:', error);
+        resetTrafficChart(serverId);
+    }
 }
-// 绘制CPU使用率曲线图
-function renderCpuUsageChart() {
-    const chartContainer = document.getElementById('cpu-usage-chart');
-    if (!chartContainer || cpuUsageHistory.length === 0) return;
+
+// 重置流量曲线图
+function resetTrafficChart(serverId) {
+    const chartContainer = document.getElementById(\`traffic-chart-\${serverId}\`);
+    if (chartContainer) {
+        chartContainer.innerHTML = \`
+            <div class="text-center p-3 text-muted" style="font-size: 0.875rem;">
+                暂无流量历史数据
+            </div>
+        \`;
+    }
+}
+
+// 绘制流量使用率曲线图（显示24小时上传下载数据）
+function renderTrafficChart(serverId) {
+    const chartContainer = document.getElementById(\`traffic-chart-\${serverId}\`);
+    if (!chartContainer || !trafficUsageHistory || trafficUsageHistory.length === 0) {
+        resetTrafficChart(serverId);
+        return;
+    }
     
     // 清空容器
     chartContainer.innerHTML = '';
@@ -8263,92 +8673,326 @@ function renderCpuUsageChart() {
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('width', '100%');
     svg.setAttribute('height', '100%');
-    svg.setAttribute('viewBox', '0 0 400 80');
-    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.setAttribute('viewBox', '0 0 400 120');
+    svg.setAttribute('preserveAspectRatio', 'xMinYMid meet'); // 修复图表偏右问题
     svg.style.position = 'absolute';
-    svg.style.top = '0';
-    svg.style.left = '0';
     svg.style.width = '100%';
     svg.style.height = '100%';
+        svg.style.left = '0px';
     
-    // 计算最大值用于缩放（至少20%以显示低使用率）
-    const maxUsage = Math.max(20, Math.max(...cpuUsageHistory.map(point => point.usage)));
-    
-    // 创建曲线路径
-    let pathData = '';
-    const pointCount = cpuUsageHistory.length;
-    
-    cpuUsageHistory.forEach((point, index) => {
-        const x = (index / (MAX_CPU_HISTORY_POINTS - 1)) * 400;
-        const y = 80 - ((point.usage / maxUsage) * 70); // 70是可用高度，留出10px边距
-        
-        if (index === 0) {
-            pathData += \`M \${x} \${y}\`;
-        } else {
-            pathData += \` L \${x} \${y}\`;
-        }
-    });
-    
-    // 创建路径元素
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.setAttribute('d', pathData);
-    path.setAttribute('stroke', '#007bff');
-    path.setAttribute('stroke-width', '2');
-    path.setAttribute('fill', 'none');
-    path.setAttribute('stroke-linecap', 'round');
-    path.setAttribute('stroke-linejoin', 'round');
-    
-    // 创建填充区域
-    if (cpuUsageHistory.length > 1) {
-        const fillPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        const fillData = pathData + \` L 400 80 L 0 80 Z\`;
-        fillPath.setAttribute('d', fillData);
-        fillPath.setAttribute('fill', 'rgba(0, 123, 255, 0.1)');
-        svg.appendChild(fillPath);
+    // 数据处理
+    const data = trafficUsageHistory.slice().sort((a, b) => a.timestamp - b.timestamp);
+    if (data.length === 0) {
+        resetTrafficChart(serverId);
+        return;
     }
     
-    svg.appendChild(path);
+    // 计算最大值用于缩放
+    let maxUpload = 0;
+    let maxDownload = 0;
+    data.forEach(item => {
+        maxUpload = Math.max(maxUpload, item.upload || 0);
+        maxDownload = Math.max(maxDownload, item.download || 0);
+    });
+    const maxTraffic = Math.max(maxUpload, maxDownload);
     
-    // 添加网格线
+    if (maxTraffic === 0) {
+        resetTrafficChart(serverId);
+        return;
+    }
+    
+    // 图表参数
+    const padding = { top: 15, right: 30, bottom: 20, left: 30 };
+    const chartWidth = 400 - padding.left - padding.right;
+    const chartHeight = 120 - padding.top - padding.bottom;
+    
+    // 添加基础网格
     for (let i = 0; i <= 4; i++) {
-        const y = (i / 4) * 70 + 5;
+        const y = padding.top + (i / 4) * chartHeight;
         const gridLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-        gridLine.setAttribute('x1', '0');
+        gridLine.setAttribute('x1', padding.left.toString());
         gridLine.setAttribute('y1', y.toString());
-        gridLine.setAttribute('x2', '400');
+        gridLine.setAttribute('x2', (400 - padding.right).toString());
         gridLine.setAttribute('y2', y.toString());
         gridLine.setAttribute('stroke', '#e9ecef');
         gridLine.setAttribute('stroke-width', '0.5');
         svg.appendChild(gridLine);
     }
     
+    // Y轴标签
+    for (let i = 0; i <= 4; i++) {
+        const y = padding.top + (i / 4) * chartHeight;
+        const value = maxTraffic * (1 - i / 4);
+        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        label.setAttribute('x', (padding.left +15).toString());
+        label.setAttribute('y', (y + 3).toString());
+        label.setAttribute('text-anchor', 'end');
+        label.setAttribute('font-size', '8');
+        label.setAttribute('fill', '#666');
+        label.textContent = formatTrafficValue(value);
+        svg.appendChild(label);
+    }
+    
+    // 创建路径字符串
+    let uploadPath = '';
+    let downloadPath = '';
+    
+    data.forEach((item, index) => {
+        const x = padding.left + (index / (data.length - 1)) * chartWidth;
+        const uploadY = padding.top + chartHeight - (item.upload / maxTraffic) * chartHeight;
+        const downloadY = padding.top + chartHeight - (item.download / maxTraffic) * chartHeight;
+        
+        if (index === 0) {
+            uploadPath += \`M \${x} \${uploadY}\`;
+            downloadPath += \`M \${x} \${downloadY}\`;
+        } else {
+            uploadPath += \` L \${x} \${uploadY}\`;
+            downloadPath += \` L \${x} \${downloadY}\`;
+        }
+    });
+    
+    // 绘制上传线条（红棕色）
+    if (uploadPath) {
+        const uploadLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        uploadLine.setAttribute('d', uploadPath);
+        uploadLine.setAttribute('stroke', '#dc3545'); // 红色
+        uploadLine.setAttribute('stroke-width', '2');
+        uploadLine.setAttribute('fill', 'none');
+        svg.appendChild(uploadLine);
+    }
+    
+    // 绘制下载线条（绿色）
+    if (downloadPath) {
+        const downloadLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        downloadLine.setAttribute('d', downloadPath);
+        downloadLine.setAttribute('stroke', '#28a745'); // 绿色
+        downloadLine.setAttribute('stroke-width', '2');
+        downloadLine.setAttribute('fill', 'none');
+        svg.appendChild(downloadLine);
+    }
+    
+   
+    
+    chartContainer.appendChild(svg);
+    // 添加点击放大功能
+    svg.style.cursor = 'pointer';
+    svg.addEventListener('click', () => {
+        showTrafficHistoryModal(serverId);
+    });
+}
+
+// 格式化流量值显示
+function formatTrafficValue(value) {
+    if (value >= 1024 * 1024 * 1024) {
+        return \`\${(value / (1024 * 1024 * 1024)).toFixed(1)}GB/s\`;
+    } else if (value >= 1024 * 1024) {
+        return \`\${(value / (1024 * 1024)).toFixed(1)}MB/s\`;
+    } else if (value >= 1024) {
+        return \`\${(value / 1024).toFixed(1)}KB/s\`;
+    } else {
+        return \`\${Math.round(value)}B/s\`;
+    }
+}
+
+// 绘制设备CPU使用率对比图（显示24小时历史数据）
+function renderCpuUsageChart(serverId) {
+    const chartContainer = document.getElementById(\`cpu-usage-chart-\${serverId}\`);
+    if (!chartContainer || !cpuUsageHistory || cpuUsageHistory.length === 0) {
+        if (chartContainer) {
+            chartContainer.innerHTML = '<div class="text-center p-3 text-muted" style="font-size: 0.875rem;">暂无CPU历史数据</div>';
+        }
+        return;
+    }
+    
+    // 清空容器
+    chartContainer.innerHTML = '';
+    
+    // 创建SVG容器（留出空间给坐标轴）
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('width', '100%');
+    svg.setAttribute('height', '100%');
+    svg.setAttribute('viewBox', '0 0 450 150'); // 增加宽度和高度给坐标轴
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    svg.style.position = 'absolute';
+    svg.style.top = '0';
+    svg.style.left = '0';
+    svg.style.width = '100%';
+    svg.style.height = '100%';
+    
+    // 计算数据范围
+    const maxUsage = Math.max(20, ...cpuUsageHistory.map(p => p.usage));
+    const minTime = Math.min(...cpuUsageHistory.map(p => p.timestamp));
+    const maxTime = Math.max(...cpuUsageHistory.map(p => p.timestamp));
+    const timeRange = maxTime - minTime;
+    
+    // 图表区域设置
+    const chartLeft = 50;   // Y轴标签空间
+    const chartTop = 10;    // 顶部边距
+    const chartWidth = 350; // 图表宽度
+    const chartHeight = 100; // 图表高度
+    const chartBottom = chartTop + chartHeight;
+    
+    // 添加Y轴网格线和标签
+    for (let i = 0; i <= 4; i++) {
+        const yPercent = i / 4;
+        const y = chartBottom - (yPercent * chartHeight);
+        const usage = (maxUsage * yPercent).toFixed(0);
+        
+        // 网格线
+        const gridLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        gridLine.setAttribute('x1', chartLeft.toString());
+        gridLine.setAttribute('y1', y.toString());
+        gridLine.setAttribute('x2', (chartLeft + chartWidth).toString());
+        gridLine.setAttribute('y2', y.toString());
+        gridLine.setAttribute('stroke', '#e9ecef');
+        gridLine.setAttribute('stroke-width', '0.5');
+        svg.appendChild(gridLine);
+        
+        // Y轴标签
+        const yLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        yLabel.setAttribute('x', (chartLeft - 5).toString());
+        yLabel.setAttribute('y', (y + 3).toString());
+        yLabel.setAttribute('text-anchor', 'end');
+        yLabel.setAttribute('font-size', '10');
+        yLabel.setAttribute('fill', '#666');
+        yLabel.textContent = usage + '%';
+        svg.appendChild(yLabel);
+    }
+    
+    // 添加X轴网格线和时间标签
+    const timeLabels = 6; // 显示6个时间点
+    for (let i = 0; i <= timeLabels; i++) {
+        const xPercent = i / timeLabels;
+        const x = chartLeft + (xPercent * chartWidth);
+        const timestamp = minTime + (timeRange * xPercent);
+        const date = new Date(timestamp);
+        const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
+        
+        // 竖直网格线
+        if (i > 0 && i < timeLabels) {
+            const gridLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            gridLine.setAttribute('x1', x.toString());
+            gridLine.setAttribute('y1', chartTop.toString());
+            gridLine.setAttribute('x2', x.toString());
+            gridLine.setAttribute('y2', chartBottom.toString());
+            gridLine.setAttribute('stroke', '#e9ecef');
+            gridLine.setAttribute('stroke-width', '0.3');
+            svg.appendChild(gridLine);
+        }
+        
+        // X轴标签
+        const xLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        xLabel.setAttribute('x', x.toString());
+        xLabel.setAttribute('y', (chartBottom + 15).toString());
+        xLabel.setAttribute('text-anchor', 'middle');
+        xLabel.setAttribute('font-size', '9');
+        xLabel.setAttribute('fill', '#666');
+        xLabel.textContent = timeStr;
+        svg.appendChild(xLabel);
+    }
+    
+    // 绘制CPU使用率曲线
+    if (cpuUsageHistory.length > 1) {
+        let pathData = '';
+        const sortedData = [...cpuUsageHistory].sort((a, b) => a.timestamp - b.timestamp);
+        
+        sortedData.forEach((point, index) => {
+            const x = chartLeft + ((point.timestamp - minTime) / timeRange) * chartWidth;
+            const y = chartBottom - ((point.usage / maxUsage) * chartHeight);
+            
+            if (index === 0) {
+                pathData += \`M \${x} \${y}\`;
+            } else {
+                pathData += \` L \${x} \${y}\`;
+            }
+        });
+        
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', pathData);
+        path.setAttribute('stroke', '#007bff');
+        path.setAttribute('stroke-width', '2');
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke-linecap', 'round');
+        path.setAttribute('stroke-linejoin', 'round');
+        svg.appendChild(path);
+        
+        // 添加数据点
+        sortedData.forEach(point => {
+            const x = chartLeft + ((point.timestamp - minTime) / timeRange) * chartWidth;
+            const y = chartBottom - ((point.usage / maxUsage) * chartHeight);
+            
+            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            circle.setAttribute('cx', x.toString());
+            circle.setAttribute('cy', y.toString());
+            circle.setAttribute('r', '3');
+            circle.setAttribute('fill', '#007bff');
+            circle.setAttribute('stroke', '#fff');
+            circle.setAttribute('stroke-width', '1');
+            
+            // 添加hover效果
+            const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+            const time = new Date(point.timestamp).toLocaleString('zh-CN');
+            title.textContent = \`\${time}: \${point.usage.toFixed(1)}%\`;
+            circle.appendChild(title);
+            
+            svg.appendChild(circle);
+        });
+    }
+    
+    // 添加轴标签
+    const yAxisLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    yAxisLabel.setAttribute('x', '15');
+    yAxisLabel.setAttribute('y', '75');
+    yAxisLabel.setAttribute('text-anchor', 'middle');
+    yAxisLabel.setAttribute('font-size', '11');
+    yAxisLabel.setAttribute('fill', '#666');
+    yAxisLabel.setAttribute('transform', 'rotate(-90, 15, 75)');
+    yAxisLabel.textContent = 'CPU使用率(%)';
+    svg.appendChild(yAxisLabel);
+    
+    const xAxisLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    xAxisLabel.setAttribute('x', (chartLeft + chartWidth/2).toString());
+    xAxisLabel.setAttribute('y', '140');
+    xAxisLabel.setAttribute('text-anchor', 'middle');
+    xAxisLabel.setAttribute('font-size', '11');
+    xAxisLabel.setAttribute('fill', '#666');
+    xAxisLabel.textContent = '时间';
+    svg.appendChild(xAxisLabel);
+    
     chartContainer.appendChild(svg);
     
-    // 添加当前值标签
-    const currentValue = cpuUsageHistory[cpuUsageHistory.length - 1].usage;
-    const valueLabel = document.createElement('div');
-    valueLabel.style.cssText = \`
-        position: absolute;
-        top: 5px;
-        right: 10px;
-        background: rgba(0, 123, 255, 0.8);
-        color: white;
-        padding: 2px 6px;
-        border-radius: 3px;
-        font-size: 11px;
-        font-weight: 600;
-    \`;
-    valueLabel.textContent = \`\${currentValue.toFixed(1)}%\`;
-    chartContainer.appendChild(valueLabel);
+    // 添加点击放大功能
+    svg.style.cursor = 'pointer';
+    svg.addEventListener('click', () => {
+        showCpuHistoryModal(serverId);
+    });
+    // 添加当前值显示
+    if (cpuUsageHistory.length > 0) {
+        const latestValue = cpuUsageHistory[cpuUsageHistory.length - 1].usage;
+        const currentLabel = document.createElement('div');
+        currentLabel.style.cssText = \`
+            position: absolute;
+            top: 5px;
+            right: 10px;
+            background: rgba(0,123,255,0.1);
+            color: #007bff;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        \`;
+        currentLabel.textContent = \`当前: \${latestValue.toFixed(1)}%\`;
+        chartContainer.appendChild(currentLabel);
+    }
 }
 
 // 重置CPU曲线图
-function resetCpuChart() {
-    const chartContainer = document.getElementById('cpu-usage-chart');
+function resetCpuChart(serverId) {
+    const chartContainer = document.getElementById(\`cpu-usage-chart-\${serverId}\`);
     if (chartContainer) {
         chartContainer.innerHTML = \`
             <div class="text-center p-3 text-muted" style="font-size: 0.875rem;">
-                点击"实时监控"开始显示CPU使用率曲线
+                正在加载CPU使用率历史数据...
             </div>
         \`;
     }
@@ -8356,9 +9000,8 @@ function resetCpuChart() {
 
 // Populate the detailed row with data
 function populateDetailsRow(serverId, vpsRealtimeEndPoint,detailsRow) {
-    // 设置当前服务器ID用于实时监控
-    currentServerId = serverId;
-    currentRealtimeEndPoint=vpsRealtimeEndPoint;
+    // 初始化CPU历史数据图表
+    initializeCpuHistoryChart(serverId);
     const serverData = serverDataCache[serverId];
     const detailsContentDiv = detailsRow.querySelector('.server-details-content');
 
@@ -8386,12 +9029,12 @@ function populateDetailsRow(serverId, vpsRealtimeEndPoint,detailsRow) {
             
             detailsHtml += \`
                 <div class="mt-2">
-                    <small class="text-muted">内存</small>
-                    <div class="progress" style="height: 25px; background-color: #e9ecef;">
+                    <small class="text-muted">内存 (\${memoryTotal}) </small>
+                    <div class="progress" style="height: 25px; background-color: #b0c8e0;">
                         <div class="progress-bar \${memoryColor}" role="progressbar" 
                              style="width: \${memoryPercent}%; display: flex; align-items: center; justify-content: center; font-weight: 600; color: white;" 
                              id="memory-progress-bar">
-                            \${memoryUsed}/\${memoryTotal} (\${memoryPercent.toFixed(1)}%)
+                            \${memoryUsed}(\${memoryPercent.toFixed(1)}%)
                         </div>
                     </div>
                 </div>
@@ -8409,13 +9052,25 @@ function populateDetailsRow(serverId, vpsRealtimeEndPoint,detailsRow) {
             
             detailsHtml += \`
                 <div class="mt-2">
-                    <small class="text-muted">硬盘 (/)</small>
-                    <div class="progress" style="height: 25px; background-color: #e9ecef;">
+                    <small class="text-muted">硬盘 (\${diskTotal}G)</small>
+                    <div class="progress" style="height: 25px; background-color: #b0c8e0;">
                         <div class="progress-bar \${diskColor}" role="progressbar" 
-                             style="width: \${diskPercent}%; display: flex; align-items: center; justify-content: center; font-weight: 600; color: white;" 
+                             style="width: \${diskPercent+2}%; display: flex; align-items: center; justify-content: center;padding-left: 10px; font-weight: 600; color: white;" 
                              id="disk-progress-bar">
-                            \${diskUsed}G/\${diskTotal}G (\${diskPercent.toFixed(1)}%)
+                            \${diskUsed}G (\${diskPercent.toFixed(1)}%)
                         </div>
+                    </div>
+                </div>
+            \`;
+        }
+        // 添加CPU负载信息到内存硬盘框
+        if (metrics.cpu && metrics.cpu.load_avg) {
+            detailsHtml += \`
+                <div class="mt-2">
+                    <small class="text-muted">CPU负载 (1m, 5m, 15m)</small>
+                    <div class="fw-bold text-info" id="cpu-load-display-\${serverId}">
+                        <i class="bi bi-cpu me-1"></i>
+                        \${metrics.cpu.load_avg.join(', ')}
                     </div>
                 </div>
             \`;
@@ -8424,70 +9079,57 @@ function populateDetailsRow(serverId, vpsRealtimeEndPoint,detailsRow) {
         detailsHtml += \`</div>\`;
     }
 
-    // CPU负载 & 总流量 (combined with CPU usage chart)
+    // 24小时上传下载流量曲线图
     detailsHtml += \`
         <div class="detail-item">
             <div class="d-flex justify-content-between align-items-center">
-                <strong>CPU负载 & 总流量:</strong>
-                
+                <strong>24小时流量走势图:</strong>
             </div>
             
-            <!-- CPU Load and Total Traffic Info -->
-            <div class="row mt-2">
-                <div class="col-6">
-                    <small class="text-muted">CPU负载 (1m, 5m, 15m)</small>
-                    <div class="fw-bold text-info" id="cpu-load-display">
-                        <i class="bi bi-cpu me-1"></i>
-                        \${metrics.cpu && metrics.cpu.load_avg ? metrics.cpu.load_avg.join(', ') : '-'}
+            <!-- Traffic Chart -->
+            <div class="mt-3"> 
+                <div id="traffic-chart-\${serverId}" style="height: 120px; border: 1px solid #ddd; border-radius: 4px; position: relative; background-color: #f8f9fa; margin-top: 5px;">
+                    <div class="text-center p-3 text-muted" style="font-size: 0.875rem;">
+                        正在加载流量历史数据...
                     </div>
                 </div>
-                <div class="col-6">
-                    <small class="text-muted">CPU使用率</small>
-                    <div class="fw-bold text-warning" id="cpu-usage-display">
-                        <i class="bi bi-speedometer me-1"></i>
-                        <span id="cpu-usage-value">\${metrics.cpu && typeof metrics.cpu.usage_percent === 'number' ? metrics.cpu.usage_percent.toFixed(1) + '%' : '-'}</span>
-                    </div>
+                <div class="mt-2 d-flex justify-content-center gap-3">
+                    <small><i class="bi bi-circle-fill" style="color: #dc3545;"></i> 上传</small>
+                    <small><i class="bi bi-circle-fill" style="color: #28a745;"></i> 下载</small>
                 </div>
             </div>
             
-            <!-- Total Traffic -->
-            \${metrics.network ? \`
-            <div class="row mt-2">
-                <div class="col-6">
-                    <small class="text-muted">总上传</small>
-                    <div class="fw-bold text-success">
-                        <i class="bi bi-arrow-up-circle-fill me-1"></i>
-                        \${formatDataSize(metrics.network.total_upload)}
-                    </div>
-                </div>
-                <div class="col-6">
-                    <small class="text-muted">总下载</small>
-                    <div class="fw-bold text-primary">
-                        <i class="bi bi-arrow-down-circle-fill me-1"></i>
-                        \${formatDataSize(metrics.network.total_download)}
-                    </div>
-                </div>
-            </div>
-            \` : ''}
-            
+            <!-- Total Traffic Summary -->
+             
         </div>
         <div class="detail-item">
             <!-- CPU Usage Chart -->
             <div class="mt-3">
-                <small class="text-muted">CPU使用率曲线图 (最近60秒)</small><button class="btn btn-outline-primary btn-sm" id="realtime-monitoring-btn" onclick="toggleRealtimeMonitoring()">
-                    <i class="bi bi-play-fill" id="monitoring-icon"></i> 实时监控
-                </button>
-                <div id="cpu-usage-chart" style="height: 80px; border: 1px solid #ddd; border-radius: 4px; position: relative; background-color: #f8f9fa; margin-top: 5px;">
+                <small class="text-muted">设备CPU使用率历史图 (24小时)</small>
+                <div id="cpu-usage-chart-\${serverId}" style="height: 120px; border: 1px solid #ddd; border-radius: 4px; position: relative; background-color: #f8f9fa; margin-top: 5px;">
                     <div class="text-center p-3 text-muted" style="font-size: 0.875rem;">
-                        点击"实时监控"开始显示CPU使用率曲线
+                        正在加载CPU使用率历史数据...
                     </div>
+                </div>
+                <div class="mt-2 d-flex justify-content-center gap-3">
+                    <small><i class="bi bi-circle-fill" style="color: #007bff;"></i> VPS CPU使用率</small>
                 </div>
             </div>
         </div>
     \`;
 
     detailsContentDiv.innerHTML = detailsHtml || '<p class="text-muted">无详细数据</p>';
+    
+    // 初始化CPU和流量图表
+    if (detailsHtml) {
+        initializeCpuHistoryChart(serverId);
+        initializeTrafficHistoryChart(serverId);
+    }
 }
+
+
+
+
 
 
 // Load all server statuses
@@ -8559,7 +9201,7 @@ function getProgressBarHtml(percentage) {
 
     // Use relative positioning on the container and absolute for the text, centered over the whole bar
     return \`
-        <div class="progress" style="height: 25px; font-size: 0.8em; position: relative; background-color: #e9ecef;">
+        <div class="progress" style="height: 25px; font-size: 0.8em; position: relative; background-color: #b0c8e0;">
             <div class="progress-bar \${bgColorClass}" role="progressbar" style="width: \${percent}%;" aria-valuenow="\${percent}" aria-valuemin="0" aria-valuemax="100"></div>
             <span style="position: absolute; width: 100%; text-align: center; line-height: 25px; font-weight: bold;">
                 \${percent.toFixed(1)}%
@@ -8706,16 +9348,26 @@ function renderMobileServerCards(allStatuses) {
         \`;
         cardBody.appendChild(diskUptimeRow);
 
-        // 在线率 - 单行（可点击查看历史）
+        // 在线率 - 单行（可点击查看历史，支持时间段切换）
         const uptimeRateRow = document.createElement('div');
         uptimeRateRow.className = 'mobile-card-row';
-        uptimeRateRow.style.cursor = 'pointer';
         uptimeRateRow.innerHTML = \`
-            <span class="mobile-card-label">在线率</span>
-            <span class="mobile-card-value" id="mobile-uptime-\${serverId}" style="color: #007bff; text-decoration: underline;">加载中...</span>
+            <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+                <span class="mobile-card-label">在线率</span>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span class="mobile-card-value" id="mobile-uptime-\${serverId}" style="color: #007bff; cursor: pointer; text-decoration: underline;">加载中...</span>
+                    <select class="form-select form-select-sm" id="mobile-period-\${serverId}" style="width: 70px; font-size: 0.75rem;" onchange="updateMobileUptimeDisplay('\${serverId}', this.value)">
+                        <option value="24h">24小时</option>
+                        <option value="3d">3天</option>
+                        <option value="30d">30天</option>
+                        <option value="90d">90天</option>
+                    </select>
+                </div>
+            </div>
         \`;
-        uptimeRateRow.onclick = () => {
-            if (typeof showUptimeHistory === 'function') {
+        uptimeRateRow.onclick = (e) => {
+            // 只有在点击在线率数值时才显示详情
+            if (e.target.id === \`mobile-uptime-\${serverId}\` && typeof showUptimeHistory === 'function') {
                 showUptimeHistory(serverId);
             }
         };
@@ -8744,16 +9396,6 @@ function renderMobileServerCards(allStatuses) {
         \`;
         cardBody.appendChild(lastUpdateRow);
 
-        // 实时监控按钮行
-        const realtimeRow = document.createElement('div');
-        realtimeRow.className = 'mobile-card-row';
-        realtimeRow.style.marginTop = '10px';
-        realtimeRow.innerHTML = \`
-            <button class="btn btn-primary btn-sm w-100" onclick="startRealtimeMonitoring('\${serverId}', '\${serverName}')">
-                <i class="bi bi-speedometer2"></i> 实时监控
-            </button>
-        \`;
-        cardBody.appendChild(realtimeRow);
 
         // 组装卡片
         card.appendChild(cardHeader);
@@ -8761,6 +9403,44 @@ function renderMobileServerCards(allStatuses) {
 
         mobileContainer.appendChild(card);
     });
+    
+    // 为每个服务器初始化在线率显示
+    allStatuses.forEach(data => {
+        const serverId = data.server.id;
+        // 使用默认时间段初始化在线率
+        setTimeout(() => {
+            updateMobileUptimeDisplay(serverId, '24h');
+        }, 100); // 等待DOM更新完成
+    });
+}
+
+// 更新手机端在线率显示
+async function updateMobileUptimeDisplay(serverId, period) {
+    const uptimeElement = document.getElementById(\`mobile-uptime-\${serverId}\`);
+    if (!uptimeElement) return;
+    
+    try {
+        uptimeElement.textContent = '加载中...';
+        const response = await publicApiRequest(\`/api/servers/\${serverId}/uptime?period=\${period}\`);
+        
+        if (response && response.uptime !== undefined) {
+            const percentage = response.uptime;
+            let colorClass = 'text-success';
+            if (percentage < 95) colorClass = 'text-warning';
+            if (percentage < 90) colorClass = 'text-danger';
+            
+            uptimeElement.textContent = \`\${percentage.toFixed(2)}%\`;
+            uptimeElement.className = \`mobile-card-value \${colorClass}\`;
+            uptimeElement.style.cursor = 'pointer';
+            uptimeElement.style.textDecoration = 'underline';
+        } else {
+            uptimeElement.textContent = '无数据';
+        }
+    } catch (error) {
+        console.error(\`加载服务器 \${serverId} 在线率数据失败:\`, error);
+        uptimeElement.textContent = '加载失败';
+        uptimeElement.className = 'mobile-card-value text-muted';
+    }
 }
 
 // 移动端网站卡片渲染函数
@@ -8885,14 +9565,16 @@ async function loadServerUptimeData() {
                 console.warn(\`无法找到服务器 \${server.id} 的在线率单元格\`);
             }
             
-            // 更新移动端显示
+            // 更新移动端显示（使用默认时间段）
             const mobileUptimeCell = document.getElementById(\`mobile-uptime-\${server.id}\`);
             if (mobileUptimeCell) {
-                mobileUptimeCell.innerHTML = \`\${uptimePercentage}%\`;
-                mobileUptimeCell.className = \`mobile-card-value \${uptimeClass}\`;
-                mobileUptimeCell.style.color = '#007bff';
-                mobileUptimeCell.style.textDecoration = 'underline';
+                const mobileSelect = document.getElementById(\`mobile-period-\${server.id}\`);
+                const period = mobileSelect ? mobileSelect.value : '24h';
+                // 初始化移动端在线率显示
+                updateMobileUptimeDisplay(server.id, period);
             }
+                mobileUptimeCell.style.textDecoration = 'underline';
+            
         });
     } catch (error) {
         console.error('加载在线率数据失败:', error);
@@ -8927,51 +9609,34 @@ function showUptimeHistory(serverId) {
         </div>
     \`;
     
-    // 检测设备类型 - 移动设备只显示24小时，桌面设备显示所有选项
-    const isMobile = window.innerWidth <= 768;
+    // 显示所有时间段选项（移动端和桌面端都支持）
     const periodButtons = document.getElementById('uptimePeriodButtons');
     
-    if (isMobile) {
-        // 移动端：只显示24小时选项
-        periodButtons.innerHTML = \`
-            <input type="radio" class="btn-check" name="uptimePeriod" id="period24h" value="24h" checked>
-            <label class="btn btn-outline-primary" for="period24h">24小时</label>
-        \`;
-        document.getElementById('period24h').checked = true;
-        modal.show();
-        loadUptimeHistory('24h');
-    } else {
-        // 桌面端：显示所有时间段选项，但需要检查监控历史
-        // 先显示默认的按钮组
-        periodButtons.innerHTML = \`
-            <input type="radio" class="btn-check" name="uptimePeriod" id="period24h" value="24h" checked>
-            <label class="btn btn-outline-primary" for="period24h">24小时</label>
-            
-            <input type="radio" class="btn-check" name="uptimePeriod" id="period3d" value="3d">
-            <label class="btn btn-outline-primary" for="period3d">3天</label>
-            
-            <input type="radio" class="btn-check" name="uptimePeriod" id="period30d" value="30d">
-            <label class="btn btn-outline-primary" for="period30d">1个月</label>
-            
-            <input type="radio" class="btn-check" name="uptimePeriod" id="period90d" value="90d">
-            <label class="btn btn-outline-primary" for="period90d">3个月</label>
-            
-            <input type="radio" class="btn-check" name="uptimePeriod" id="period180d" value="180d">
-            <label class="btn btn-outline-primary" for="period180d">6个月</label>
-            
-            <input type="radio" class="btn-check" name="uptimePeriod" id="period365d" value="365d">
-            <label class="btn btn-outline-primary" for="period365d">1年</label>
-        \`;
+    // 显示所有时间段选项
+    periodButtons.innerHTML = \`
+        <input type="radio" class="btn-check" name="uptimePeriod" id="period24h" value="24h" checked>
+        <label class="btn btn-outline-primary" for="period24h">24小时</label>
         
-        // 设置默认时间段为3天，如果监控历史不足1个月则只显示3天
-        document.getElementById('period3d').checked = true;
-        modal.show();
+        <input type="radio" class="btn-check" name="uptimePeriod" id="period3d" value="3d">
+        <label class="btn btn-outline-primary" for="period3d">3天</label>
         
-        // 先检查服务器的监控历史长度
-        checkServerHistoryAndAdjustPeriods(serverId).then(() => {
-            loadUptimeHistory('3d');
-        });
-    }
+        <input type="radio" class="btn-check" name="uptimePeriod" id="period30d" value="30d">
+        <label class="btn btn-outline-primary" for="period30d">1个月</label>
+        
+        <input type="radio" class="btn-check" name="uptimePeriod" id="period90d" value="90d">
+        <label class="btn btn-outline-primary" for="period90d">3个月</label>
+        
+        <input type="radio" class="btn-check" name="uptimePeriod" id="period180d" value="180d">
+        <label class="btn btn-outline-primary" for="period180d">6个月</label>
+        
+        <input type="radio" class="btn-check" name="uptimePeriod" id="period365d" value="365d">
+        <label class="btn btn-outline-primary" for="period365d">1年</label>
+    \`;
+    
+    // 默认选中24小时
+    document.getElementById('period24h').checked = true;
+    modal.show();
+    loadUptimeHistory('24h');
     
     // 重新绑定时间段切换事件
     const periodInputs = document.querySelectorAll('input[name="uptimePeriod"]');
@@ -9349,9 +10014,7 @@ function renderServerTable(allStatuses) {
             <td><span style="color: #000;">\${lastUpdate}</span></td>
             <td><span style="display: none" data-realtime-endpoint="\${realtime_endpoint}">-</span></td>
             <td>
-                <button class="btn btn-primary btn-sm" onclick="startRealtimeMonitoring('\${serverId}', '\${serverName}')" title="开启实时监控">
-                    <i class="bi bi-speedometer2"></i>
-                </button>
+                <!-- 实时监控按钮已移除 -->
             </td>
         \`;
 
@@ -9484,7 +10147,7 @@ async function loadAllSiteStatuses() {
 
     } catch (error) {
                 const siteStatusTableBody = document.getElementById('siteStatusTableBody');
-        siteStatusTableBody.innerHTML = '<tr><td colspan="6" class="text-center text-danger">Failed to load website status data. Please refresh the page.</td></tr>'; // Colspan updated
+        siteStatusTableBody.innerHTML = '<tr><td colspan="7" class="text-center text-danger">Failed to load website status data. Please refresh the page.</td></tr>'; // Colspan updated
         // 显示错误通知
         showToast('danger', '加载网站数据失败，请刷新页面重试');
     }
@@ -9507,6 +10170,12 @@ async function renderSiteStatusTable(sites) {
         uptimeCell.setAttribute('data-site-id', site.id);
         uptimeCell.innerHTML = '-'; // 初始显示，等待异步加载
         
+        // 24小时记录单元格
+        const historyCell = document.createElement('td');
+        historyCell.className = 'history-cell text-center';
+        historyCell.setAttribute('data-site-id', site.id);
+        historyCell.innerHTML = '<div class="history-bar-container d-flex justify-content-center"></div>';
+        
         row.innerHTML = \`
             <td>\${site.name || '-'}</td>
             <td><span class="badge \${statusInfo.class}">\${statusInfo.text}</span></td>
@@ -9515,6 +10184,7 @@ async function renderSiteStatusTable(sites) {
             <td>\${lastCheckTime}</td>
         \`;
         row.appendChild(uptimeCell);
+        row.appendChild(historyCell);
         tableBody.appendChild(row);
     }
 
@@ -9523,8 +10193,9 @@ async function renderSiteStatusTable(sites) {
         const uptimeCells = tableBody?.querySelectorAll('td.uptime-cell');
         
         if (uptimeCells && uptimeCells.length > 0) {
-            // DOM已准备好，加载在线率数据
+            // DOM已准备好，加载在线率数据和历史数据
             await loadSiteUptimeData();
+            await loadSiteHistoryData();
         } else if (retries > 0) {
             // DOM还没准备好，重试
             setTimeout(() => loadUptimeWithRetry(retries - 1), 500);
@@ -9576,6 +10247,49 @@ async function loadSiteUptimeData() {
             uptimeCells.forEach(cell => {
                 cell.innerHTML = '<span class="text-muted">-</span>';
                 cell.title = '获取在线率数据失败';
+            });
+        }
+    }
+}
+
+// 加载网站24小时历史柱状图数据
+async function loadSiteHistoryData() {
+    // 确保在浏览器环境中运行
+    if (typeof document === 'undefined') {
+        return;
+    }
+    
+    try {
+        // 获取所有网站的历史容器
+        const historyContainers = document.querySelectorAll('.history-bar-container');
+        
+        // 为每个网站单独获取历史数据
+        for (const container of historyContainers) {
+            const historyCell = container.closest('td.history-cell');
+            if (historyCell) {
+                const siteId = historyCell.getAttribute('data-site-id');
+                if (siteId) {
+                    try {
+                        const response = await publicApiRequest(\`/api/sites/\${siteId}/history\`);
+                        if (response && response.history) {
+                            renderSiteHistoryBar(container, response.history);
+                        } else {
+                            container.innerHTML = '<small class="text-muted">无记录</small>';
+                        }
+                    } catch (error) {
+                        console.error(\`加载网站 \${siteId} 历史数据失败:\`, error);
+                        container.innerHTML = '<small class="text-muted">加载失败</small>';
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error('加载网站历史数据失败:', error);
+        // 如果获取历史数据失败，显示错误信息
+        const historyContainers = document.querySelectorAll('.history-bar-container');
+        if (historyContainers.length > 0) {
+            historyContainers.forEach(container => {
+                container.innerHTML = '<small class="text-muted">加载失败</small>';
             });
         }
     }
@@ -9852,12 +10566,23 @@ function renderSiteHistoryBar(containerElement, history) {
 
         if (recordForHour) {
             if (recordForHour.status === 'UP') {
-                barClass = 'history-bar-up';
+                const responseTime = recordForHour.response_time_ms || 0;
+                // 根据响应时间设置不同颜色
+                if (responseTime > 5000) { // 超过5秒
+                    barClass = 'history-bar-slow-red';
+                } else if (responseTime > 2000) { // 超过2秒
+                    barClass = 'history-bar-slow-orange';
+                } else if (responseTime > 1000) { // 超过1秒
+                    barClass = 'history-bar-slow-yellow';
+                } else {
+                    barClass = 'history-bar-up'; // 正常绿色
+                }
             } else if (['DOWN', 'TIMEOUT', 'ERROR'].includes(recordForHour.status)) {
                 barClass = 'history-bar-down';
             }
             const recordDate = new Date(recordForHour.timestamp * 1000);
-            titleText = \`\${recordDate.toLocaleString()}: \${recordForHour.status} (\${recordForHour.status_code || 'N/A'}), \${recordForHour.response_time_ms || '-'}ms\`;
+            const responseTimeText = recordForHour.response_time_ms ? \`\${recordForHour.response_time_ms}ms\` : '-';
+            titleText = \`\${recordDate.toLocaleString()}: \${recordForHour.status} (\${recordForHour.status_code || 'N/A'}), \${responseTimeText}\`;
         }
 
         historyHtml += \`<div class="history-bar \${barClass}" title="\${titleText}"></div>\`;
@@ -9973,7 +10698,7 @@ function applyGlobalBackgroundSettings(enabled, url, opacity) {
         body.style.removeProperty('--custom-background-url');
         body.style.removeProperty('--page-opacity');
         body.classList.remove('custom-background-enabled');
-            }
+            } 
 }
 
 
@@ -9993,9 +10718,386 @@ window.addEventListener('storage', function(e) {
                     }
     }
 });
-`;
+
+
+// --- CPU History Modal Functions ---
+
+let currentCpuServerId = null;
+
+function showCpuHistoryModal(serverId) {
+    currentCpuServerId = serverId;
+    const modalElement = document.getElementById('cpuHistoryModal');
+    if (!modalElement) return;
+    const modal = new bootstrap.Modal(modalElement);
+    
+    const serverName = serverDataCache[serverId]?.server?.name || '服务器';
+    const modalTitle = document.getElementById('cpuHistoryModalLabel');
+    if (modalTitle) {
+        modalTitle.textContent = \`\${serverName} - 24小时CPU使用率历史详情\`;
+    }
+
+    const chartContainer = document.getElementById('cpuHistoryChartContainer');
+    if (chartContainer) {
+        chartContainer.innerHTML = \`
+            <div class="text-center p-5">
+                <div class="spinner-border" role="status">
+                    <span class="visually-hidden">加载中...</span>
+                </div>
+            </div>
+        \`;
+    }
+    
+    modal.show();
+    
+    renderZoomedCpuChart(serverId);
 }
 
+async function renderZoomedCpuChart(serverId) {
+    const chartContainer = document.getElementById('cpuHistoryChartContainer');
+    if (!chartContainer) return;
+
+    try {
+        const response = await fetch(\`/api/servers/\${serverId}/cpu/history\`);
+        if (!response.ok) {
+            throw new Error(\`HTTP \${response.status}\`);
+        }
+        
+        const data = await response.json();
+        const cpuHistory = data.history || [];
+        
+        if (cpuHistory.length === 0) {
+            chartContainer.innerHTML = \`
+                <div class="text-center p-5 text-muted">
+                    <i class="bi bi-info-circle me-2"></i>暂无CPU历史数据
+                </div>
+            \`;
+            return;
+        }
+        
+        // 清空容器
+        chartContainer.innerHTML = '';
+        
+        // 创建放大版的SVG容器
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('width', '100%');
+        svg.setAttribute('height', '100%');
+        svg.setAttribute('viewBox', '0 0 800 400'); // 更大的视图
+        svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+        svg.style.width = '100%';
+        svg.style.height = '100%';
+        
+        // 计算数据范围
+        const maxUsage = Math.max(20, ...cpuHistory.map(p => p.usage));
+        const minTime = Math.min(...cpuHistory.map(p => p.timestamp));
+        const maxTime = Math.max(...cpuHistory.map(p => p.timestamp));
+        
+        // 图表参数（放大版）
+        const padding = { top: 30, right: 50, bottom: 60, left: 60 };
+        const chartWidth = 800 - padding.left - padding.right;
+        const chartHeight = 400 - padding.top - padding.bottom;
+        
+        // 添加网格线
+        for (let i = 0; i <= 10; i++) {
+            const y = padding.top + (i / 10) * chartHeight;
+            const gridLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            gridLine.setAttribute('x1', padding.left.toString());
+            gridLine.setAttribute('y1', y.toString());
+            gridLine.setAttribute('x2', (800 - padding.right).toString());
+            gridLine.setAttribute('y2', y.toString());
+            gridLine.setAttribute('stroke', '#e9ecef');
+            gridLine.setAttribute('stroke-width', '1');
+            if (i === 0 || i === 10) {
+                gridLine.setAttribute('stroke-width', '2');
+                gridLine.setAttribute('stroke', '#dee2e6');
+            }
+            svg.appendChild(gridLine);
+        }
+        
+        // 添加Y轴标签（CPU使用率）
+        for (let i = 0; i <= 10; i++) {
+            const y = padding.top + (i / 10) * chartHeight;
+            const value = maxUsage * (1 - i / 10);
+            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            label.setAttribute('x', (padding.left - 10).toString());
+            label.setAttribute('y', (y + 4).toString());
+            label.setAttribute('text-anchor', 'end');
+            label.setAttribute('font-size', '12');
+            label.setAttribute('fill', '#666');
+            label.textContent = \`\${value.toFixed(1)}%\`;
+            svg.appendChild(label);
+        }
+        
+        // 添加X轴时间标签
+        const timePoints = 8;
+        for (let i = 0; i <= timePoints; i++) {
+            const x = padding.left + (i / timePoints) * chartWidth;
+            const timeValue = minTime + (maxTime - minTime) * (i / timePoints);
+            const timeLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            timeLabel.setAttribute('x', x.toString());
+            timeLabel.setAttribute('y', (400 - padding.bottom + 20).toString());
+            timeLabel.setAttribute('text-anchor', 'middle');
+            timeLabel.setAttribute('font-size', '11');
+            timeLabel.setAttribute('fill', '#666');
+            const date = new Date(timeValue);
+            timeLabel.textContent = \`\${date.getHours().toString().padStart(2, '0')}:\${date.getMinutes().toString().padStart(2, '0')}\`;
+            svg.appendChild(timeLabel);
+        }
+        
+        // 绘制CPU使用率曲线
+        let path = '';
+        cpuHistory.forEach((point, index) => {
+            const x = padding.left + ((point.timestamp - minTime) / (maxTime - minTime)) * chartWidth;
+            const y = padding.top + chartHeight - (point.usage / maxUsage) * chartHeight;
+            
+            if (index === 0) {
+                path += \`M \${x} \${y}\`;
+            } else {
+                path += \` L \${x} \${y}\`;
+            }
+        });
+        
+        // 添加CPU曲线
+        const cpuLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        cpuLine.setAttribute('d', path);
+        cpuLine.setAttribute('stroke', '#007bff');
+        cpuLine.setAttribute('stroke-width', '3');
+        cpuLine.setAttribute('fill', 'none');
+        svg.appendChild(cpuLine);
+        
+        // 添加坐标轴标题
+        const yAxisTitle = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        yAxisTitle.setAttribute('x', '20');
+        yAxisTitle.setAttribute('y', '200');
+        yAxisTitle.setAttribute('text-anchor', 'middle');
+        yAxisTitle.setAttribute('font-size', '14');
+        yAxisTitle.setAttribute('fill', '#333');
+        yAxisTitle.setAttribute('transform', 'rotate(-90, 20, 200)');
+        yAxisTitle.textContent = 'CPU使用率 (%)';
+        svg.appendChild(yAxisTitle);
+        
+        const xAxisTitle = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        xAxisTitle.setAttribute('x', '400');
+        xAxisTitle.setAttribute('y', '390');
+        xAxisTitle.setAttribute('text-anchor', 'middle');
+        xAxisTitle.setAttribute('font-size', '14');
+        xAxisTitle.setAttribute('fill', '#333');
+        xAxisTitle.textContent = '时间';
+        svg.appendChild(xAxisTitle);
+        
+        chartContainer.appendChild(svg);
+        
+    } catch (error) {
+        chartContainer.innerHTML = \`<div class="text-center p-5 text-danger">加载图表失败: \${error.message}</div>\`;
+    }
+}
+
+// --- Traffic History Modal Functions ---
+
+let currentTrafficServerId = null;
+
+function showTrafficHistoryModal(serverId) {
+    currentTrafficServerId = serverId;
+    const modalElement = document.getElementById('trafficHistoryModal');
+    if (!modalElement) return;
+    const modal = new bootstrap.Modal(modalElement);
+    
+    const serverName = serverDataCache[serverId]?.server?.name || '服务器';
+    const modalTitle = document.getElementById('trafficHistoryModalLabel');
+    if (modalTitle) {
+        modalTitle.textContent = \`\${serverName} - 24小时流量历史详情\`;
+    }
+
+    const chartContainer = document.getElementById('trafficHistoryChartContainer');
+    if (chartContainer) {
+        chartContainer.innerHTML = \`
+            <div class="text-center p-5">
+                <div class="spinner-border" role="status">
+                    <span class="visually-hidden">加载中...</span>
+                </div>
+            </div>
+        \`;
+    }
+    
+    modal.show();
+    
+    renderZoomedTrafficChart(serverId);
+}
+
+async function renderZoomedTrafficChart(serverId) {
+    const chartContainer = document.getElementById('trafficHistoryChartContainer');
+    if (!chartContainer) return;
+
+    try {
+        const response = await fetch(\`/api/servers/\${serverId}/traffic/history\`);
+        if (!response.ok) throw new Error('Failed to load data');
+        const data = await response.json();
+        const history = data.history || [];
+        
+        if (history.length === 0) {
+            chartContainer.innerHTML = '<div class="text-center p-5 text-muted">暂无流量历史数据</div>';
+            return;
+        }
+
+        chartContainer.innerHTML = '';
+    
+        const viewBoxWidth = 800;
+        const viewBoxHeight = 400;
+
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('width', '100%');
+        svg.setAttribute('height', '100%');
+        svg.setAttribute('viewBox', \`0 0 \${viewBoxWidth} \${viewBoxHeight}\`);
+        svg.setAttribute('preserveAspectRatio', 'xMinYMid meet');
+        svg.style.position = 'absolute';
+        svg.style.width = '100%';
+        svg.style.height = '100%';
+        svg.style.left = '0px';
+        
+        const sortedData = history.slice().sort((a, b) => a.timestamp - b.timestamp);
+        
+        let maxUpload = 0;
+        let maxDownload = 0;
+        sortedData.forEach(item => {
+            maxUpload = Math.max(maxUpload, item.upload || 0);
+            maxDownload = Math.max(maxDownload, item.download || 0);
+        });
+        const maxTraffic = Math.max(maxUpload, maxDownload);
+        
+        if (maxTraffic === 0) {
+            chartContainer.innerHTML = '<div class="text-center p-5 text-muted">流量数据为0</div>';
+            return;
+        }
+        
+        const padding = { top: 20, right: 40, bottom: 40, left: 80 };
+        const chartWidth = viewBoxWidth - padding.left - padding.right;
+        const chartHeight = viewBoxHeight - padding.top - padding.bottom;
+        
+        for (let i = 0; i <= 5; i++) {
+            const y = padding.top + (i / 5) * chartHeight;
+            const gridLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            gridLine.setAttribute('x1', padding.left.toString());
+            gridLine.setAttribute('y1', y.toString());
+            gridLine.setAttribute('x2', (viewBoxWidth - padding.right).toString());
+            gridLine.setAttribute('y2', y.toString());
+            gridLine.setAttribute('stroke', '#e9ecef');
+            gridLine.setAttribute('stroke-width', '1');
+            svg.appendChild(gridLine);
+        }
+        
+        for (let i = 0; i <= 5; i++) {
+            const y = padding.top + (i / 5) * chartHeight;
+            const value = maxTraffic * (1 - i / 5);
+            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            label.setAttribute('x', (padding.left - 10).toString());
+            label.setAttribute('y', (y + 4).toString());
+            label.setAttribute('text-anchor', 'end');
+            label.setAttribute('font-size', '12');
+            label.setAttribute('fill', '#666');
+            label.textContent = formatTrafficValue(value);
+            svg.appendChild(label);
+        }
+
+        const timeLabels = 6;
+        const minTime = sortedData[0].timestamp;
+        const maxTime = sortedData[sortedData.length - 1].timestamp;
+        const timeRange = maxTime - minTime;
+        if (timeRange > 0) {
+            for (let i = 0; i <= timeLabels; i++) {
+                const x = padding.left + (i / timeLabels) * chartWidth;
+                const timestamp = minTime + (timeRange * (i / timeLabels));
+                const date = new Date(timestamp);
+                const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
+                
+                const xLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                xLabel.setAttribute('x', x.toString());
+                xLabel.setAttribute('y', (viewBoxHeight - padding.bottom + 20).toString());
+                xLabel.setAttribute('text-anchor', 'middle');
+                xLabel.setAttribute('font-size', '12');
+                xLabel.setAttribute('fill', '#666');
+                xLabel.textContent = timeStr;
+                svg.appendChild(xLabel);
+            }
+        }
+        
+        let uploadPath = '';
+        let downloadPath = '';
+        
+        sortedData.forEach((item, index) => {
+            const x = timeRange > 0 ? padding.left + ((item.timestamp - minTime) / timeRange) * chartWidth : padding.left;
+            const uploadY = padding.top + chartHeight - (item.upload / maxTraffic) * chartHeight;
+            const downloadY = padding.top + chartHeight - (item.download / maxTraffic) * chartHeight;
+            
+            if (index === 0) {
+                uploadPath += \`M \${x} \${uploadY}\`;
+                downloadPath += \`M \${x} \${downloadY}\`;
+            } else {
+                uploadPath += \` L \${x} \${uploadY}\`;
+                downloadPath += \` L \${x} \${downloadY}\`;
+            }
+        });
+        
+        if (uploadPath) {
+            const uploadLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            uploadLine.setAttribute('d', uploadPath);
+            uploadLine.setAttribute('stroke', '#dc3545');
+            uploadLine.setAttribute('stroke-width', '2.5');
+            uploadLine.setAttribute('fill', 'none');
+            svg.appendChild(uploadLine);
+        }
+        
+        if (downloadPath) {
+            const downloadLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            downloadLine.setAttribute('d', downloadPath);
+            downloadLine.setAttribute('stroke', '#28a745');
+            downloadLine.setAttribute('stroke-width', '2.5');
+            downloadLine.setAttribute('fill', 'none');
+            svg.appendChild(downloadLine);
+        }
+        
+        const legendX = viewBoxWidth - 120;
+        const uploadLegend = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        const uploadLegendRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        uploadLegendRect.setAttribute('x', legendX);
+        uploadLegendRect.setAttribute('y', '10');
+        uploadLegendRect.setAttribute('width', '15');
+        uploadLegendRect.setAttribute('height', '15');
+        uploadLegendRect.setAttribute('fill', '#dc3545');
+        uploadLegend.appendChild(uploadLegendRect);
+        
+        const uploadLegendText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        uploadLegendText.setAttribute('x', legendX + 20);
+        uploadLegendText.setAttribute('y', '22');
+        uploadLegendText.setAttribute('font-size', '14');
+        uploadLegendText.setAttribute('fill', '#333');
+        uploadLegendText.textContent = '上传';
+        uploadLegend.appendChild(uploadLegendText);
+        svg.appendChild(uploadLegend);
+        
+        const downloadLegend = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        const downloadLegendRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        downloadLegendRect.setAttribute('x', legendX);
+        downloadLegendRect.setAttribute('y', '35');
+        downloadLegendRect.setAttribute('width', '15');
+        downloadLegendRect.setAttribute('height', '15');
+        downloadLegendRect.setAttribute('fill', '#28a745');
+        downloadLegend.appendChild(downloadLegendRect);
+        
+        const downloadLegendText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        downloadLegendText.setAttribute('x', legendX + 20);
+        downloadLegendText.setAttribute('y', '47');
+        downloadLegendText.setAttribute('font-size', '14');
+        downloadLegendText.setAttribute('fill', '#333');
+        downloadLegendText.textContent = '下载';
+        downloadLegend.appendChild(downloadLegendText);
+        svg.appendChild(downloadLegend);
+        
+        chartContainer.appendChild(svg);
+    } catch (error) {
+        chartContainer.innerHTML = \`<div class="text-center p-5 text-danger">加载图表失败: \${error.message}</div>\`;
+    }
+}
+`;
+}
 function getLoginJs() {
   return `// login.js - 登录页面的JavaScript逻辑
 
