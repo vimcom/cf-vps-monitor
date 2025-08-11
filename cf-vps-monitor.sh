@@ -668,17 +668,11 @@ install_dependencies() {
     if ! command_exists curl; then
         missing_deps+=("curl")
     fi
-    # 检查必需的命令
-    if ! command_exists openssl; then
-        missing_deps+=("openssl")
-    fi
+    
     if ! command_exists bc; then
         missing_deps+=("bc")
     fi
     
-    if ! command_exists websocat; then
-        missing_deps+=("websocat")
-    fi
     # 检查可选的命令
     local optional_missing=()
     if ! command_exists ifstat; then
@@ -772,15 +766,8 @@ create_directories() {
     print_message "$BLUE" "创建集中式目录结构..."
 
     # 创建主目录和子目录
-    mkdir -p "$SCRIPT_DIR"/{bin,config,logs,tmp,cache,certs,run,system/{templates,backups}} || error_exit "无法创建目录结构"
+    mkdir -p "$SCRIPT_DIR"/{bin,config,logs,tmp,cache,run,system/{templates,backups}} || error_exit "无法创建目录结构"
 
-	# 生成私钥和自签名证书（有效期 10 年）
-	openssl req -x509 -newkey rsa:4096 \
-	  -keyout "$SCRIPT_DIR"/certs/key.pem \
-	  -out "$SCRIPT_DIR"/certs/cert.pem \
-	  -days 3650 \
-	  -nodes \
-	  -subj "/CN=localhost"
     # 创建安装清单文件
     touch "$INSTALL_MANIFEST"
 
@@ -1469,10 +1456,9 @@ start_http_server() {
     fi
 
     log "启动HTTP服务器，端口: $port"
-    if command_exists websocat; then
-		start_websocket_server  "$port" "$pid_file" &
+    
     # 使用nc或socat启动简单HTTP服务器
-    elif command_exists nc; then
+    if command_exists nc; then
         start_nc_server "$port" "$pid_file" &
     elif command_exists socat; then
         start_socat_server "$port" "$pid_file" &
@@ -1486,58 +1472,7 @@ start_http_server() {
     log "HTTP服务器已启动 (PID: $server_pid)"
     return 0
 }
-start_websocket_server() {
-    local port="$1"
-    local pid_file="$2"
-    print_message "$GREEN" "启动WebSocket服务器 (端口: $port)"
-    
-    # 证书路径
-    local cert_dir="$SCRIPT_DIR/certs"
-    local cert_file="$cert_dir/cert.pem"
-    local key_file="$cert_dir/key.pem"
-    
-    # 创建命名管道用于通信
-    local fifo_path="$SCRIPT_DIR/tmp/websocket_fifo"
-    mkfifo "$fifo_path"
 
-    # 检查证书是否存在
-    if [[ ! -f "$cert_file" ]] || [[ ! -f "$key_file" ]]; then
-        print_message "$RED" "错误: SSL证书缺失，请运行生成证书命令"
-        return 1
-    fi
-
-    # 后台运行WebSocket服务器
-    (
-        # 设置退出时清理
-        trap "rm -f '$fifo_path'; exit 0" EXIT HUP INT QUIT TERM
-        
-        while true; do
-            {
-                # 使用websocat监听WSS连接
-                websocat -v \
-                    --ssl-cert "$cert_file" \
-                    --ssl-key "$key_file" \
-                    -s 0.0.0.0:$WEBSOCKET_PORT \
-                    sh-c:'
-                    # 每秒发送一次实时数据
-                    while sleep 1; do
-                        get_realtime_data "$SERVER_ID"
-                    done
-                ' 2>&1 | while read -r line; do
-                    # 记录连接事件
-                    if [[ "$line" == *"Connection from"* ]]; then
-                        log "WebSocket客户端连接: $line"
-                    fi
-                done
-            } < "$fifo_path" > "$fifo_path"
-        done
-    ) &
-     
-    
-    print_message "$GREEN" "WebSocket服务器已启动 (PID: $pid_file)"
-    print_message "$YELLOW" "注意: 使用的是自签名证书，浏览器会显示安全警告"
-    print_message "$CYAN" "您需要手动接受证书（首次访问时）"
-}
 # 使用nc启动HTTP服务器
 start_nc_server() {
     local port="$1"
@@ -1566,7 +1501,7 @@ start_nc_server() {
 start_socat_server() {
     local port="$1"
     local pid_file="$2"
-    print_message "$GREEN" "启动socat HTTP服务器（端口: $port），支持JSONP"
+    
     while [[ -f "$pid_file" ]]; do
         socat TCP-LISTEN:"$port",reuseaddr,fork EXEC:"$0 http-response" 2>/dev/null || sleep 1
     done
@@ -1595,15 +1530,7 @@ http_response() {
     # 解析请求方法和路径
     local method path
     read -r method path <<< "$request_line"
-     # 解析查询字符串（用于JSONP）
-    local callback_param=""
-    if [[ "$path" =~ ^[^\?]+\?([^\ ]+) ]]; then
-        local query_string="${BASH_REMATCH[1]}"
-        # 提取callback参数
-        if [[ "$query_string" =~ callback=([^&]+) ]]; then
-            callback_param="${BASH_REMATCH[1]}"
-        fi
-    fi
+    
     # 跳过其他HTTP头
     while read -r line && [[ "$line" != $'\r' && -n "$line" ]]; do
         continue
@@ -1611,11 +1538,7 @@ http_response() {
     
     # 发送HTTP响应
     echo -e "HTTP/1.1 200 OK\r"
-    if [[ -n "$callback_param" ]]; then
-        echo -e "Content-Type: application/javascript\r"
-    else
-        echo -e "Content-Type: application/json\r"
-    fi
+    echo -e "Content-Type: application/json\r"
     echo -e "Access-Control-Allow-Origin: *\r"
     echo -e "Access-Control-Allow-Methods: GET, POST, OPTIONS\r"
     echo -e "Access-Control-Allow-Headers: *\r"
@@ -1627,14 +1550,7 @@ http_response() {
     fi
     
     # 获取并返回实时数据
-    local data=$(get_realtime_data)
-    
-    # 如果设置了callback参数，返回JSONP格式
-    if [[ -n "$callback_param" ]]; then
-        echo "${callback_param}(${data});"
-    else
-        echo "$data"
-    fi
+    get_realtime_data
 }
 
 # 获取实时监控数据
