@@ -5,7 +5,7 @@
 
 PC端前台：
 
-![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/newfront.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/newFront.jpg)
 
 移动端前台：
 
