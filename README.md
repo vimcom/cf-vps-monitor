@@ -6,6 +6,9 @@
 PC端前台：
 
 ![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/newFront.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/online.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/trac.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/cpu.jpg)
 
 移动端前台：
 
