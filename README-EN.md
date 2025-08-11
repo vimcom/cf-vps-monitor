@@ -6,12 +6,15 @@
 Panel Demo: https://vps-monitor.abo-vendor289.workers.dev/
 
 PC Frontend:
+ 
 
-![image](https://github.com/kadidalax/cf-vps-monitor/blob/main/pic/front.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/newFront.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/online.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/trac.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/cpu.jpg)
+ Mobile Frontend:
 
-Mobile Frontend:
-
-![image](https://github.com/kadidalax/cf-vps-monitor/blob/main/pic/mobile.jpg)
+![image](https://github.com/kadidalax/cf-vps-monitor/blob/main/pic/newmobile.jpg)
 
 Backend:
 
@@ -168,3 +171,4 @@ The installation script itself also provides management functions:
 ### Sponsorship Welcome🤣:
 
 [![Powered by DartNode](https://dartnode.com/branding/DN-Open-Source-sm.png)](https://dartnode.com "Powered by DartNode - Free VPS for Open Source")
+
