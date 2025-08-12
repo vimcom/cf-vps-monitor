@@ -12,7 +12,7 @@ PC端前台：
 
 移动端前台：
 
-![image](https://github.com/kadidalax/cf-vps-monitor/blob/main/pic/newmobile.jpg)
+![image](https://github.com/fanbang/cf-vps-monitor/blob/main/pic/newmobile.jpg)
 
 后台：
 
