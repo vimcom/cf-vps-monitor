@@ -116,11 +116,11 @@ Agent 是一个需要在你的 VPS 上运行的脚本，用于收集状态信息
 
 第二种是：下载脚本并运行：
 ```
-wget -O cf-vps-monitor.sh https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-monitor.sh && chmod +x cf-vps-monitor.sh && ./cf-vps-monitor.sh
+wget -O cf-vps-monitor.sh https://raw.githubusercontent.com/vimcom/cf-vps-monitor/main/cf-vps-monitor.sh && chmod +x cf-vps-monitor.sh && ./cf-vps-monitor.sh
 ```
 或者下载脚本并运行：
 ```
-curl -O https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-monitor.sh && chmod +x cf-vps-monitor.sh && ./cf-vps-monitor.sh
+curl -O https://raw.githubusercontent.com/vimcom/cf-vps-monitor/main/cf-vps-monitor.sh && chmod +x cf-vps-monitor.sh && ./cf-vps-monitor.sh
 ```
 *   安装需要  `服务器ID` `API密钥` 和你的 `worker网址`
 *   可以在后台点击 `查看密钥` 来获取上述三个参数
