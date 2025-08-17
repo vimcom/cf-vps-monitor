@@ -2127,7 +2127,7 @@ create_systemd_service() {
         cat > "$SCRIPT_DIR/system/templates/systemd.service" << EOF
 [Unit]
 Description=cf-vps-monitor Service - VPS Monitoring Agent
-Documentation=https://github.com/kadidalax/cf-vps-monitor
+Documentation=https://github.com/vimcom/cf-vps-monitor
 After=network.target network-online.target
 Wants=network-online.target
 
@@ -2147,7 +2147,7 @@ EOF
         cat > "$SCRIPT_DIR/system/templates/systemd.service" << EOF
 [Unit]
 Description=cf-vps-monitor Service - VPS Monitoring Agent
-Documentation=https://github.com/kadidalax/cf-vps-monitor
+Documentation=https://github.com/vimcom/cf-vps-monitor
 After=network.target network-online.target
 Wants=network-online.target
 
